@@ -77,27 +77,55 @@ def get_last_5_matches(df, team_name):
     last_5['L/V'] = np.where(last_5['home'] == team_name, '🏠', '✈️')
     return last_5[['Fecha', 'L/V', 'Rival', 'Res']]
 
-def predict_match_poisson(home, away, team_stats, avg_h, avg_a):
+# ======================================================
+# MODELO DIXON-COLES (Sustituye a predict_match_poisson)
+# ======================================================
+def predict_match_dixon_coles(home, away, team_stats, avg_h, avg_a):
+    # 1. Calculamos las Lambdas (Igual que en Poisson)
     h_exp = team_stats[home]['att_h'] * team_stats[away]['def_a'] * avg_h
     a_exp = team_stats[away]['att_a'] * team_stats[home]['def_h'] * avg_a
+
     max_goals = 10
     probs = np.zeros((max_goals, max_goals))
-    for i in range(max_goals):
-        for j in range(max_goals):
-            probs[i][j] = poisson.pmf(i, h_exp) * poisson.pmf(j, a_exp)
+
+    # 2. Parámetro Rho (Factor de corrección para empates bajos)
+    rho = -0.13 
+
+    # 3. Llenamos la matriz con el ajuste Dixon-Coles
+    for x in range(max_goals):
+        for y in range(max_goals):
+            p_base = poisson.pmf(x, h_exp) * poisson.pmf(y, a_exp)
+            
+            # Aplicamos corrección a 0-0, 1-0, 0-1 y 1-1
+            correction = 1.0
+            if x == 0 and y == 0: correction = 1.0 - (h_exp * a_exp * rho)
+            elif x == 0 and y == 1: correction = 1.0 + (h_exp * rho)
+            elif x == 1 and y == 0: correction = 1.0 + (a_exp * rho)
+            elif x == 1 and y == 1: correction = 1.0 - (rho)
+            
+            probs[x][y] = p_base * correction
+
+    # Normalizamos para que sume 100% exacto
+    probs = max(0, probs) # Evitar negativos raros
+    probs = probs / probs.sum()
+
+    # 4. Resultados finales
     p_home = np.tril(probs, -1).sum()
     p_draw = np.diag(probs).sum()
     p_away = np.triu(probs, 1).sum()
+
     p_o25 = 0
     for i in range(max_goals):
         for j in range(max_goals):
             if (i + j) > 2.5: p_o25 += probs[i][j]
     
+    # Top 3 Marcadores
     flat_indices = np.argsort(probs.ravel())[::-1][:3]
     top_scores = []
     for idx in flat_indices:
         i, j = np.unravel_index(idx, probs.shape)
         top_scores.append((f"{i}-{j}", probs[i][j]))
+
     return h_exp, a_exp, p_home, p_draw, p_away, p_o25, top_scores
 
 def calculate_kelly_criterion(prob_real, odd_bookie):
@@ -177,7 +205,7 @@ c1, c2 = st.columns(2)
 home_team = c1.selectbox("Local", teams_list, index=0)
 away_team = c2.selectbox("Visitante", [t for t in teams_list if t != home_team], index=0)
 
-h_exp, a_exp, p_home, p_draw, p_away, p_o25, top_scores = predict_match_poisson(home_team, away_team, stats, avg_h, avg_a)
+h_exp, a_exp, p_home, p_draw, p_away, p_o25, top_scores = predict_match_dixon_coles(home_team, away_team, stats, avg_h, avg_a)
 
 # --- VISUALIZACIÓN PRINCIPAL (PESTAÑAS) ---
 tab1, tab2, tab3 = st.tabs(["📊 Análisis Visual", "💰 Valor & Apuesta", "📜 Historial"])
@@ -268,3 +296,4 @@ with tab3:
             else: st.info("No hay pendientes")
 
     else: st.info("Historial vacío")
+
