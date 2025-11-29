@@ -6,47 +6,63 @@ import plotly.graph_objects as go
 import os
 
 # ======================================================
-# 1. CONFIGURACIÓN Y ESTILOS CSS 🎨 (CORREGIDO PARA MODO OSCURO)
+# 1. CONFIGURACIÓN Y ESTILOS CSS (DARK MODE) 🎨
 # ======================================================
-st.set_page_config(page_title="Poisson Pro", layout="wide", page_icon="⚽")
-CSV_FILE = 'mis_apuestas_poisson.csv'
+st.set_page_config(page_title="Dixon-Coles Pro", layout="wide", page_icon="⚽")
+CSV_FILE = 'mis_apuestas_pro.csv'
 
-# Inyectamos CSS corregido para que se vea bien en modo oscuro
+# Estilos CSS para modo oscuro (Tarjetas grises elegantes)
 st.markdown("""
 <style>
-    /* Estilo para las métricas (cajitas de números) */
     div[data-testid="stMetric"] {
-        background-color: #262730; /* <-- ESTO ES LO QUE CAMBIÓ (Gris oscuro) */
-        border: 1px solid #464b5c; /* Borde más sutil */
+        background-color: #262730;
+        border: 1px solid #464b5c;
         padding: 15px;
         border-radius: 10px;
-        box-shadow: 2px 2px 5px rgba(0,0,0,0.2);
+        box-shadow: 2px 2px 5px rgba(0,0,0,0.3);
     }
-    /* Centrar títulos */
     h1, h2, h3 { text-align: center; }
 </style>
 """, unsafe_allow_html=True)
 
 # ======================================================
-# 2. LÓGICA MATEMÁTICA 🧠 (Igual que antes)
+# 2. LÓGICA DE DATOS Y MODELO MATEMÁTICO 🧠
 # ======================================================
 @st.cache_data
 def fetch_live_soccer_data(league_code="SP1"):
+    """Descarga datos incluyendo cuotas históricas (B365)"""
     url = f"https://www.football-data.co.uk/mmz4281/2526/{league_code}.csv"
     try:
         df = pd.read_csv(url)
-        df = df[['Date', 'HomeTeam', 'AwayTeam', 'FTHG', 'FTAG']]
-        df.columns = ['date', 'home', 'away', 'home_goals', 'away_goals']
+        # Seleccionamos columnas clave + Cuotas de Bet365 para el Backtest
+        cols = ['Date', 'HomeTeam', 'AwayTeam', 'FTHG', 'FTAG', 'B365H', 'B365D', 'B365A']
+        # Filtramos solo las que existan (por seguridad)
+        actual_cols = [c for c in cols if c in df.columns]
+        df = df[actual_cols]
+        
+        # Renombramos para facilitar uso
+        new_names = ['date', 'home', 'away', 'home_goals', 'away_goals', 'odd_h', 'odd_d', 'odd_a']
+        # Ajustamos si faltan columnas de cuotas
+        if len(actual_cols) == 8:
+            df.columns = new_names
+        else:
+            # Si no hay cuotas, usamos nombres básicos
+            df = df[['Date', 'HomeTeam', 'AwayTeam', 'FTHG', 'FTAG']]
+            df.columns = ['date', 'home', 'away', 'home_goals', 'away_goals']
+            df['odd_h'] = 1.0; df['odd_d'] = 1.0; df['odd_a'] = 1.0 # Placeholder
+
         df = df.dropna()
         df['date'] = pd.to_datetime(df['date'], dayfirst=True, errors='coerce')
         return df
     except: return pd.DataFrame()
 
 def calculate_strengths(df):
+    """Calcula fuerza de ataque/defensa con Time Decay"""
     last_date = df['date'].max()
     df['days_ago'] = (last_date - df['date']).dt.days
-    alpha = 0.005 
+    alpha = 0.005 # Decaimiento temporal
     df['weight'] = np.exp(-alpha * df['days_ago'])
+    
     avg_home = np.average(df['home_goals'], weights=df['weight'])
     avg_away = np.average(df['away_goals'], weights=df['weight'])
     
@@ -54,73 +70,54 @@ def calculate_strengths(df):
     all_teams = sorted(list(set(df['home'].unique()) | set(df['away'].unique())))
     
     for team in all_teams:
-        home_matches = df[df['home'] == team]
-        if not home_matches.empty:
-            att_h = np.average(home_matches['home_goals'], weights=home_matches['weight']) / avg_home
-            def_h = np.average(home_matches['away_goals'], weights=home_matches['weight']) / avg_away
+        h_m = df[df['home'] == team]
+        if not h_m.empty:
+            att_h = np.average(h_m['home_goals'], weights=h_m['weight']) / avg_home
+            def_h = np.average(h_m['away_goals'], weights=h_m['weight']) / avg_away
         else: att_h, def_h = 1.0, 1.0
 
-        away_matches = df[df['away'] == team]
-        if not away_matches.empty:
-            att_a = np.average(away_matches['away_goals'], weights=away_matches['weight']) / avg_away
-            def_a = np.average(away_matches['home_goals'], weights=away_matches['weight']) / avg_home
+        a_m = df[df['away'] == team]
+        if not a_m.empty:
+            att_a = np.average(a_m['away_goals'], weights=a_m['weight']) / avg_away
+            def_a = np.average(a_m['home_goals'], weights=a_m['weight']) / avg_home
         else: att_a, def_a = 1.0, 1.0
+            
         team_stats[team] = {'att_h': att_h, 'def_h': def_h, 'att_a': att_a, 'def_a': def_a}
+        
     return team_stats, avg_home, avg_away, all_teams
 
-def get_last_5_matches(df, team_name):
-    mask = (df['home'] == team_name) | (df['away'] == team_name)
-    last_5 = df[mask].sort_values(by='date', ascending=False).head(5).copy()
-    last_5['Fecha'] = last_5['date'].dt.strftime('%d/%m')
-    last_5['Rival'] = np.where(last_5['home'] == team_name, last_5['away'], last_5['home'])
-    last_5['Res'] = last_5['home_goals'].astype(int).astype(str) + "-" + last_5['away_goals'].astype(int).astype(str)
-    last_5['L/V'] = np.where(last_5['home'] == team_name, '🏠', '✈️')
-    return last_5[['Fecha', 'L/V', 'Rival', 'Res']]
-
-# ======================================================
-# MODELO DIXON-COLES (CORREGIDO) ✅
-# ======================================================
 def predict_match_dixon_coles(home, away, team_stats, avg_h, avg_a):
-    # 1. Calculamos las Lambdas
+    """Modelo Matemático Avanzado con corrección de empates"""
     h_exp = team_stats[home]['att_h'] * team_stats[away]['def_a'] * avg_h
     a_exp = team_stats[away]['att_a'] * team_stats[home]['def_h'] * avg_a
-
+    
     max_goals = 10
     probs = np.zeros((max_goals, max_goals))
+    rho = -0.13 # Factor de corrección Dixon-Coles
 
-    # 2. Parámetro Rho
-    rho = -0.13 
-
-    # 3. Llenamos la matriz
     for x in range(max_goals):
         for y in range(max_goals):
             p_base = poisson.pmf(x, h_exp) * poisson.pmf(y, a_exp)
-            
             correction = 1.0
-            if x == 0 and y == 0: correction = 1.0 - (h_exp * a_exp * rho)
-            elif x == 0 and y == 1: correction = 1.0 + (h_exp * rho)
-            elif x == 1 and y == 0: correction = 1.0 + (a_exp * rho)
-            elif x == 1 and y == 1: correction = 1.0 - (rho)
-            
+            if x==0 and y==0: correction = 1.0 - (h_exp * a_exp * rho)
+            elif x==0 and y==1: correction = 1.0 + (h_exp * rho)
+            elif x==1 and y==0: correction = 1.0 + (a_exp * rho)
+            elif x==1 and y==1: correction = 1.0 - (rho)
             probs[x][y] = p_base * correction
+            
+    probs = np.maximum(0, probs) # Corrección de negativos
+    probs = probs / probs.sum() # Normalización
 
-    # ⚠️ CORRECCIÓN AQUÍ: Usamos np.maximum en lugar de max
-    probs = np.maximum(0, probs) 
-    
-    # Normalización
-    probs = probs / probs.sum()
-
-    # 4. Resultados finales
     p_home = np.tril(probs, -1).sum()
     p_draw = np.diag(probs).sum()
     p_away = np.triu(probs, 1).sum()
-
+    
     p_o25 = 0
     for i in range(max_goals):
         for j in range(max_goals):
-            if (i + j) > 2.5: p_o25 += probs[i][j]
-    
-    # Top 3 Marcadores
+            if (i+j) > 2.5: p_o25 += probs[i][j]
+
+    # Top 3 Scores
     flat_indices = np.argsort(probs.ravel())[::-1][:3]
     top_scores = []
     for idx in flat_indices:
@@ -129,173 +126,180 @@ def predict_match_dixon_coles(home, away, team_stats, avg_h, avg_a):
 
     return h_exp, a_exp, p_home, p_draw, p_away, p_o25, top_scores
 
-def calculate_kelly_criterion(prob_real, odd_bookie):
-    if prob_real <= 0 or odd_bookie <= 1: return 0.0
-    b = odd_bookie - 1
-    f = (b * prob_real - (1 - prob_real)) / b
+def run_backtest(df, team_stats, avg_h, avg_a):
+    """Prueba el modelo con los últimos 20 partidos reales"""
+    recent = df.tail(20).copy()
+    results = []
+    correct, bal = 0, 0
+    
+    for _, row in recent.iterrows():
+        _, _, ph, pd_prob, pa, _, _ = predict_match_dixon_coles(row['home'], row['away'], team_stats, avg_h, avg_a)
+        
+        # Determinar predicción del modelo
+        if ph > pd_prob and ph > pa: pred, prob, odd, res_real = "Local", ph, row['odd_h'], ("Local" if row['home_goals'] > row['away_goals'] else "Fallo")
+        elif pa > ph and pa > pd_prob: pred, prob, odd, res_real = "Visita", pa, row['odd_a'], ("Visita" if row['away_goals'] > row['home_goals'] else "Fallo")
+        else: pred, prob, odd, res_real = "Empate", pd_prob, row['odd_d'], ("Empate" if row['home_goals'] == row['away_goals'] else "Fallo")
+        
+        is_win = (pred == res_real)
+        profit = (odd - 1) if is_win else -1
+        if is_win: correct += 1
+        bal += profit
+        
+        results.append({
+            "Partido": f"{row['home']} vs {row['away']}",
+            "Predicción": f"{pred} ({prob*100:.0f}%)",
+            "Realidad": f"{int(row['home_goals'])}-{int(row['away_goals'])}",
+            "Cuota": odd,
+            "Res": "✅" if is_win else "❌",
+            "P/L": round(profit, 2)
+        })
+    return pd.DataFrame(results), correct, bal
+
+# ======================================================
+# 3. UTILIDADES VISUALES Y GESTIÓN 🛠️
+# ======================================================
+def plot_gauge(val, title, color):
+    return go.Figure(go.Indicator(
+        mode="gauge+number", value=val*100, title={'text': title},
+        gauge={'axis': {'range': [0, 100]}, 'bar': {'color': color}, 'bgcolor': "white"}
+    )).update_layout(height=150, margin=dict(l=20, r=20, t=30, b=20))
+
+def get_last_5(df, team):
+    mask = (df['home'] == team) | (df['away'] == team)
+    l5 = df[mask].sort_values(by='date', ascending=False).head(5).copy()
+    l5['Rival'] = np.where(l5['home'] == team, l5['away'], l5['home'])
+    l5['Score'] = l5['home_goals'].astype(int).astype(str) + "-" + l5['away_goals'].astype(int).astype(str)
+    l5['Sede'] = np.where(l5['home'] == team, '🏠', '✈️')
+    return l5[['Sede', 'Rival', 'Score']]
+
+def calculate_kelly(prob, odd):
+    if prob <= 0 or odd <= 1: return 0.0
+    b = odd - 1
+    f = (b * prob - (1 - prob)) / b
     return max(0.0, f * 0.5) * 100
 
-# ======================================================
-# 3. FUNCIONES VISUALES NUEVAS (VELOCÍMETROS) 🏎️
-# ======================================================
-def plot_gauge(value, title, color):
-    fig = go.Figure(go.Indicator(
-        mode = "gauge+number",
-        value = value * 100,
-        title = {'text': title, 'font': {'size': 18}},
-        gauge = {
-            'axis': {'range': [0, 100]},
-            'bar': {'color': color},
-            'bgcolor': "white",
-            'borderwidth': 2,
-            'bordercolor': "gray",
-            'steps': [{'range': [0, 100], 'color': '#f0f2f6'}]
-        }
-    ))
-    fig.update_layout(height=180, margin=dict(l=20, r=20, t=30, b=20))
-    return fig
-
-# ======================================================
-# 4. GESTIÓN DE APUESTAS 💰
-# ======================================================
-def load_bets():
-    if os.path.exists(CSV_FILE): return pd.read_csv(CSV_FILE)
-    return pd.DataFrame(columns=["ID", "Fecha", "Liga", "Partido", "Pick", "Cuota", "Stake", "Prob_Modelo", "Estado", "Ganancia"])
-
-def save_bet(bet_data):
-    df = load_bets()
-    df = pd.concat([df, pd.DataFrame([bet_data])], ignore_index=True)
-    df.to_csv(CSV_FILE, index=False)
-
-def update_bet_status(bet_id, new_status):
-    df = load_bets()
-    idx = df[df['ID'].astype(str) == str(bet_id)].index
-    if not idx.empty:
-        i = idx[0]
-        df.at[i, 'Estado'] = new_status
-        stake, odd = float(df.at[i, 'Stake']), float(df.at[i, 'Cuota'])
-        df.at[i, 'Ganancia'] = (stake * odd) - stake if new_status == 'Ganada' else (-stake if new_status == 'Perdida' else 0.0)
+def manage_bets(mode, data=None, id_bet=None, status=None):
+    if os.path.exists(CSV_FILE): df = pd.read_csv(CSV_FILE)
+    else: df = pd.DataFrame(columns=["ID", "Fecha", "Liga", "Partido", "Pick", "Cuota", "Stake", "Prob", "Estado", "Ganancia"])
+    
+    if mode == "save":
+        df = pd.concat([df, pd.DataFrame([data])], ignore_index=True)
         df.to_csv(CSV_FILE, index=False)
-        return True
-    return False
+    elif mode == "update":
+        idx = df[df['ID'].astype(str) == str(id_bet)].index
+        if not idx.empty:
+            i = idx[0]
+            df.at[i, 'Estado'] = status
+            profit = (df.at[i, 'Stake'] * df.at[i, 'Cuota']) - df.at[i, 'Stake'] if status == 'Ganada' else (-df.at[i, 'Stake'] if status == 'Perdida' else 0)
+            df.at[i, 'Ganancia'] = profit
+            df.to_csv(CSV_FILE, index=False)
+    return df
 
 # ======================================================
-# 5. INTERFAZ GRÁFICA (UI) MEJORADA 🌟
+# 4. INTERFAZ GRÁFICA (UI) 🌟
 # ======================================================
-
-# --- SIDEBAR ---
 with st.sidebar:
     st.header("⚙️ Configuración")
-    league_map = {"SP1": "🇪🇸 La Liga", "E0": "🏴󠁧󠁢󠁥󠁮󠁧󠁿 Premier League", "I1": "🇮🇹 Serie A", "D1": "🇩🇪 Bundesliga", "F1": "🇫🇷 Ligue 1"}
-    league_code = st.selectbox("Liga", list(league_map.keys()), format_func=lambda x: league_map[x])
-    df_data = fetch_live_soccer_data(league_code)
+    leagues = {"SP1": "🇪🇸 La Liga", "E0": "🏴󠁧󠁢󠁥󠁮󠁧󠁿 Premier League", "I1": "🇮🇹 Serie A", "D1": "🇩🇪 Bundesliga", "F1": "🇫🇷 Ligue 1"}
+    code = st.selectbox("Liga", list(leagues.keys()), format_func=lambda x: leagues[x])
     
-    if not df_data.empty:
-        stats, avg_h, avg_a, teams_list = calculate_strengths(df_data)
-        st.success(f"✅ {len(df_data)} partidos cargados")
-    else:
-        st.error("Error de conexión"); st.stop()
+    df = fetch_live_soccer_data(code)
+    if not df.empty:
+        stats, ah, aa, teams = calculate_strengths(df)
+        st.success(f"✅ {len(df)} partidos cargados")
+    else: st.error("Error cargando datos"); st.stop()
     
     st.divider()
-    bankroll = st.number_input("💰 Tu Banco Actual ($)", value=1000.0, step=50.0)
+    bank = st.number_input("💰 Tu Banco ($)", 1000.0, step=50.0)
 
-# --- TÍTULO Y SELECCIÓN ---
-st.title(f"⚽ {league_map[league_code]} Dashboard")
+st.title(f"🤖 Dixon-Coles: {leagues[code]}")
 
 c1, c2 = st.columns(2)
-home_team = c1.selectbox("Local", teams_list, index=0)
-away_team = c2.selectbox("Visitante", [t for t in teams_list if t != home_team], index=0)
+home = c1.selectbox("Local", teams)
+away = c2.selectbox("Visitante", [t for t in teams if t != home])
 
-h_exp, a_exp, p_home, p_draw, p_away, p_o25, top_scores = predict_match_dixon_coles(home_team, away_team, stats, avg_h, avg_a)
+# EJECUCIÓN DEL MODELO
+h_exp, a_exp, ph, pd_prob, pa, po25, top_sc = predict_match_dixon_coles(home, away, stats, ah, aa)
 
-# --- VISUALIZACIÓN PRINCIPAL (PESTAÑAS) ---
-tab1, tab2, tab3 = st.tabs(["📊 Análisis Visual", "💰 Valor & Apuesta", "📜 Historial"])
+# PESTAÑAS
+t1, t2, t3, t4 = st.tabs(["📊 Análisis", "💰 Valor", "📜 Historial", "🧪 Laboratorio"])
 
-with tab1:
-    # 1. TARJETAS DE GOLES
+with t1:
     st.markdown("### 🥅 Expectativa de Goles")
-    col_g1, col_g2, col_g3 = st.columns(3)
-    col_g1.metric(f"{home_team}", f"{h_exp:.2f}", delta="Goles Esperados")
-    col_g2.metric("Total Partido", f"{h_exp + a_exp:.2f}", delta="Overs")
-    col_g3.metric(f"{away_team}", f"{a_exp:.2f}", delta="Goles Esperados")
+    c_g1, c_g2, c_g3 = st.columns(3)
+    c_g1.metric(home, f"{h_exp:.2f}")
+    c_g2.metric("Total", f"{h_exp+a_exp:.2f}", delta="Over 2.5: "+f"{po25*100:.0f}%")
+    c_g3.metric(away, f"{a_exp:.2f}")
     
-    st.divider()
-    
-    # 2. VELOCÍMETROS (GAUGES)
-    st.markdown("### 🏆 Probabilidades de Victoria")
+    st.markdown("### 🏆 Probabilidades")
     g1, g2, g3 = st.columns(3)
-    g1.plotly_chart(plot_gauge(p_home, f"Gana {home_team}", "#4CAF50"), use_container_width=True)
-    g2.plotly_chart(plot_gauge(p_draw, "Empate", "#FFC107"), use_container_width=True)
-    g3.plotly_chart(plot_gauge(p_away, f"Gana {away_team}", "#2196F3"), use_container_width=True)
-
-    # 3. MARCADORES EXACTOS
-    st.info(f"🎯 **Marcador más probable:** {top_scores[0][0]} ({top_scores[0][1]*100:.1f}%) | **Segunda opción:** {top_scores[1][0]} ({top_scores[1][1]*100:.1f}%)")
+    g1.plotly_chart(plot_gauge(ph, f"Gana {home}", "#4CAF50"), use_container_width=True)
+    g2.plotly_chart(plot_gauge(pd_prob, "Empate", "#FFC107"), use_container_width=True)
+    g3.plotly_chart(plot_gauge(pa, f"Gana {away}", "#2196F3"), use_container_width=True)
     
-    # 4. ESTADO DE FORMA
-    st.markdown("### 📉 Estado de Forma (Últimos 5)")
+    st.info(f"🎯 **Marcador Exacto:** {top_sc[0][0]} ({top_sc[0][1]*100:.1f}%) | **Opción 2:** {top_sc[1][0]}")
+    
+    st.markdown("### 📉 Estado de Forma")
     cf1, cf2 = st.columns(2)
-    with cf1: st.dataframe(get_last_5_matches(df_data, home_team), hide_index=True, use_container_width=True)
-    with cf2: st.dataframe(get_last_5_matches(df_data, away_team), hide_index=True, use_container_width=True)
+    with cf1: st.dataframe(get_last_5(df, home), use_container_width=True, hide_index=True)
+    with cf2: st.dataframe(get_last_5(df, away), use_container_width=True, hide_index=True)
 
-with tab2:
-    st.markdown("### 🏦 Cazador de Valor")
-    col_odd1, col_odd2, col_odd3 = st.columns(3)
-    odd_h = col_odd1.number_input("Cuota Local", 1.01, 20.0, 2.00)
-    odd_d = col_odd2.number_input("Cuota Empate", 1.01, 20.0, 3.20)
-    odd_a = col_odd3.number_input("Cuota Visita", 1.01, 20.0, 3.50)
+with t2:
+    st.markdown("### 🏦 Buscador de Valor")
+    co1, co2, co3 = st.columns(3)
+    oh = co1.number_input("Cuota 1", 1.01, 20.0, 2.0)
+    od = co2.number_input("Cuota X", 1.01, 20.0, 3.2)
+    oa = co3.number_input("Cuota 2", 1.01, 20.0, 3.5)
     
-    # Kelly & Valor
-    ev_h, kelly_h = (p_home * odd_h) - 1, calculate_kelly_criterion(p_home, odd_h)
-    ev_d, kelly_d = (p_draw * odd_d) - 1, calculate_kelly_criterion(p_draw, odd_d)
-    ev_a, kelly_a = (p_away * odd_a) - 1, calculate_kelly_criterion(p_away, odd_a)
+    ev_h, kh = (ph*oh)-1, calculate_kelly(ph, oh)
+    ev_d, kd = (pd_prob*od)-1, calculate_kelly(pd_prob, od)
+    ev_a, ka = (pa*oa)-1, calculate_kelly(pa, oa)
     
-    st.divider()
-    
-    # Mostrar alertas de Valor
-    def show_card(label, ev, kelly, odd):
+    def card(lab, ev, k, odd):
         if ev > 0:
-            st.success(f"✅ **{label}** (Cuota {odd})")
-            st.markdown(f"**Rentabilidad:** +{ev*100:.1f}% | **Apostar:** ${bankroll * (kelly/100):.2f}")
-        else:
-            st.error(f"❌ **{label}**: No apostar (EV {ev*100:.1f}%)")
-
-    c_val1, c_val2, c_val3 = st.columns(3)
-    with c_val1: show_card(f"Gana {home_team}", ev_h, kelly_h, odd_h)
-    with c_val2: show_card("Empate", ev_d, kelly_d, odd_d)
-    with c_val3: show_card(f"Gana {away_team}", ev_a, kelly_a, odd_a)
-
+            st.success(f"✅ **{lab}** (+{ev*100:.1f}%)")
+            st.markdown(f"**Apostar:** ${bank*(k/100):.2f} ({k:.1f}%)")
+        else: st.error(f"❌ **{lab}** (EV {ev*100:.1f}%)")
+            
+    cv1, cv2, cv3 = st.columns(3)
+    with cv1: card(home, ev_h, kh, oh)
+    with cv2: card("Empate", ev_d, kd, od)
+    with cv3: card(away, ev_a, ka, oa)
+    
     st.divider()
-    st.subheader("📝 Registrar Apuesta")
-    with st.form("bet_form"):
-        pick_sel = st.selectbox("Tu Elección", [f"Gana {home_team}", "Empate", f"Gana {away_team}"])
-        stake_in = st.number_input("Dinero Apostado ($)", 1.0, 5000.0, 50.0)
+    with st.form("bet"):
+        pk = st.selectbox("Pick", [f"Gana {home}", "Empate", f"Gana {away}"])
+        stk = st.number_input("Stake $", 1.0, 5000.0, 50.0)
+        if "Gana "+home in pk: fo, fp = oh, ph
+        elif "Empate" in pk: fo, fp = od, pd_prob
+        else: fo, fp = oa, pa
         
-        if "Gana " + home_team in pick_sel: f_odd, f_prob = odd_h, p_home
-        elif "Empate" in pick_sel: f_odd, f_prob = odd_d, p_draw
-        else: f_odd, f_prob = odd_a, p_away
-        
-        if st.form_submit_button("💾 Guardar Apuesta"):
-            save_bet({"ID": pd.Timestamp.now().strftime('%Y%m%d%H%M%S'), "Fecha": pd.Timestamp.now().strftime('%Y-%m-%d'), 
-                      "Liga": league_code, "Partido": f"{home_team} vs {away_team}", "Pick": pick_sel, 
-                      "Cuota": f_odd, "Stake": stake_in, "Prob_Modelo": round(f_prob, 4), "Estado": "Pendiente", "Ganancia": 0.0})
-            st.success("Guardada!"); st.rerun()
+        if st.form_submit_button("💾 Guardar"):
+            manage_bets("save", {"ID": pd.Timestamp.now().strftime('%Y%m%d%H%M%S'), "Fecha": pd.Timestamp.now().strftime('%Y-%m-%d'), 
+                                 "Liga": code, "Partido": f"{home}-{away}", "Pick": pk, "Cuota": fo, "Stake": stk, "Prob": round(fp, 4), "Estado": "Pendiente", "Ganancia": 0.0})
+            st.success("Guardado!"); st.rerun()
 
-with tab3:
+with t3:
     st.markdown("### 📜 Historial")
-    df_bets = load_bets()
-    if not df_bets.empty:
-        profit = df_bets['Ganancia'].sum()
-        st.metric("Ganancia Neta", f"${profit:.2f}", delta_color="normal")
-        st.dataframe(df_bets.sort_values(by="Fecha", ascending=False), use_container_width=True)
-        
-        with st.expander("🔄 Actualizar Resultados"):
-            pends = df_bets[df_bets['Estado'] == 'Pendiente']
-            if not pends.empty:
-                b_id = st.selectbox("ID Apuesta", pends['ID'].values)
+    db = manage_bets("load")
+    if not db.empty:
+        st.metric("Balance Total", f"${db['Ganancia'].sum():.2f}")
+        st.dataframe(db.sort_values(by="Fecha", ascending=False), use_container_width=True)
+        with st.expander("Actualizar"):
+            pen = db[db['Estado']=='Pendiente']
+            if not pen.empty:
+                bid = st.selectbox("ID", pen['ID'].unique())
                 res = st.selectbox("Resultado", ["Ganada", "Perdida", "Push"])
-                if st.button("Actualizar"): update_bet_status(b_id, res); st.rerun()
+                if st.button("Actualizar "): manage_bets("update", id_bet=bid, status=res); st.rerun()
             else: st.info("No hay pendientes")
 
-    else: st.info("Historial vacío")
-
-
+with t4:
+    st.markdown("### 🧪 Laboratorio de Backtesting")
+    st.info("Pon a prueba el modelo con los últimos 20 partidos REALES de esta liga.")
+    if st.button("▶️ Ejecutar Simulación"):
+        test_df, ok, profit = run_backtest(df, stats, ah, aa)
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Aciertos", f"{ok}/20 ({ok/20*100:.0f}%)")
+        m2.metric("Profit (Stake 1U)", f"{profit:.2f} U", delta_color="normal")
+        m3.metric("Estado", "🔥 Rentable" if profit > 0 else "❄️ Pérdidas")
+        st.dataframe(test_df, use_container_width=True)
