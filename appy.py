@@ -6,9 +6,9 @@ import plotly.graph_objects as go
 import os
 
 # ======================================================
-# 1. CONFIGURACIÓN Y ESTILOS CSS (DARK MODE) 🎨
+# 1. CONFIGURACIÓN Y ESTILOS CSS
 # ======================================================
-st.set_page_config(page_title="AI Hybrid Betting", layout="wide", page_icon="🧠")
+st.set_page_config(page_title="Tactical AI Betting", layout="wide", page_icon="🧠")
 CSV_FILE = 'mis_apuestas_pro.csv'
 
 st.markdown("""
@@ -25,20 +25,17 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ======================================================
-# 2. LÓGICA DE DATOS Y MODELO HÍBRIDO 🧠
+# 2. LÓGICA DE DATOS
 # ======================================================
 @st.cache_data
 def fetch_live_soccer_data(league_code="SP1"):
-    """Descarga datos incluyendo Cuotas y TIROS A PUERTA (HST/AST)"""
     url = f"https://www.football-data.co.uk/mmz4281/2526/{league_code}.csv"
     try:
         df = pd.read_csv(url)
-        # Seleccionamos Goles, Cuotas y Tiros (HST = Home Shots Target)
         cols = ['Date', 'HomeTeam', 'AwayTeam', 'FTHG', 'FTAG', 'B365H', 'B365D', 'B365A', 'HST', 'AST']
         actual_cols = [c for c in cols if c in df.columns]
         df = df[actual_cols]
         
-        # Renombramos
         mapping = {
             'Date': 'date', 'HomeTeam': 'home', 'AwayTeam': 'away', 
             'FTHG': 'home_goals', 'FTAG': 'away_goals', 
@@ -47,7 +44,6 @@ def fetch_live_soccer_data(league_code="SP1"):
         }
         df = df.rename(columns=mapping)
         
-        # Si la liga no tiene datos de tiros, rellenamos con 0 para no romper el código
         if 'home_shots' not in df.columns: df['home_shots'] = 0
         if 'away_shots' not in df.columns: df['away_shots'] = 0
 
@@ -56,22 +52,23 @@ def fetch_live_soccer_data(league_code="SP1"):
         return df
     except: return pd.DataFrame()
 
-def calculate_strengths(df):
+def calculate_strengths(df, mode="Híbrido"):
     """
-    Calcula fuerza HÍBRIDA:
-    Fuerza = (60% Goles) + (40% Generación de Juego/Tiros)
+    Calcula fuerza según el MODO elegido:
+    - "Clásico": Solo usa Goles (Mejor para ligas cerradas/impredecibles).
+    - "Híbrido": Usa Goles + Tiros (Mejor para ligas ofensivas).
     """
     last_date = df['date'].max()
     df['days_ago'] = (last_date - df['date']).dt.days
     alpha = 0.005 
     df['weight'] = np.exp(-alpha * df['days_ago'])
     
-    # 1. Promedios de la Liga
     avg_h_goals = np.average(df['home_goals'], weights=df['weight'])
     avg_a_goals = np.average(df['away_goals'], weights=df['weight'])
     
-    # Revisamos si hay datos de tiros válidos en esta liga
-    use_shots = df['home_shots'].sum() > 0
+    # Solo usamos tiros si el modo es Híbrido Y existen datos
+    use_shots = (mode == "Híbrido") and (df['home_shots'].sum() > 0)
+    
     if use_shots:
         avg_h_shots = np.average(df['home_shots'], weights=df['weight'])
         avg_a_shots = np.average(df['away_shots'], weights=df['weight'])
@@ -80,25 +77,23 @@ def calculate_strengths(df):
     all_teams = sorted(list(set(df['home'].unique()) | set(df['away'].unique())))
     
     for team in all_teams:
-        # --- LOCAL ---
+        # LOCAL
         h_m = df[df['home'] == team]
         if not h_m.empty:
-            # Fuerza Goles
             att_h_g = np.average(h_m['home_goals'], weights=h_m['weight']) / avg_h_goals
             def_h_g = np.average(h_m['away_goals'], weights=h_m['weight']) / avg_a_goals
             
-            # Fuerza Tiros (Si hay datos)
             if use_shots:
                 att_h_s = np.average(h_m['home_shots'], weights=h_m['weight']) / avg_h_shots
                 def_h_s = np.average(h_m['away_shots'], weights=h_m['weight']) / avg_a_shots
-                # MEZCLA HÍBRIDA (0.6 / 0.4)
+                # MEZCLA 60/40
                 att_h = (att_h_g * 0.6) + (att_h_s * 0.4)
                 def_h = (def_h_g * 0.6) + (def_h_s * 0.4)
             else:
                 att_h, def_h = att_h_g, def_h_g
         else: att_h, def_h = 1.0, 1.0
 
-        # --- VISITANTE ---
+        # VISITANTE
         a_m = df[df['away'] == team]
         if not a_m.empty:
             att_a_g = np.average(a_m['away_goals'], weights=a_m['weight']) / avg_a_goals
@@ -107,7 +102,7 @@ def calculate_strengths(df):
             if use_shots:
                 att_a_s = np.average(a_m['away_shots'], weights=a_m['weight']) / avg_a_shots
                 def_a_s = np.average(a_m['home_shots'], weights=a_m['weight']) / avg_h_shots
-                # MEZCLA HÍBRIDA
+                # MEZCLA 60/40
                 att_a = (att_a_g * 0.6) + (att_a_s * 0.4)
                 def_a = (def_a_g * 0.6) + (def_a_s * 0.4)
             else:
@@ -116,16 +111,15 @@ def calculate_strengths(df):
             
         team_stats[team] = {'att_h': att_h, 'def_h': def_h, 'att_a': att_a, 'def_a': def_a}
         
-    return team_stats, avg_h_goals, avg_a_goals, all_teams
+    return team_stats, avg_h_goals, avg_a_goals, all_teams, use_shots
 
 def predict_match_dixon_coles(home, away, team_stats, avg_h, avg_a):
-    """Modelo Matemático Avanzado con corrección de empates"""
     h_exp = team_stats[home]['att_h'] * team_stats[away]['def_a'] * avg_h
     a_exp = team_stats[away]['att_a'] * team_stats[home]['def_h'] * avg_a
     
     max_goals = 10
     probs = np.zeros((max_goals, max_goals))
-    rho = -0.13 # Factor corrección Dixon-Coles
+    rho = -0.13
 
     for x in range(max_goals):
         for y in range(max_goals):
@@ -163,10 +157,8 @@ def run_backtest(df, team_stats, avg_h, avg_a):
     correct, bal = 0, 0
     
     for _, row in recent.iterrows():
-        # Usamos el modelo para predecir el pasado
         _, _, ph, pd_prob, pa, _, _ = predict_match_dixon_coles(row['home'], row['away'], team_stats, avg_h, avg_a)
         
-        # Estrategia: Apostar al resultado con mayor probabilidad matemática
         if ph > pd_prob and ph > pa: pred, prob, odd, res_real = "Local", ph, row.get('odd_h', 1.0), ("Local" if row['home_goals'] > row['away_goals'] else "Fallo")
         elif pa > ph and pa > pd_prob: pred, prob, odd, res_real = "Visita", pa, row.get('odd_a', 1.0), ("Visita" if row['away_goals'] > row['home_goals'] else "Fallo")
         else: pred, prob, odd, res_real = "Empate", pd_prob, row.get('odd_d', 1.0), ("Empate" if row['home_goals'] == row['away_goals'] else "Fallo")
@@ -187,7 +179,7 @@ def run_backtest(df, team_stats, avg_h, avg_a):
     return pd.DataFrame(results), correct, bal
 
 # ======================================================
-# 3. UTILIDADES VISUALES Y GESTIÓN 🛠️
+# 3. UTILIDADES
 # ======================================================
 def plot_gauge(val, title, color):
     return go.Figure(go.Indicator(
@@ -227,42 +219,48 @@ def manage_bets(mode, data=None, id_bet=None, status=None):
     return df
 
 # ======================================================
-# 4. INTERFAZ GRÁFICA (UI) 🌟
+# 4. INTERFAZ GRÁFICA
 # ======================================================
 with st.sidebar:
     st.header("⚙️ Configuración")
     leagues = {"SP1": "🇪🇸 La Liga", "E0": "🏴󠁧󠁢󠁥󠁮󠁧󠁿 Premier League", "I1": "🇮🇹 Serie A", "D1": "🇩🇪 Bundesliga", "F1": "🇫🇷 Ligue 1"}
     code = st.selectbox("Liga", list(leagues.keys()), format_func=lambda x: leagues[x])
     
+    # --- SELECTOR DE ESTRATEGIA (NUEVO) ---
+    st.divider()
+    st.markdown("### 🧠 Estrategia del Modelo")
+    strategy = st.radio("Selecciona enfoque:", ["Clásico (Solo Goles)", "Híbrido (Goles + Tiros)"], index=1)
+    
+    # Mapeo simple del string a lo que entiende la función
+    mode_input = "Híbrido" if "Híbrido" in strategy else "Clásico"
+    
     df = fetch_live_soccer_data(code)
     if not df.empty:
-        stats, ah, aa, teams = calculate_strengths(df)
+        # Pasamos el MODO elegido a la calculadora
+        stats, ah, aa, teams, used_shots = calculate_strengths(df, mode=mode_input)
+        
         st.success(f"✅ {len(df)} partidos cargados")
-        # Mostrar si el modelo híbrido está activo
-        has_shots = df['home_shots'].sum() > 0
-        if has_shots:
-            st.caption("🧠 Modelo Híbrido: ACTIVO (Goles + Tiros)")
+        if used_shots:
+            st.caption("🚀 Modo Híbrido Activado")
         else:
-            st.caption("⚠️ Modelo Básico: Solo Goles (Faltan datos de tiros)")
+            st.caption("🛡️ Modo Clásico (Goles) Activado")
     else: st.error("Error cargando datos"); st.stop()
     
     st.divider()
     bank = st.number_input("💰 Tu Banco ($)", 1000.0, step=50.0)
 
-st.title(f"🧠 AI Betting: {leagues[code]}")
+st.title(f"⚽ {leagues[code]} Dashboard")
 
 c1, c2 = st.columns(2)
 home = c1.selectbox("Local", teams)
 away = c2.selectbox("Visitante", [t for t in teams if t != home])
 
-# EJECUCIÓN DEL MODELO
 h_exp, a_exp, ph, pd_prob, pa, po25, top_sc = predict_match_dixon_coles(home, away, stats, ah, aa)
 
-# PESTAÑAS
 t1, t2, t3, t4 = st.tabs(["📊 Análisis", "💰 Valor", "📜 Historial", "🧪 Laboratorio"])
 
 with t1:
-    st.markdown("### 🥅 Expectativa de Goles (Híbrida)")
+    st.markdown("### 🥅 Expectativa de Goles")
     c_g1, c_g2, c_g3 = st.columns(3)
     c_g1.metric(home, f"{h_exp:.2f}")
     c_g2.metric("Total", f"{h_exp+a_exp:.2f}", delta="Over 2.5: "+f"{po25*100:.0f}%")
@@ -274,7 +272,7 @@ with t1:
     g2.plotly_chart(plot_gauge(pd_prob, "Empate", "#FFC107"), use_container_width=True)
     g3.plotly_chart(plot_gauge(pa, f"Gana {away}", "#2196F3"), use_container_width=True)
     
-    st.info(f"🎯 **Marcador Exacto:** {top_sc[0][0]} ({top_sc[0][1]*100:.1f}%) | **Opción 2:** {top_sc[1][0]}")
+    st.info(f"🎯 **Marcador:** {top_sc[0][0]} ({top_sc[0][1]*100:.1f}%) | **Opción 2:** {top_sc[1][0]}")
     
     st.markdown("### 📉 Estado de Forma")
     cf1, cf2 = st.columns(2)
@@ -332,7 +330,7 @@ with t3:
 
 with t4:
     st.markdown("### 🧪 Laboratorio de Backtesting")
-    st.info("Pon a prueba el modelo Híbrido con los últimos 20 partidos.")
+    st.info(f"Probando estrategia: **{strategy}**")
     if st.button("▶️ Ejecutar Simulación"):
         test_df, ok, profit = run_backtest(df, stats, ah, aa)
         m1, m2, m3 = st.columns(3)
