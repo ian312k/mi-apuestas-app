@@ -4,3 +4,4 @@ numpy
 scipy
 plotly
 watchdog
+scikit-learn
