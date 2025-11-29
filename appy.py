@@ -8,10 +8,9 @@ import os
 # ======================================================
 # 1. CONFIGURACIÓN Y ESTILOS CSS (DARK MODE) 🎨
 # ======================================================
-st.set_page_config(page_title="Dixon-Coles Pro", layout="wide", page_icon="⚽")
+st.set_page_config(page_title="AI Hybrid Betting", layout="wide", page_icon="🧠")
 CSV_FILE = 'mis_apuestas_pro.csv'
 
-# Estilos CSS para modo oscuro (Tarjetas grises elegantes)
 st.markdown("""
 <style>
     div[data-testid="stMetric"] {
@@ -26,30 +25,31 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ======================================================
-# 2. LÓGICA DE DATOS Y MODELO MATEMÁTICO 🧠
+# 2. LÓGICA DE DATOS Y MODELO HÍBRIDO 🧠
 # ======================================================
 @st.cache_data
 def fetch_live_soccer_data(league_code="SP1"):
-    """Descarga datos incluyendo cuotas históricas (B365)"""
+    """Descarga datos incluyendo Cuotas y TIROS A PUERTA (HST/AST)"""
     url = f"https://www.football-data.co.uk/mmz4281/2526/{league_code}.csv"
     try:
         df = pd.read_csv(url)
-        # Seleccionamos columnas clave + Cuotas de Bet365 para el Backtest
-        cols = ['Date', 'HomeTeam', 'AwayTeam', 'FTHG', 'FTAG', 'B365H', 'B365D', 'B365A']
-        # Filtramos solo las que existan (por seguridad)
+        # Seleccionamos Goles, Cuotas y Tiros (HST = Home Shots Target)
+        cols = ['Date', 'HomeTeam', 'AwayTeam', 'FTHG', 'FTAG', 'B365H', 'B365D', 'B365A', 'HST', 'AST']
         actual_cols = [c for c in cols if c in df.columns]
         df = df[actual_cols]
         
-        # Renombramos para facilitar uso
-        new_names = ['date', 'home', 'away', 'home_goals', 'away_goals', 'odd_h', 'odd_d', 'odd_a']
-        # Ajustamos si faltan columnas de cuotas
-        if len(actual_cols) == 8:
-            df.columns = new_names
-        else:
-            # Si no hay cuotas, usamos nombres básicos
-            df = df[['Date', 'HomeTeam', 'AwayTeam', 'FTHG', 'FTAG']]
-            df.columns = ['date', 'home', 'away', 'home_goals', 'away_goals']
-            df['odd_h'] = 1.0; df['odd_d'] = 1.0; df['odd_a'] = 1.0 # Placeholder
+        # Renombramos
+        mapping = {
+            'Date': 'date', 'HomeTeam': 'home', 'AwayTeam': 'away', 
+            'FTHG': 'home_goals', 'FTAG': 'away_goals', 
+            'B365H': 'odd_h', 'B365D': 'odd_d', 'B365A': 'odd_a',
+            'HST': 'home_shots', 'AST': 'away_shots'
+        }
+        df = df.rename(columns=mapping)
+        
+        # Si la liga no tiene datos de tiros, rellenamos con 0 para no romper el código
+        if 'home_shots' not in df.columns: df['home_shots'] = 0
+        if 'away_shots' not in df.columns: df['away_shots'] = 0
 
         df = df.dropna()
         df['date'] = pd.to_datetime(df['date'], dayfirst=True, errors='coerce')
@@ -57,34 +57,66 @@ def fetch_live_soccer_data(league_code="SP1"):
     except: return pd.DataFrame()
 
 def calculate_strengths(df):
-    """Calcula fuerza de ataque/defensa con Time Decay"""
+    """
+    Calcula fuerza HÍBRIDA:
+    Fuerza = (60% Goles) + (40% Generación de Juego/Tiros)
+    """
     last_date = df['date'].max()
     df['days_ago'] = (last_date - df['date']).dt.days
-    alpha = 0.005 # Decaimiento temporal
+    alpha = 0.005 
     df['weight'] = np.exp(-alpha * df['days_ago'])
     
-    avg_home = np.average(df['home_goals'], weights=df['weight'])
-    avg_away = np.average(df['away_goals'], weights=df['weight'])
+    # 1. Promedios de la Liga
+    avg_h_goals = np.average(df['home_goals'], weights=df['weight'])
+    avg_a_goals = np.average(df['away_goals'], weights=df['weight'])
+    
+    # Revisamos si hay datos de tiros válidos en esta liga
+    use_shots = df['home_shots'].sum() > 0
+    if use_shots:
+        avg_h_shots = np.average(df['home_shots'], weights=df['weight'])
+        avg_a_shots = np.average(df['away_shots'], weights=df['weight'])
     
     team_stats = {}
     all_teams = sorted(list(set(df['home'].unique()) | set(df['away'].unique())))
     
     for team in all_teams:
+        # --- LOCAL ---
         h_m = df[df['home'] == team]
         if not h_m.empty:
-            att_h = np.average(h_m['home_goals'], weights=h_m['weight']) / avg_home
-            def_h = np.average(h_m['away_goals'], weights=h_m['weight']) / avg_away
+            # Fuerza Goles
+            att_h_g = np.average(h_m['home_goals'], weights=h_m['weight']) / avg_h_goals
+            def_h_g = np.average(h_m['away_goals'], weights=h_m['weight']) / avg_a_goals
+            
+            # Fuerza Tiros (Si hay datos)
+            if use_shots:
+                att_h_s = np.average(h_m['home_shots'], weights=h_m['weight']) / avg_h_shots
+                def_h_s = np.average(h_m['away_shots'], weights=h_m['weight']) / avg_a_shots
+                # MEZCLA HÍBRIDA (0.6 / 0.4)
+                att_h = (att_h_g * 0.6) + (att_h_s * 0.4)
+                def_h = (def_h_g * 0.6) + (def_h_s * 0.4)
+            else:
+                att_h, def_h = att_h_g, def_h_g
         else: att_h, def_h = 1.0, 1.0
 
+        # --- VISITANTE ---
         a_m = df[df['away'] == team]
         if not a_m.empty:
-            att_a = np.average(a_m['away_goals'], weights=a_m['weight']) / avg_away
-            def_a = np.average(a_m['home_goals'], weights=a_m['weight']) / avg_home
+            att_a_g = np.average(a_m['away_goals'], weights=a_m['weight']) / avg_a_goals
+            def_a_g = np.average(a_m['home_goals'], weights=a_m['weight']) / avg_h_goals
+            
+            if use_shots:
+                att_a_s = np.average(a_m['away_shots'], weights=a_m['weight']) / avg_a_shots
+                def_a_s = np.average(a_m['home_shots'], weights=a_m['weight']) / avg_h_shots
+                # MEZCLA HÍBRIDA
+                att_a = (att_a_g * 0.6) + (att_a_s * 0.4)
+                def_a = (def_a_g * 0.6) + (def_a_s * 0.4)
+            else:
+                att_a, def_a = att_a_g, def_a_g
         else: att_a, def_a = 1.0, 1.0
             
         team_stats[team] = {'att_h': att_h, 'def_h': def_h, 'att_a': att_a, 'def_a': def_a}
         
-    return team_stats, avg_home, avg_away, all_teams
+    return team_stats, avg_h_goals, avg_a_goals, all_teams
 
 def predict_match_dixon_coles(home, away, team_stats, avg_h, avg_a):
     """Modelo Matemático Avanzado con corrección de empates"""
@@ -93,7 +125,7 @@ def predict_match_dixon_coles(home, away, team_stats, avg_h, avg_a):
     
     max_goals = 10
     probs = np.zeros((max_goals, max_goals))
-    rho = -0.13 # Factor de corrección Dixon-Coles
+    rho = -0.13 # Factor corrección Dixon-Coles
 
     for x in range(max_goals):
         for y in range(max_goals):
@@ -105,8 +137,8 @@ def predict_match_dixon_coles(home, away, team_stats, avg_h, avg_a):
             elif x==1 and y==1: correction = 1.0 - (rho)
             probs[x][y] = p_base * correction
             
-    probs = np.maximum(0, probs) # Corrección de negativos
-    probs = probs / probs.sum() # Normalización
+    probs = np.maximum(0, probs) 
+    probs = probs / probs.sum()
 
     p_home = np.tril(probs, -1).sum()
     p_draw = np.diag(probs).sum()
@@ -117,7 +149,6 @@ def predict_match_dixon_coles(home, away, team_stats, avg_h, avg_a):
         for j in range(max_goals):
             if (i+j) > 2.5: p_o25 += probs[i][j]
 
-    # Top 3 Scores
     flat_indices = np.argsort(probs.ravel())[::-1][:3]
     top_scores = []
     for idx in flat_indices:
@@ -127,18 +158,18 @@ def predict_match_dixon_coles(home, away, team_stats, avg_h, avg_a):
     return h_exp, a_exp, p_home, p_draw, p_away, p_o25, top_scores
 
 def run_backtest(df, team_stats, avg_h, avg_a):
-    """Prueba el modelo con los últimos 20 partidos reales"""
     recent = df.tail(20).copy()
     results = []
     correct, bal = 0, 0
     
     for _, row in recent.iterrows():
+        # Usamos el modelo para predecir el pasado
         _, _, ph, pd_prob, pa, _, _ = predict_match_dixon_coles(row['home'], row['away'], team_stats, avg_h, avg_a)
         
-        # Determinar predicción del modelo
-        if ph > pd_prob and ph > pa: pred, prob, odd, res_real = "Local", ph, row['odd_h'], ("Local" if row['home_goals'] > row['away_goals'] else "Fallo")
-        elif pa > ph and pa > pd_prob: pred, prob, odd, res_real = "Visita", pa, row['odd_a'], ("Visita" if row['away_goals'] > row['home_goals'] else "Fallo")
-        else: pred, prob, odd, res_real = "Empate", pd_prob, row['odd_d'], ("Empate" if row['home_goals'] == row['away_goals'] else "Fallo")
+        # Estrategia: Apostar al resultado con mayor probabilidad matemática
+        if ph > pd_prob and ph > pa: pred, prob, odd, res_real = "Local", ph, row.get('odd_h', 1.0), ("Local" if row['home_goals'] > row['away_goals'] else "Fallo")
+        elif pa > ph and pa > pd_prob: pred, prob, odd, res_real = "Visita", pa, row.get('odd_a', 1.0), ("Visita" if row['away_goals'] > row['home_goals'] else "Fallo")
+        else: pred, prob, odd, res_real = "Empate", pd_prob, row.get('odd_d', 1.0), ("Empate" if row['home_goals'] == row['away_goals'] else "Fallo")
         
         is_win = (pred == res_real)
         profit = (odd - 1) if is_win else -1
@@ -207,12 +238,18 @@ with st.sidebar:
     if not df.empty:
         stats, ah, aa, teams = calculate_strengths(df)
         st.success(f"✅ {len(df)} partidos cargados")
+        # Mostrar si el modelo híbrido está activo
+        has_shots = df['home_shots'].sum() > 0
+        if has_shots:
+            st.caption("🧠 Modelo Híbrido: ACTIVO (Goles + Tiros)")
+        else:
+            st.caption("⚠️ Modelo Básico: Solo Goles (Faltan datos de tiros)")
     else: st.error("Error cargando datos"); st.stop()
     
     st.divider()
     bank = st.number_input("💰 Tu Banco ($)", 1000.0, step=50.0)
 
-st.title(f"🤖 Dixon-Coles: {leagues[code]}")
+st.title(f"🧠 AI Betting: {leagues[code]}")
 
 c1, c2 = st.columns(2)
 home = c1.selectbox("Local", teams)
@@ -225,7 +262,7 @@ h_exp, a_exp, ph, pd_prob, pa, po25, top_sc = predict_match_dixon_coles(home, aw
 t1, t2, t3, t4 = st.tabs(["📊 Análisis", "💰 Valor", "📜 Historial", "🧪 Laboratorio"])
 
 with t1:
-    st.markdown("### 🥅 Expectativa de Goles")
+    st.markdown("### 🥅 Expectativa de Goles (Híbrida)")
     c_g1, c_g2, c_g3 = st.columns(3)
     c_g1.metric(home, f"{h_exp:.2f}")
     c_g2.metric("Total", f"{h_exp+a_exp:.2f}", delta="Over 2.5: "+f"{po25*100:.0f}%")
@@ -295,7 +332,7 @@ with t3:
 
 with t4:
     st.markdown("### 🧪 Laboratorio de Backtesting")
-    st.info("Pon a prueba el modelo con los últimos 20 partidos REALES de esta liga.")
+    st.info("Pon a prueba el modelo Híbrido con los últimos 20 partidos.")
     if st.button("▶️ Ejecutar Simulación"):
         test_df, ok, profit = run_backtest(df, stats, ah, aa)
         m1, m2, m3 = st.columns(3)
