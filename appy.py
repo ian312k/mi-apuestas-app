@@ -78,25 +78,24 @@ def get_last_5_matches(df, team_name):
     return last_5[['Fecha', 'L/V', 'Rival', 'Res']]
 
 # ======================================================
-# MODELO DIXON-COLES (Sustituye a predict_match_poisson)
+# MODELO DIXON-COLES (CORREGIDO) ✅
 # ======================================================
 def predict_match_dixon_coles(home, away, team_stats, avg_h, avg_a):
-    # 1. Calculamos las Lambdas (Igual que en Poisson)
+    # 1. Calculamos las Lambdas
     h_exp = team_stats[home]['att_h'] * team_stats[away]['def_a'] * avg_h
     a_exp = team_stats[away]['att_a'] * team_stats[home]['def_h'] * avg_a
 
     max_goals = 10
     probs = np.zeros((max_goals, max_goals))
 
-    # 2. Parámetro Rho (Factor de corrección para empates bajos)
+    # 2. Parámetro Rho
     rho = -0.13 
 
-    # 3. Llenamos la matriz con el ajuste Dixon-Coles
+    # 3. Llenamos la matriz
     for x in range(max_goals):
         for y in range(max_goals):
             p_base = poisson.pmf(x, h_exp) * poisson.pmf(y, a_exp)
             
-            # Aplicamos corrección a 0-0, 1-0, 0-1 y 1-1
             correction = 1.0
             if x == 0 and y == 0: correction = 1.0 - (h_exp * a_exp * rho)
             elif x == 0 and y == 1: correction = 1.0 + (h_exp * rho)
@@ -105,8 +104,10 @@ def predict_match_dixon_coles(home, away, team_stats, avg_h, avg_a):
             
             probs[x][y] = p_base * correction
 
-    # Normalizamos para que sume 100% exacto
-    probs = max(0, probs) # Evitar negativos raros
+    # ⚠️ CORRECCIÓN AQUÍ: Usamos np.maximum en lugar de max
+    probs = np.maximum(0, probs) 
+    
+    # Normalización
     probs = probs / probs.sum()
 
     # 4. Resultados finales
@@ -296,4 +297,5 @@ with tab3:
             else: st.info("No hay pendientes")
 
     else: st.info("Historial vacío")
+
 
