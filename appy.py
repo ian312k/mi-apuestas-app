@@ -6,21 +6,21 @@ import plotly.graph_objects as go
 import os
 
 # ======================================================
-# 1. CONFIGURACIÓN Y ESTILOS CSS 🎨
+# 1. CONFIGURACIÓN Y ESTILOS CSS 🎨 (CORREGIDO PARA MODO OSCURO)
 # ======================================================
 st.set_page_config(page_title="Poisson Pro", layout="wide", page_icon="⚽")
 CSV_FILE = 'mis_apuestas_poisson.csv'
 
-# Inyectamos CSS para que se vea bonito (Tarjetas y métricas)
+# Inyectamos CSS corregido para que se vea bien en modo oscuro
 st.markdown("""
 <style>
     /* Estilo para las métricas (cajitas de números) */
     div[data-testid="stMetric"] {
-        background-color: #f0f2f6;
-        border: 1px solid #e6e9ef;
+        background-color: #262730; /* <-- ESTO ES LO QUE CAMBIÓ (Gris oscuro) */
+        border: 1px solid #464b5c; /* Borde más sutil */
         padding: 15px;
         border-radius: 10px;
-        box-shadow: 2px 2px 5px rgba(0,0,0,0.05);
+        box-shadow: 2px 2px 5px rgba(0,0,0,0.2);
     }
     /* Centrar títulos */
     h1, h2, h3 { text-align: center; }
@@ -266,4 +266,5 @@ with tab3:
                 res = st.selectbox("Resultado", ["Ganada", "Perdida", "Push"])
                 if st.button("Actualizar"): update_bet_status(b_id, res); st.rerun()
             else: st.info("No hay pendientes")
+
     else: st.info("Historial vacío")
