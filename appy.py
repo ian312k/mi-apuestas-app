@@ -325,18 +325,31 @@ with t2:
             total_odd = 1.0
             total_prob = 1.0
             
-            # Mostrar lista de apuestas
+            # --- MODIFICACIÓN AQUÍ: Bucle con botón de borrar ---
             for idx, item in enumerate(st.session_state.ticket):
-                st.markdown(f"""
-                <div class="ticket-box">
-                    <small>{item['league']}</small><br>
-                    <strong>{item['match']}</strong><br>
-                    Pick: {item['pick']} <br>
-                    <span style="color:#4CAF50">@ {item['odd']}</span>
-                </div>
-                """, unsafe_allow_html=True)
+                c_info, c_del = st.columns([5, 1]) # Columnas para info y botón
+                
+                with c_info:
+                    st.markdown(f"""
+                    <div class="ticket-box">
+                        <small>{item['league']}</small><br>
+                        <strong>{item['match']}</strong><br>
+                        Pick: {item['pick']} <br>
+                        <span style="color:#4CAF50">@ {item['odd']}</span>
+                    </div>
+                    """, unsafe_allow_html=True)
+                
+                with c_del:
+                    # Botón X con clave única
+                    st.write("") # Espacio vertical
+                    st.write("") 
+                    if st.button("❌", key=f"del_{idx}"):
+                        st.session_state.ticket.pop(idx) # Borra solo este índice
+                        st.rerun() # Recarga la página
+
                 total_odd *= item['odd']
                 total_prob *= item['prob']
+            # ----------------------------------------------------
 
             st.divider()
             
@@ -349,7 +362,6 @@ with t2:
             st.success(f"Ganancia Potencial: ${pot_win:.2f}")
             
             if st.button("💾 Guardar Apuesta"):
-                # Crear descripción combinada
                 if len(st.session_state.ticket) == 1:
                     it = st.session_state.ticket[0]
                     match_str = it['match']
@@ -372,7 +384,7 @@ with t2:
                     "Estado": "Pendiente",
                     "Ganancia": 0.0
                 })
-                st.session_state.ticket = [] # Limpiar después de guardar
+                st.session_state.ticket = [] 
                 st.balloons()
                 st.success("Guardado exitosamente!")
                 st.rerun()
@@ -401,3 +413,4 @@ with t4:
         m2.metric("Profit (Stake 1U)", f"{profit:.2f} U", delta_color="normal")
         m3.metric("Estado", "🔥 Rentable" if profit > 0 else "❄️ Pérdidas")
         st.dataframe(test_df, use_container_width=True)
+
