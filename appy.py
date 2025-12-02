@@ -131,8 +131,8 @@ def predict_match_dixon_coles(home, away, team_stats, avg_h, avg_a):
     return h_exp, a_exp, p_home, p_draw, p_away, p_o25, top_scores
 
 def run_backtest(df, team_stats, avg_h, avg_a):
-    """Prueba el modelo con los últimos 50 partidos (SOLICITUD DE USUARIO)"""
-    recent = df.tail(50).copy() # CAMBIO A 50
+    """Prueba el modelo con los últimos 50 partidos"""
+    recent = df.tail(50).copy() 
     results = []
     correct, bal = 0, 0
     
@@ -203,15 +203,14 @@ def manage_bets(mode, data=None, id_bet=None, status=None):
 # ======================================================
 with st.sidebar:
     st.header("⚙️ Configuración")
-    # LISTA DE LIGAS ACTUALIZADA
     leagues = {
         "SP1": "🇪🇸 La Liga", 
         "E0": "🏴󠁧󠁢󠁥󠁮󠁧󠁿 Premier League", 
         "I1": "🇮🇹 Serie A", 
         "D1": "🇩🇪 Bundesliga", 
         "F1": "🇫🇷 Ligue 1",
-        "N1": "🇳🇱 Eredivisie",  # NUEVA
-        "P1": "🇵🇹 Primeira Liga" # NUEVA
+        "N1": "🇳🇱 Eredivisie", 
+        "P1": "🇵🇹 Primeira Liga"
     }
     code = st.selectbox("Liga", list(leagues.keys()), format_func=lambda x: leagues[x])
     
@@ -219,12 +218,22 @@ with st.sidebar:
     if not df.empty:
         stats, ah, aa, teams = calculate_strengths(df)
         st.success(f"✅ {len(df)} partidos cargados")
+        
+        # --- AQUÍ ESTÁ LO QUE FALTABA: ÚLTIMOS RESULTADOS ---
+        st.markdown("---")
+        st.markdown("###### 🕒 Últimos 5 Registrados:")
+        last_5 = df.tail(5).copy().iloc[::-1]
+        last_5['Fecha'] = last_5['date'].dt.strftime('%d/%m')
+        last_5['Partido'] = last_5['home'] + " vs " + last_5['away']
+        last_5['Score'] = last_5['home_goals'].astype(int).astype(str) + "-" + last_5['away_goals'].astype(int).astype(str)
+        st.dataframe(last_5[['Fecha', 'Partido', 'Score']], hide_index=True, use_container_width=True)
+        # ------------------------------------------------------
+        
     else: st.error("Error cargando datos"); st.stop()
     
     st.divider()
     bank = st.number_input("💰 Tu Banco ($)", 1000.0, step=50.0)
     
-    # MOSTRAR TICKET EN SIDEBAR
     if st.session_state.ticket:
         st.divider()
         st.markdown("### 🎫 Ticket Actual")
@@ -325,9 +334,8 @@ with t2:
             total_odd = 1.0
             total_prob = 1.0
             
-            # --- MODIFICACIÓN AQUÍ: Bucle con botón de borrar ---
             for idx, item in enumerate(st.session_state.ticket):
-                c_info, c_del = st.columns([5, 1]) # Columnas para info y botón
+                c_info, c_del = st.columns([5, 1])
                 
                 with c_info:
                     st.markdown(f"""
@@ -340,16 +348,14 @@ with t2:
                     """, unsafe_allow_html=True)
                 
                 with c_del:
-                    # Botón X con clave única
-                    st.write("") # Espacio vertical
+                    st.write("") 
                     st.write("") 
                     if st.button("❌", key=f"del_{idx}"):
-                        st.session_state.ticket.pop(idx) # Borra solo este índice
-                        st.rerun() # Recarga la página
+                        st.session_state.ticket.pop(idx) 
+                        st.rerun() 
 
                 total_odd *= item['odd']
                 total_prob *= item['prob']
-            # ----------------------------------------------------
 
             st.divider()
             
@@ -405,12 +411,11 @@ with t3:
 
 with t4:
     st.markdown("### 🧪 Laboratorio de Backtesting")
-    st.info("Pon a prueba el modelo con los últimos 50 partidos REALES de esta liga.") # TEXTO ACTUALIZADO
+    st.info("Pon a prueba el modelo con los últimos 50 partidos REALES de esta liga.") 
     if st.button("▶️ Ejecutar Simulación (50 Partidos)"):
-        test_df, ok, profit = run_backtest(df, stats, ah, aa) # EJECUTA 50 PARTIDOS
+        test_df, ok, profit = run_backtest(df, stats, ah, aa) 
         m1, m2, m3 = st.columns(3)
-        m1.metric("Aciertos", f"{ok}/50 ({ok/50*100:.0f}%)") # METRICA ACTUALIZADA
+        m1.metric("Aciertos", f"{ok}/50 ({ok/50*100:.0f}%)") 
         m2.metric("Profit (Stake 1U)", f"{profit:.2f} U", delta_color="normal")
         m3.metric("Estado", "🔥 Rentable" if profit > 0 else "❄️ Pérdidas")
         st.dataframe(test_df, use_container_width=True)
-
