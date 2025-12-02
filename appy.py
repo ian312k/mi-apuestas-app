@@ -39,9 +39,14 @@ st.markdown("""
 # ======================================================
 # 2. LÓGICA DE DATOS Y MODELO MATEMÁTICO 🧠
 # ======================================================
-@st.cache_data
+
+# --- CORRECCIÓN AQUÍ: TTL=3600 (Actualiza cada hora) ---
+@st.cache_data(ttl=3600)
 def fetch_live_soccer_data(league_code="SP1"):
     """Descarga datos incluyendo cuotas históricas"""
+    # NOTA: Asegúrate de que el año en la URL (2526) coincida con la temporada actual.
+    # Si estamos en 2024-2025, debería ser '2425'. Si es 2025-2026, es '2526'.
+    # Ajusta este número si ves que la URL falla en el futuro.
     url = f"https://www.football-data.co.uk/mmz4281/2526/{league_code}.csv"
     try:
         df = pd.read_csv(url)
@@ -203,6 +208,13 @@ def manage_bets(mode, data=None, id_bet=None, status=None):
 # ======================================================
 with st.sidebar:
     st.header("⚙️ Configuración")
+    
+    # --- BOTÓN PARA FORZAR ACTUALIZACIÓN ---
+    if st.button("🔄 Actualizar Datos"):
+        st.cache_data.clear()
+        st.rerun()
+    # ---------------------------------------
+
     leagues = {
         "SP1": "🇪🇸 La Liga", 
         "E0": "🏴󠁧󠁢󠁥󠁮󠁧󠁿 Premier League", 
@@ -219,7 +231,7 @@ with st.sidebar:
         stats, ah, aa, teams = calculate_strengths(df)
         st.success(f"✅ {len(df)} partidos cargados")
         
-        # --- AQUÍ ESTÁ LO QUE FALTABA: ÚLTIMOS RESULTADOS ---
+        # --- ÚLTIMOS RESULTADOS ---
         st.markdown("---")
         st.markdown("###### 🕒 Últimos 5 Registrados:")
         last_5 = df.tail(5).copy().iloc[::-1]
@@ -227,7 +239,7 @@ with st.sidebar:
         last_5['Partido'] = last_5['home'] + " vs " + last_5['away']
         last_5['Score'] = last_5['home_goals'].astype(int).astype(str) + "-" + last_5['away_goals'].astype(int).astype(str)
         st.dataframe(last_5[['Fecha', 'Partido', 'Score']], hide_index=True, use_container_width=True)
-        # ------------------------------------------------------
+        # --------------------------
         
     else: st.error("Error cargando datos"); st.stop()
     
