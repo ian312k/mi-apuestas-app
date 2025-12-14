@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 # ======================================================
 # 1. CONFIGURACIÓN Y ESTILOS CSS (DARK MODE) 🎨
 # ======================================================
-st.set_page_config(page_title="Dixon-Coles Pro v3.1", layout="wide", page_icon="⚽")
+st.set_page_config(page_title="Dixon-Coles Pro v3.2", layout="wide", page_icon="⚽")
 CSV_FILE = 'mis_apuestas_pro.csv'
 
 # --- GESTIÓN DE ESTADO (SESSION STATE) ---
@@ -54,7 +54,7 @@ def fetch_live_soccer_data(league_code="SP1"):
         return df
     except: return pd.DataFrame()
 
-# API MANUAL (SIN CACHE STREAMLIT, CONTROLADA POR BOTÓN)
+# API MANUAL
 def call_api_real(sport_key, api_key):
     url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/?regions=eu&markets=h2h&oddsFormat=decimal&apiKey={api_key}"
     try:
@@ -191,9 +191,11 @@ def calculate_kelly(prob, odd):
 def manage_bets(mode, data=None, id_bet=None, status=None):
     if os.path.exists(CSV_FILE): df = pd.read_csv(CSV_FILE)
     else: df = pd.DataFrame(columns=["ID", "Fecha", "Liga", "Partido", "Pick", "Cuota", "Stake", "Prob", "Estado", "Ganancia"])
+    
     if mode == "save":
         df = pd.concat([df, pd.DataFrame([data])], ignore_index=True)
         df.to_csv(CSV_FILE, index=False)
+    
     elif mode == "update":
         idx = df[df['ID'].astype(str) == str(id_bet)].index
         if not idx.empty:
@@ -202,6 +204,12 @@ def manage_bets(mode, data=None, id_bet=None, status=None):
             profit = (df.at[i, 'Stake'] * df.at[i, 'Cuota']) - df.at[i, 'Stake'] if status == 'Ganada' else (-df.at[i, 'Stake'] if status == 'Perdida' else 0)
             df.at[i, 'Ganancia'] = profit
             df.to_csv(CSV_FILE, index=False)
+    
+    elif mode == "delete":
+        # --- LÓGICA DE BORRADO ---
+        df = df[df['ID'].astype(str) != str(id_bet)]
+        df.to_csv(CSV_FILE, index=False)
+        
     return df
 
 # ======================================================
@@ -347,7 +355,7 @@ with t2:
                 manage_bets("save", {"ID": pd.Timestamp.now().strftime('%Y%m%d%H%M%S'), "Fecha": pd.Timestamp.now().strftime('%Y-%m-%d'), "Liga": tipo_str, "Partido": match_str, "Pick": pick_str, "Cuota": round(total_odd, 2), "Stake": stake_parlay, "Prob": round(total_prob, 4), "Estado": "Pendiente", "Ganancia": 0.0})
                 st.session_state.ticket = []; st.balloons(); st.rerun()
 
-# --- TAB 3: HISTORIAL ---
+# --- TAB 3: HISTORIAL (CON BORRADO) ---
 with t3:
     st.markdown("### 📜 Historial")
     db = manage_bets("load")
@@ -360,19 +368,32 @@ with t3:
         st.dataframe(db.sort_values(by="Fecha", ascending=False), use_container_width=True)
         csv = db.to_csv(index=False).encode('utf-8')
         st.download_button("📥 Descargar Historial (CSV)", data=csv, file_name="mis_apuestas_backup.csv", mime="text/csv")
-        with st.expander("Actualizar Estado"):
-            pen = db[db['Estado']=='Pendiente']
-            if not pen.empty:
-                bid = st.selectbox("ID", pen['ID'].unique())
-                res = st.selectbox("Resultado", ["Ganada", "Perdida", "Push"])
-                if st.button("Actualizar"): manage_bets("update", id_bet=bid, status=res); st.rerun()
+        
+        c_upd, c_del = st.columns(2)
+        with c_upd:
+            with st.expander("📝 Actualizar Resultado"):
+                pen = db[db['Estado']=='Pendiente']
+                if not pen.empty:
+                    bid = st.selectbox("ID", pen['ID'].unique())
+                    res = st.selectbox("Resultado", ["Ganada", "Perdida", "Push"])
+                    if st.button("Actualizar"): manage_bets("update", id_bet=bid, status=res); st.rerun()
+                else: st.info("No hay pendientes")
+        
+        with c_del:
+            with st.expander("🗑️ Eliminar Apuesta"):
+                ids_all = db['ID'].unique()
+                id_del = st.selectbox("Seleccionar ID para borrar", ids_all)
+                if st.button("Borrar definitivamente"):
+                    manage_bets("delete", id_bet=id_del)
+                    st.warning("Apuesta eliminada")
+                    st.rerun()
 
-# --- TAB 4: ESCÁNER ---
+# --- TAB 4: ESCÁNER BLINDADO ---
 with t4:
     st.markdown("## 💎 Escáner Seguro")
     if st.session_state.api_usage['used'] > 0:
         pct_used = st.session_state.api_usage['used'] / 500
-        st.progress(pct_used, text=f"Llamadas API: {st.session_state.api_usage['used']} / 500")
+        st.progress(pct_used, text=f"Llamadas API: {st.session_state.api_usage['used']} / 500 usadas")
     
     api_league_map = { "SP1": "soccer_spain_la_liga", "E0": "soccer_epl", "I1": "soccer_italy_serie_a", "D1": "soccer_germany_bundesliga", "F1": "soccer_france_ligue_one", "N1": "soccer_netherlands_eredivisie", "P1": "soccer_portugal_primeira_liga" }
     api_key_input = st.text_input("🔑 API Key:", value=st.session_state.api_key, type="password")
@@ -437,19 +458,26 @@ with t4:
             
             if live_results:
                 df_live = pd.DataFrame(live_results).sort_values(by="EV", ascending=False)
-                st.markdown(f"### 🎯 Oportunidades ({len(df_live)})")
+                st.markdown(f"### 🎯 Oportunidades (Memoria) - {len(df_live)} Partidos")
                 for i, row in df_live.iterrows():
                     color = "#4CAF50" if row['EV'] > 0 else "#FF5252"
+                    val_txt = f"+{row['EV']*100:.1f}%" if row['EV'] > 0 else f"{row['EV']*100:.1f}%"
                     st.markdown(f"""
                     <div style="background-color: #262730; border-left: 5px solid {color}; padding: 10px; margin-bottom: 10px; border-radius: 5px;">
                         <div style="display:flex; justify-content:space-between;">
                             <strong>⏰ {row['Hora']} | {row['Partido']}</strong>
-                            <span style="color:{color}; font-weight:bold;">EV: {row['EV']*100:.1f}%</span>
+                            <span style="color:{color}; font-weight:bold; font-size:1.2em">EV: {val_txt}</span>
                         </div>
-                        <small>{row['Prob']} | {row['Cuotas']}</small><br>
-                        <span>👉 {row['Pick Valor']}</span>
-                    </div>""", unsafe_allow_html=True)
-            else: st.info("Datos OK, pero no hay partidos compatibles.")
+                        <div style="display:flex; justify-content:space-between; font-size:0.9em; margin-top:5px; color:#ccc;">
+                            <span>🧠 {row['Prob']}</span>
+                            <span>🏦 {row['Cuotas']}</span>
+                        </div>
+                        <div style="margin-top:5px; font-size:1.1em;">
+                            👉 Recomendación: <strong>{row['Pick Valor']}</strong>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+            else: st.info("Datos descargados, pero no se encontraron partidos compatibles para esta semana.")
 
 # --- TAB 5: LABORATORIO (BACKTEST + MONTE CARLO) ---
 with t5:
@@ -471,7 +499,7 @@ with t5:
         fig_sim = go.Figure()
         fig_sim.add_trace(go.Histogram(x=sim_h, name=home, marker_color='#4CAF50', opacity=0.75))
         fig_sim.add_trace(go.Histogram(x=sim_a, name=away, marker_color='#2196F3', opacity=0.75))
-        fig_sim.update_layout(barmode='overlay', title="Distribución de Goles", xaxis_title="Goles")
+        fig_sim.update_layout(barmode='overlay', title="Distribución de Goles Simulados", xaxis_title="Goles")
         st.plotly_chart(fig_sim, use_container_width=True)
 
     st.divider()
