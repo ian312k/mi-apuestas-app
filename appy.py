@@ -11,10 +11,10 @@ from datetime import datetime, timezone
 # ======================================================
 # 1. CONFIGURACIÓN Y ESTILOS CSS (DARK MODE) 🎨
 # ======================================================
-st.set_page_config(page_title="Dixon-Coles Pro + API Semanal", layout="wide", page_icon="⚽")
+st.set_page_config(page_title="Dixon-Coles Pro + API Segura", layout="wide", page_icon="⚽")
 CSV_FILE = 'mis_apuestas_pro.csv'
 
-# Inicializar Session States (CON TU CLAVE YA CARGADA)
+# Inicializar Session States
 if 'ticket' not in st.session_state: st.session_state.ticket = []
 if 'daily_matches' not in st.session_state: st.session_state.daily_matches = []
 if 'api_key' not in st.session_state: st.session_state.api_key = "f8b57bf9dc94df0f21b95752a4897c98"
@@ -59,34 +59,47 @@ def fetch_live_soccer_data(league_code="SP1"):
         cols = ['Date', 'HomeTeam', 'AwayTeam', 'FTHG', 'FTAG', 'B365H', 'B365D', 'B365A']
         actual_cols = [c for c in cols if c in df.columns]
         df = df[actual_cols]
-        
         new_names = ['date', 'home', 'away', 'home_goals', 'away_goals', 'odd_h', 'odd_d', 'odd_a']
-        if len(actual_cols) == 8:
-            df.columns = new_names
+        if len(actual_cols) == 8: df.columns = new_names
         else:
             df = df[['Date', 'HomeTeam', 'AwayTeam', 'FTHG', 'FTAG']]
             df.columns = ['date', 'home', 'away', 'home_goals', 'away_goals']
             df['odd_h'] = 1.0; df['odd_d'] = 1.0; df['odd_a'] = 1.0 
-
         df = df.dropna()
         df['date'] = pd.to_datetime(df['date'], dayfirst=True, errors='coerce')
         return df
     except: return pd.DataFrame()
+
+# --- NUEVA FUNCIÓN SEGURA (CACHEADA) ---
+@st.cache_data(ttl=3600, show_spinner=False) # TTL = 3600 segundos (1 hora)
+def fetch_odds_from_api(sport_key, api_key):
+    """
+    Esta función guarda los datos en memoria por 1 hora.
+    Si vuelves a llamar con la misma liga en menos de 1 hora, 
+    NO gasta llamadas de API.
+    """
+    url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/?regions=eu&markets=h2h&oddsFormat=decimal&apiKey={api_key}"
+    try:
+        res = requests.get(url)
+        if res.status_code == 200:
+            return res.json()
+        else:
+            return {"error": f"Error {res.status_code}", "message": res.text}
+    except Exception as e:
+        return {"error": "Excepción", "message": str(e)}
+# ---------------------------------------
 
 def calculate_strengths(df):
     last_date = df['date'].max()
     df['days_ago'] = (last_date - df['date']).dt.days
     alpha = 0.004
     df['weight'] = np.exp(-alpha * df['days_ago'])
-    
     avg_home = np.average(df['home_goals'], weights=df['weight'])
     avg_away = np.average(df['away_goals'], weights=df['weight'])
     avg_global = (avg_home + avg_away) / 2
-    
     team_stats = {}
     all_teams = sorted(list(set(df['home'].unique()) | set(df['away'].unique())))
     MIX_FACTOR = 0.7 
-    
     for team in all_teams:
         team_matches = df[(df['home'] == team) | (df['away'] == team)].copy()
         if not team_matches.empty:
@@ -95,19 +108,16 @@ def calculate_strengths(df):
             att_global = np.average(team_matches['goals_scored'], weights=team_matches['weight']) / avg_global
             def_global = np.average(team_matches['goals_conceded'], weights=team_matches['weight']) / avg_global
         else: att_global, def_global = 1.0, 1.0
-
         h_m = df[df['home'] == team]
         if not h_m.empty:
             att_h_pure = np.average(h_m['home_goals'], weights=h_m['weight']) / avg_home
             def_h_pure = np.average(h_m['away_goals'], weights=h_m['weight']) / avg_away
         else: att_h_pure, def_h_pure = 1.0, 1.0
-
         a_m = df[df['away'] == team]
         if not a_m.empty:
             att_a_pure = np.average(a_m['away_goals'], weights=a_m['weight']) / avg_away
             def_a_pure = np.average(a_m['home_goals'], weights=a_m['weight']) / avg_home
         else: att_a_pure, def_a_pure = 1.0, 1.0
-            
         team_stats[team] = {
             'att_h': (att_h_pure * MIX_FACTOR) + (att_global * (1 - MIX_FACTOR)),
             'def_h': (def_h_pure * MIX_FACTOR) + (def_global * (1 - MIX_FACTOR)),
@@ -119,11 +129,9 @@ def calculate_strengths(df):
 def predict_match_dixon_coles(home, away, team_stats, avg_h, avg_a):
     h_exp = team_stats[home]['att_h'] * team_stats[away]['def_a'] * avg_h
     a_exp = team_stats[away]['att_a'] * team_stats[home]['def_h'] * avg_a
-    
     max_goals = 10
     probs = np.zeros((max_goals, max_goals))
     rho = -0.13 
-
     for x in range(max_goals):
         for y in range(max_goals):
             p_base = poisson.pmf(x, h_exp) * poisson.pmf(y, a_exp)
@@ -133,27 +141,22 @@ def predict_match_dixon_coles(home, away, team_stats, avg_h, avg_a):
             elif x==1 and y==0: correction = 1.0 + (a_exp * rho)
             elif x==1 and y==1: correction = 1.0 - (rho)
             probs[x][y] = p_base * correction
-            
     probs = np.maximum(0, probs)
     probs = probs / probs.sum()
-
     p_home = np.tril(probs, -1).sum()
     p_draw = np.diag(probs).sum()
     p_away = np.triu(probs, 1).sum()
-    
     p_o15, p_o25, p_btts = 0, 0, 0
     for i in range(max_goals):
         for j in range(max_goals):
             if (i+j) > 1.5: p_o15 += probs[i][j]
             if (i+j) > 2.5: p_o25 += probs[i][j]
             if i > 0 and j > 0: p_btts += probs[i][j]
-
     flat_indices = np.argsort(probs.ravel())[::-1][:3]
     top_scores = []
     for idx in flat_indices:
         i, j = np.unravel_index(idx, probs.shape)
         top_scores.append((f"{i}-{j}", probs[i][j]))
-
     return h_exp, a_exp, p_home, p_draw, p_away, p_o15, p_o25, p_btts, top_scores, probs
 
 def run_backtest(df, team_stats, avg_h, avg_a):
@@ -237,7 +240,6 @@ with st.sidebar:
     if not df.empty:
         stats, ah, aa, teams = calculate_strengths(df)
         st.success(f"✅ {len(df)} partidos cargados")
-        
         st.markdown("---")
         st.markdown("###### 🕒 Últimos 5 Registrados (Liga):")
         last_5 = df.tail(5).copy().iloc[::-1]
@@ -364,11 +366,11 @@ with t3:
                 res = st.selectbox("Resultado", ["Ganada", "Perdida", "Push"])
                 if st.button("Actualizar"): manage_bets("update", id_bet=bid, status=res); st.rerun()
 
-# --- ESCÁNER CON API ---
+# --- ESCÁNER CON API (CACHEADO 1 HORA) ---
 with t4:
     st.markdown("## 💎 Escáner En Vivo (The Odds API)")
     
-    # Mapeo de códigos de tu App a los códigos de la API
+    # Mapeo de códigos
     api_league_map = {
         "SP1": "soccer_spain_la_liga",
         "E0": "soccer_epl",
@@ -379,7 +381,7 @@ with t4:
         "P1": "soccer_portugal_primeira_liga"
     }
 
-    # Input de Key (Pre-cargada con tu clave)
+    # Input de Key
     api_key_input = st.text_input("🔑 API Key:", value=st.session_state.api_key, type="password")
     if st.button("💾 Guardar Key / Actualizar"):
         st.session_state.api_key = api_key_input
@@ -389,19 +391,23 @@ with t4:
     st.divider()
 
     if st.session_state.api_key:
-        st.write(f"📡 Buscando partidos **(Próximos 7 días)** para: **{leagues[code]}**...")
+        st.write(f"📡 Buscando partidos **(Próxima Semana)** para: **{leagues[code]}**...")
         
-        if st.button("🚀 Escanear Mercado Real"):
-            sport_key = api_league_map.get(code)
-            
-            try:
-                # 1. Llamada a la API
-                url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/?regions=eu&markets=h2h&oddsFormat=decimal&apiKey={st.session_state.api_key}"
-                res = requests.get(url)
-                data = res.json()
+        # Este botón ahora usa la función CACHEADA 'fetch_odds_from_api'
+        if st.button("🚀 Escanear Mercado Real (Crea Cache)"):
+            with st.spinner("Conectando con la API..."):
+                sport_key = api_league_map.get(code)
                 
-                if 'message' in data:
-                    st.error(f"Error de API: {data['message']}")
+                # --- LLAMADA CACHEADA ---
+                data = fetch_odds_from_api(sport_key, st.session_state.api_key)
+                # ------------------------
+                
+                # Verificamos si vino con error
+                if isinstance(data, dict) and 'error' in data:
+                    st.error(f"{data['error']}: {data['message']}")
+                # Verificamos si hay mensaje de la API (ej. quota exceeded)
+                elif isinstance(data, dict) and 'message' in data:
+                    st.error(f"Mensaje API: {data['message']}")
                 elif not data:
                     st.warning("✅ Conexión exitosa, pero NO hay partidos programados en el corto plazo para esta liga.")
                 else:
@@ -409,12 +415,13 @@ with t4:
                     
                     # 2. Procesar partidos
                     for item in data:
-                        # --- FILTRO DE FECHA (1 SEMANA = 168 HORAS) ---
+                        # --- FILTRO DE FECHA (7 DÍAS = 168 HORAS) ---
                         match_date = pd.to_datetime(item['commence_time'])
                         now = pd.Timestamp.now(tz='UTC')
                         diff_hours = (match_date - now).total_seconds() / 3600
                         
-                        if diff_hours > 168 or diff_hours < -5: # Filtro extendido a 7 días
+                        # Filtramos solo lo que está entre hace 5 horas y 7 días adelante
+                        if diff_hours > 168 or diff_hours < -5: 
                             continue
                         # ------------------------------------------------
 
@@ -465,9 +472,11 @@ with t4:
                     if live_results:
                         df_live = pd.DataFrame(live_results).sort_values(by="EV", ascending=False)
                         
-                        st.markdown(f"### 🎯 Oportunidades (Próximos 7 días) - {len(df_live)} Partidos")
+                        st.markdown(f"### 🎯 Oportunidades (Semana) - {len(df_live)} Partidos")
+                        st.caption("Nota: Los datos de la API se guardan por 1 hora para proteger tu cuota.")
+                        
                         for i, row in df_live.iterrows():
-                            color = "#4CAF50" if row['EV'] > 0 else "#FF5252" # Verde si hay valor, Rojo si no
+                            color = "#4CAF50" if row['EV'] > 0 else "#FF5252"
                             val_txt = f"+{row['EV']*100:.1f}%" if row['EV'] > 0 else f"{row['EV']*100:.1f}%"
                             
                             st.markdown(f"""
@@ -486,10 +495,9 @@ with t4:
                             </div>
                             """, unsafe_allow_html=True)
                     else:
-                        st.info("La API no encontró partidos para los próximos 7 días en esta liga, o no pude coincidir los nombres de los equipos.")
+                        st.info("La API no encontró partidos compatibles (o no hubo coincidencia de nombres) para esta semana.")
 
-            except Exception as e:
-                st.error(f"Error de conexión: {e}")
+            
     else:
         st.warning("Por favor ingresa una API Key válida.")
 
