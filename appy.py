@@ -6,12 +6,12 @@ import plotly.graph_objects as go
 import os
 import requests 
 from difflib import get_close_matches
-from datetime import datetime
+from datetime import datetime, timezone
 
 # ======================================================
 # 1. CONFIGURACIÓN Y ESTILOS CSS (DARK MODE) 🎨
 # ======================================================
-st.set_page_config(page_title="Dixon-Coles Pro + API En Vivo", layout="wide", page_icon="⚽")
+st.set_page_config(page_title="Dixon-Coles Pro + API Semanal", layout="wide", page_icon="⚽")
 CSV_FILE = 'mis_apuestas_pro.csv'
 
 # Inicializar Session States (CON TU CLAVE YA CARGADA)
@@ -389,7 +389,7 @@ with t4:
     st.divider()
 
     if st.session_state.api_key:
-        st.write(f"📡 Buscando partidos HOY para: **{leagues[code]}**...")
+        st.write(f"📡 Buscando partidos **(Próximos 7 días)** para: **{leagues[code]}**...")
         
         if st.button("🚀 Escanear Mercado Real"):
             sport_key = api_league_map.get(code)
@@ -403,12 +403,21 @@ with t4:
                 if 'message' in data:
                     st.error(f"Error de API: {data['message']}")
                 elif not data:
-                    st.warning("✅ Conexión exitosa, pero NO hay partidos programados para hoy/mañana en esta liga.")
+                    st.warning("✅ Conexión exitosa, pero NO hay partidos programados en el corto plazo para esta liga.")
                 else:
                     live_results = []
                     
                     # 2. Procesar partidos
                     for item in data:
+                        # --- FILTRO DE FECHA (1 SEMANA = 168 HORAS) ---
+                        match_date = pd.to_datetime(item['commence_time'])
+                        now = pd.Timestamp.now(tz='UTC')
+                        diff_hours = (match_date - now).total_seconds() / 3600
+                        
+                        if diff_hours > 168 or diff_hours < -5: # Filtro extendido a 7 días
+                            continue
+                        # ------------------------------------------------
+
                         h_team_api = item['home_team']
                         a_team_api = item['away_team']
                         
@@ -445,7 +454,7 @@ with t4:
                                 if ev_d > ev_h and ev_d > ev_a and ev_d > 0: best_pick, best_ev = "Empate", ev_d
                                 
                                 live_results.append({
-                                    "Hora": pd.to_datetime(item['commence_time']).strftime('%H:%M'),
+                                    "Hora": pd.to_datetime(item['commence_time']).strftime('%d/%m %H:%M'),
                                     "Partido": f"{real_home} vs {real_away}",
                                     "Prob Modelo": f"L:{ph*100:.0f}% E:{pd_prob*100:.0f}% V:{pa*100:.0f}%",
                                     "Cuotas Reales": f"L:{odds_h} E:{odds_d} V:{odds_a}",
@@ -456,7 +465,7 @@ with t4:
                     if live_results:
                         df_live = pd.DataFrame(live_results).sort_values(by="EV", ascending=False)
                         
-                        st.markdown(f"### 🎯 Oportunidades Encontradas ({len(df_live)})")
+                        st.markdown(f"### 🎯 Oportunidades (Próximos 7 días) - {len(df_live)} Partidos")
                         for i, row in df_live.iterrows():
                             color = "#4CAF50" if row['EV'] > 0 else "#FF5252" # Verde si hay valor, Rojo si no
                             val_txt = f"+{row['EV']*100:.1f}%" if row['EV'] > 0 else f"{row['EV']*100:.1f}%"
@@ -477,7 +486,7 @@ with t4:
                             </div>
                             """, unsafe_allow_html=True)
                     else:
-                        st.info("La API trajo partidos, pero no pude coincidir los nombres de los equipos con tu base de datos histórica. Intenta actualizar los datos.")
+                        st.info("La API no encontró partidos para los próximos 7 días en esta liga, o no pude coincidir los nombres de los equipos.")
 
             except Exception as e:
                 st.error(f"Error de conexión: {e}")
