@@ -11,14 +11,13 @@ from datetime import datetime, timezone
 # ======================================================
 # 1. CONFIGURACIÓN Y ESTILOS CSS (DARK MODE) 🎨
 # ======================================================
-st.set_page_config(page_title="Dixon-Coles Pro + Auto-Odds", layout="wide", page_icon="⚽")
+st.set_page_config(page_title="Dixon-Coles Pro Final", layout="wide", page_icon="⚽")
 CSV_FILE = 'mis_apuestas_pro.csv'
 
 # Inicializar Session States
 if 'ticket' not in st.session_state: st.session_state.ticket = []
-if 'daily_matches' not in st.session_state: st.session_state.daily_matches = []
+# (Eliminamos daily_matches porque ya no se usa)
 if 'api_key' not in st.session_state: st.session_state.api_key = "f8b57bf9dc94df0f21b95752a4897c98"
-# --- NUEVO: CACHÉ PARA MOMIOS ENTRE PESTAÑAS ---
 if 'api_odds_cache' not in st.session_state: st.session_state.api_odds_cache = {} 
 
 # Estilos CSS
@@ -37,13 +36,6 @@ st.markdown("""
         padding: 15px;
         border-radius: 10px;
         margin-bottom: 10px;
-    }
-    .best-bet-card {
-        background-color: #1c2e24;
-        border-left: 5px solid #00ff00;
-        padding: 15px;
-        margin-bottom: 10px;
-        border-radius: 5px;
     }
     h1, h2, h3 { text-align: center; }
 </style>
@@ -72,7 +64,6 @@ def fetch_live_soccer_data(league_code="SP1"):
         return df
     except: return pd.DataFrame()
 
-# --- FUNCIÓN CACHEADA DE API ---
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_odds_from_api(sport_key, api_key):
     url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/?regions=eu&markets=h2h&oddsFormat=decimal&apiKey={api_key}"
@@ -251,16 +242,17 @@ with st.sidebar:
 
 st.title(f"🤖 Dixon-Coles: {leagues[code]}")
 
-# --- SELECTOR DE PARTIDO PRINCIPAL ---
+# --- SELECTOR DE PARTIDO PRINCIPAL (GLOBAL) ---
+# Este es necesario para que funcionen las pestañas 1 y 2
 c1, c2 = st.columns(2)
 home = c1.selectbox("Local", teams)
 away = c2.selectbox("Visitante", [t for t in teams if t != home])
-# -------------------------------------
+# ----------------------------------------------
 
 h_exp, a_exp, ph, pd_prob, pa, po15, po25, pbtts, top_sc, probs = predict_match_dixon_coles(home, away, stats, ah, aa)
 
 # PESTAÑAS
-t1, t2, t3, t4, t5 = st.tabs(["📊 Análisis", "💰 Valor y Parlay", "📜 Historial", "💎 Escáner En Vivo (API)", "🧪 Backtest"])
+t1, t2, t3, t4, t5 = st.tabs(["📊 Análisis", "💰 Valor y Parlay", "📜 Historial", "💎 Escáner En Vivo", "🧪 Backtest"])
 
 with t1:
     st.markdown("### 🥅 Expectativa de Goles")
@@ -297,20 +289,13 @@ with t2:
         st.markdown("### 🏦 Comparador Inteligente")
         
         # --- LOGICA DE AUTO-LLENADO DE MOMIOS ---
-        # Valores por defecto
         def_oh, def_od, def_oa = 2.0, 3.2, 3.5
         match_key = f"{home} vs {away}"
         
-        # Verificar si existe en la cache de la API (Pestaña 4)
         if match_key in st.session_state.api_odds_cache:
             saved_odds = st.session_state.api_odds_cache[match_key]
-            def_oh = saved_odds['h']
-            def_od = saved_odds['d']
-            def_oa = saved_odds['a']
-            st.success("✅ Momios reales cargados desde la API")
-        elif st.session_state.api_odds_cache:
-             # Si hay datos pero no para este partido
-             st.caption("ℹ️ Partido no encontrado en los momios de esta semana (o nombres distintos).")
+            def_oh, def_od, def_oa = saved_odds['h'], saved_odds['d'], saved_odds['a']
+            st.success("✅ Momios reales cargados desde la API (Escáner)")
         # ----------------------------------------
 
         co1, co2, co3 = st.columns(3)
@@ -377,65 +362,47 @@ with t3:
                 res = st.selectbox("Resultado", ["Ganada", "Perdida", "Push"])
                 if st.button("Actualizar"): manage_bets("update", id_bet=bid, status=res); st.rerun()
 
-# --- ESCÁNER CON API (CACHEADO 1 HORA) ---
+# --- ESCÁNER CON API (SIN SELECTORES MANUALES) ---
 with t4:
     st.markdown("## 💎 Escáner En Vivo (The Odds API)")
-    st.caption("💡 Tip: Si escaneas aquí, los momios se guardan en memoria y aparecerán automáticamente en la pestaña 'Valor y Parlay' para que no los escribas manualmente.")
+    st.caption("💡 Tip: Si escaneas aquí, los momios se guardan en memoria y aparecerán automáticamente en la pestaña 'Valor y Parlay'.")
     
-    # Mapeo de códigos
     api_league_map = {
-        "SP1": "soccer_spain_la_liga",
-        "E0": "soccer_epl",
-        "I1": "soccer_italy_serie_a",
-        "D1": "soccer_germany_bundesliga",
-        "F1": "soccer_france_ligue_one",
-        "N1": "soccer_netherlands_eredivisie",
-        "P1": "soccer_portugal_primeira_liga"
+        "SP1": "soccer_spain_la_liga", "E0": "soccer_epl", "I1": "soccer_italy_serie_a",
+        "D1": "soccer_germany_bundesliga", "F1": "soccer_france_ligue_one",
+        "N1": "soccer_netherlands_eredivisie", "P1": "soccer_portugal_primeira_liga"
     }
 
-    # Input de Key
+    # API KEY INPUT
     api_key_input = st.text_input("🔑 API Key:", value=st.session_state.api_key, type="password")
     if st.button("💾 Guardar Key / Actualizar"):
         st.session_state.api_key = api_key_input
         st.success("Clave guardada.")
         st.rerun()
-
     st.divider()
 
     if st.session_state.api_key:
         st.write(f"📡 Buscando partidos **(Próxima Semana)** para: **{leagues[code]}**...")
         
-        # Este botón ahora usa la función CACHEADA 'fetch_odds_from_api'
+        # Botón para Llamar API
         if st.button("🚀 Escanear Mercado Real (Crea Cache)"):
             with st.spinner("Conectando con la API..."):
                 sport_key = api_league_map.get(code)
-                
-                # --- LLAMADA CACHEADA ---
                 data = fetch_odds_from_api(sport_key, st.session_state.api_key)
-                # ------------------------
                 
-                if isinstance(data, dict) and 'error' in data:
-                    st.error(f"{data['error']}: {data['message']}")
-                elif isinstance(data, dict) and 'message' in data:
-                    st.error(f"Mensaje API: {data['message']}")
-                elif not data:
-                    st.warning("✅ Conexión exitosa, pero NO hay partidos programados.")
+                if isinstance(data, dict) and 'error' in data: st.error(f"{data['error']}: {data['message']}")
+                elif not data: st.warning("✅ Conexión exitosa, pero NO hay partidos programados.")
                 else:
                     live_results = []
-                    # Limpiamos la caché de la sesión anterior para esta liga
-                    # st.session_state.api_odds_cache = {} # Opcional: si quieres acumular no lo borres
-                    
                     for item in data:
-                        # --- FILTRO DE FECHA (7 DÍAS = 168 HORAS) ---
+                        # Filtro 7 Días
                         match_date = pd.to_datetime(item['commence_time'])
                         now = pd.Timestamp.now(tz='UTC')
                         diff_hours = (match_date - now).total_seconds() / 3600
                         if diff_hours > 168 or diff_hours < -5: continue
-                        # ------------------------------------------------
 
                         h_team_api = item['home_team']
                         a_team_api = item['away_team']
-                        
                         odds_h, odds_d, odds_a = 0, 0, 0
                         
                         if item['bookmakers']:
@@ -446,26 +413,17 @@ with t4:
                                 elif m['name'] == a_team_api: odds_a = m['price']
                                 else: odds_d = m['price']
                         
-                        # 3. Match de Nombres
                         match_home = get_close_matches(h_team_api, teams, n=1, cutoff=0.5)
                         match_away = get_close_matches(a_team_api, teams, n=1, cutoff=0.5)
                         
                         if match_home and match_away:
                             real_home, real_away = match_home[0], match_away[0]
-                            
-                            # --- GUARDAR EN CACHE PARA LA PESTAÑA 2 ---
-                            st.session_state.api_odds_cache[f"{real_home} vs {real_away}"] = {
-                                'h': odds_h, 'd': odds_d, 'a': odds_a
-                            }
-                            # ------------------------------------------
+                            # GUARDAR EN CACHE
+                            st.session_state.api_odds_cache[f"{real_home} vs {real_away}"] = {'h': odds_h, 'd': odds_d, 'a': odds_a}
 
                             if real_home in stats and real_away in stats:
                                 _, _, ph, pd_prob, pa, o25, _, btts, _, _ = predict_match_dixon_coles(real_home, real_away, stats, ah, aa)
-                                
-                                ev_h = (ph * odds_h) - 1
-                                ev_a = (pa * odds_a) - 1
-                                ev_d = (pd_prob * odds_d) - 1
-                                
+                                ev_h = (ph * odds_h) - 1; ev_a = (pa * odds_a) - 1; ev_d = (pd_prob * odds_d) - 1
                                 best_pick, best_ev = "No Bet", -10.0
                                 if ev_h > 0: best_pick, best_ev = f"Gana {real_home}", ev_h
                                 if ev_a > ev_h and ev_a > 0: best_pick, best_ev = f"Gana {real_away}", ev_a
@@ -476,14 +434,13 @@ with t4:
                                     "Partido": f"{real_home} vs {real_away}",
                                     "Prob Modelo": f"L:{ph*100:.0f}% E:{pd_prob*100:.0f}% V:{pa*100:.0f}%",
                                     "Cuotas Reales": f"L:{odds_h} E:{odds_d} V:{odds_a}",
-                                    "Pick Valor": best_pick,
-                                    "EV": best_ev
+                                    "Pick Valor": best_pick, "EV": best_ev
                                 })
                     
                     if live_results:
                         df_live = pd.DataFrame(live_results).sort_values(by="EV", ascending=False)
                         st.markdown(f"### 🎯 Oportunidades (Semana) - {len(df_live)} Partidos")
-                        st.success("✅ ¡Momios guardados en memoria! Ahora puedes ir a la pestaña 'Valor y Parlay' y los momios se llenarán solos.")
+                        st.success("✅ ¡Momios guardados! Ahora puedes ir a la pestaña 'Valor y Parlay' y los momios se llenarán solos.")
                         
                         for i, row in df_live.iterrows():
                             color = "#4CAF50" if row['EV'] > 0 else "#FF5252"
@@ -503,10 +460,8 @@ with t4:
                                 </div>
                             </div>
                             """, unsafe_allow_html=True)
-                    else:
-                        st.info("La API no encontró partidos compatibles.")
-    else:
-        st.warning("Por favor ingresa una API Key válida.")
+                    else: st.info("La API no encontró partidos compatibles.")
+    else: st.warning("Por favor ingresa una API Key válida.")
 
 with t5:
     st.markdown("### 🧪 Backtest")
