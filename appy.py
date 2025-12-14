@@ -161,7 +161,6 @@ def predict_match_dixon_coles(home, away, team_stats, avg_h, avg_a):
         i, j = np.unravel_index(idx, probs.shape)
         top_scores.append((f"{i}-{j}", probs[i][j]))
 
-    # [MODIFICACIÓN] Ahora devolvemos también 'probs'
     return h_exp, a_exp, p_home, p_draw, p_away, p_o15, p_o25, p_btts, top_scores, probs
 
 def run_backtest(df, team_stats, avg_h, avg_a):
@@ -171,7 +170,7 @@ def run_backtest(df, team_stats, avg_h, avg_a):
     correct, bal = 0, 0
     
     for _, row in recent.iterrows():
-        # [MODIFICACIÓN] Añadimos _ al final para capturar 'probs' que ahora se devuelve pero no usamos aquí
+        # Capturamos probs con _
         _, _, ph, pd_prob, pa, _, _, _, _, _ = predict_match_dixon_coles(row['home'], row['away'], team_stats, avg_h, avg_a)
         
         if ph > pd_prob and ph > pa: pred, prob, odd, res_real = "Local", ph, row['odd_h'], ("Local" if row['home_goals'] > row['away_goals'] else "Fallo")
@@ -204,19 +203,15 @@ def plot_gauge(val, title, color):
 
 def plot_score_heatmap(probs, home_team, away_team):
     """Genera un Heatmap con los marcadores más probables"""
-    # Recortamos a 6x6 (0-5 goles) para que sea legible
     limit = 6
     probs_cut = probs[:limit, :limit]
     
-    # Invertimos el eje Y para que 0-0 esté abajo a la izquierda (estilo plano cartesiano estándar) 
-    # o lo dejamos 'auto' (0 arriba). En fútbol suele leerse mejor con 0 arriba a la izquierda.
-    
     fig = go.Figure(data=go.Heatmap(
         z=probs_cut,
-        x=[f"{away_team} {i}" for i in range(limit)], # Eje X: Visitante
-        y=[f"{home_team} {i}" for i in range(limit)], # Eje Y: Local
+        x=[f"{away_team} {i}" for i in range(limit)], 
+        y=[f"{home_team} {i}" for i in range(limit)], 
         colorscale='Viridis',
-        text=np.round(probs_cut * 100, 1), # Texto para mostrar
+        text=np.round(probs_cut * 100, 1), 
         texttemplate="%{text}%",
         hoverongaps=False
     ))
@@ -227,6 +222,38 @@ def plot_score_heatmap(probs, home_team, away_team):
         yaxis_title=f"Goles {home_team}",
         height=450,
         margin=dict(l=40, r=40, t=40, b=40)
+    )
+    return fig
+
+def plot_radar_comparison(home, away, stats):
+    """Genera Radar de Comparación (Ataque vs Defensa)"""
+    # En Dixon-Coles, Def < 1 es BUENO. Invertimos para el gráfico (2-val) para que "Más Grande" = "Mejor"
+    h_att = stats[home]['att_h']
+    h_def = 2 - stats[home]['def_h'] 
+    
+    a_att = stats[away]['att_a']
+    a_def = 2 - stats[away]['def_a']
+    
+    fig = go.Figure()
+
+    fig.add_trace(go.Scatterpolar(
+        r=[h_att, h_def, stats[home]['att_a'], 2-stats[home]['def_a']],
+        theta=['Ataque (Casa)', 'Defensa (Casa)', 'Ataque (Fuera)', 'Defensa (Fuera)'],
+        fill='toself', name=home, line_color='#4CAF50'
+    ))
+    
+    fig.add_trace(go.Scatterpolar(
+        r=[stats[away]['att_h'], 2-stats[away]['def_h'], a_att, a_def],
+        theta=['Ataque (Casa)', 'Defensa (Casa)', 'Ataque (Fuera)', 'Defensa (Fuera)'],
+        fill='toself', name=away, line_color='#2196F3'
+    ))
+
+    fig.update_layout(
+        polar=dict(radialaxis=dict(visible=True, range=[0, 2.5])),
+        showlegend=True,
+        title="⚔️ Comparativa de Fuerzas (Área Mayor = Mejor Equipo)",
+        height=350,
+        margin=dict(t=40, b=20, l=40, r=40)
     )
     return fig
 
@@ -314,7 +341,7 @@ c1, c2 = st.columns(2)
 home = c1.selectbox("Local", teams)
 away = c2.selectbox("Visitante", [t for t in teams if t != home])
 
-# EJECUCIÓN DEL MODELO (Capturando también 'probs')
+# EJECUCIÓN DEL MODELO
 h_exp, a_exp, ph, pd_prob, pa, po15, po25, pbtts, top_sc, probs = predict_match_dixon_coles(home, away, stats, ah, aa)
 
 # PESTAÑAS
@@ -327,13 +354,14 @@ with t1:
     c_g2.metric("Total (xG)", f"{h_exp+a_exp:.2f}") 
     c_g3.metric(away, f"{a_exp:.2f}")
 
-    # --- SECCIÓN: MERCADOS DE GOLES ---
+    # --- RADAR DE FUERZA (NUEVO) ---
+    st.plotly_chart(plot_radar_comparison(home, away, stats), use_container_width=True)
+    
     st.markdown("### 📊 Probabilidades de Gol")
     mg1, mg2, mg3 = st.columns(3) 
     mg1.metric("Over 1.5 Goles", f"{po15*100:.1f}%", help="Probabilidad de que haya 2 o más goles en total")
     mg2.metric("Over 2.5 Goles", f"{po25*100:.1f}%", help="Probabilidad de que haya 3 o más goles en total")
     mg3.metric("Ambos Anotan (BTTS)", f"{pbtts*100:.1f}%", help="Probabilidad de que ambos equipos marquen")
-    # ----------------------------------------
     
     st.markdown("### 🏆 Probabilidades 1X2")
     g1, g2, g3 = st.columns(3)
@@ -343,7 +371,7 @@ with t1:
     
     st.info(f"🎯 **Marcador Exacto:** {top_sc[0][0]} ({top_sc[0][1]*100:.1f}%) | **Opción 2:** {top_sc[1][0]}")
 
-    # [NUEVO] HEATMAP DE MARCADOR EXACTO
+    # HEATMAP
     st.plotly_chart(plot_score_heatmap(probs, home, away), use_container_width=True)
     
     st.markdown("### 📉 Estado de Forma")
@@ -360,6 +388,23 @@ with t2:
         oh = co1.number_input("Cuota 1", 1.01, 20.0, 2.0)
         od = co2.number_input("Cuota X", 1.01, 20.0, 3.2)
         oa = co3.number_input("Cuota 2", 1.01, 20.0, 3.5)
+
+        # --- DETECTOR DE VALOR (NUEVO) ---
+        st.markdown("### ⚖️ Detector de Valor (Modelo vs Casa)")
+        
+        # Probabilidades Implicadas de la casa (Inverso de la cuota)
+        imp_h = (1/oh); imp_d = (1/od); imp_a = (1/oa) 
+        total_imp = imp_h + imp_d + imp_a
+        # Normalizamos para quitar el margen de la casa (vig)
+        imp_h /= total_imp; imp_d /= total_imp; imp_a /= total_imp
+
+        fig_val = go.Figure(data=[
+            go.Bar(name='Tu Modelo', x=[home, 'Empate', away], y=[ph, pd_prob, pa], marker_color='#00CC96'),
+            go.Bar(name='Casa (Sin Margen)', x=[home, 'Empate', away], y=[imp_h, imp_d, imp_a], marker_color='#EF553B')
+        ])
+        fig_val.update_layout(barmode='group', height=300, margin=dict(t=20, b=20, l=20, r=20))
+        st.plotly_chart(fig_val, use_container_width=True)
+        # ---------------------------------
         
         # Kelly y EV
         ev_h, kh = (ph*oh)-1, calculate_kelly(ph, oh)
@@ -474,15 +519,35 @@ with t3:
     st.markdown("### 📜 Historial")
     db = manage_bets("load")
     if not db.empty:
+        # --- CURVA DE BANKROLL (NUEVO) ---
+        st.markdown("#### 📈 Crecimiento del Bankroll")
+        df_plot = db.copy()
+        df_plot['Fecha'] = pd.to_datetime(df_plot['Fecha'])
+        df_plot = df_plot.sort_values(by='ID')
+        df_plot['Balance Acumulado'] = df_plot['Ganancia'].cumsum()
+        
+        fig_bal = go.Figure()
+        fig_bal.add_trace(go.Scatter(
+            x=df_plot['Fecha'], y=df_plot['Balance Acumulado'],
+            mode='lines+markers', name='Balance',
+            line=dict(color='#00ff00' if df_plot['Balance Acumulado'].iloc[-1] >= 0 else '#ff0000', width=3)
+        ))
+        fig_bal.add_hline(y=0, line_dash="dash", line_color="white", opacity=0.5)
+        fig_bal.update_layout(height=300, margin=dict(t=20, b=20, l=20, r=20))
+        st.plotly_chart(fig_bal, use_container_width=True)
+        # ---------------------------------
+
         st.metric("Balance Total", f"${db['Ganancia'].sum():.2f}")
         st.dataframe(db.sort_values(by="Fecha", ascending=False), use_container_width=True)
-        with st.expander("Actualizar"):
+        with st.expander("Actualizar Resultado"):
             pen = db[db['Estado']=='Pendiente']
             if not pen.empty:
-                bid = st.selectbox("ID", pen['ID'].unique())
+                bid = st.selectbox("ID de Apuesta", pen['ID'].unique())
                 res = st.selectbox("Resultado", ["Ganada", "Perdida", "Push"])
-                if st.button("Actualizar "): manage_bets("update", id_bet=bid, status=res); st.rerun()
-            else: st.info("No hay pendientes")
+                if st.button("Actualizar Estado"): manage_bets("update", id_bet=bid, status=res); st.rerun()
+            else: st.info("No hay apuestas pendientes")
+    else:
+        st.info("Aún no has guardado ninguna apuesta.")
 
 with t4:
     st.markdown("### 🧪 Laboratorio de Backtesting")
