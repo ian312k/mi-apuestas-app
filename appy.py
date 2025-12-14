@@ -6,58 +6,39 @@ import plotly.graph_objects as go
 import os
 import requests 
 from difflib import get_close_matches
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 # ======================================================
 # 1. CONFIGURACIÓN Y ESTILOS CSS (DARK MODE) 🎨
 # ======================================================
-st.set_page_config(page_title="Dixon-Coles Pro v3.0", layout="wide", page_icon="⚽")
+st.set_page_config(page_title="Dixon-Coles Pro + API Manual", layout="wide", page_icon="⚽")
 CSV_FILE = 'mis_apuestas_pro.csv'
 
 # --- GESTIÓN DE ESTADO (SESSION STATE) ---
 if 'ticket' not in st.session_state: st.session_state.ticket = []
-# Tu clave API por defecto (Ya cargada)
 if 'api_key' not in st.session_state: st.session_state.api_key = "f8b57bf9dc94df0f21b95752a4897c98"
-# Memoria para compartir momios entre pestañas
-if 'api_odds_cache' not in st.session_state: st.session_state.api_odds_cache = {} 
-# Contador de uso de API
 if 'api_usage' not in st.session_state: st.session_state.api_usage = {"used": 0, "remaining": 500}
 
-# Estilos CSS Personalizados
+# --- NUEVO: ALMACÉN DE DATOS MANUAL (BLINDAJE DE LLAMADAS) ---
+# Estructura: {'SP1': {'timestamp': hora, 'data': [json]}, 'E0': ...}
+if 'market_storage' not in st.session_state: st.session_state.market_storage = {}
+
+# Estilos CSS
 st.markdown("""
 <style>
-    div[data-testid="stMetric"] {
-        background-color: #262730;
-        border: 1px solid #464b5c;
-        padding: 15px;
-        border-radius: 10px;
-        box-shadow: 2px 2px 5px rgba(0,0,0,0.3);
-    }
-    .ticket-box {
-        background-color: #1e1e1e;
-        border: 1px solid #ffd700;
-        padding: 15px;
-        border-radius: 10px;
-        margin-bottom: 10px;
-    }
-    .best-bet-card {
-        background-color: #1c2e24;
-        border-left: 5px solid #00ff00;
-        padding: 15px;
-        margin-bottom: 10px;
-        border-radius: 5px;
-    }
+    div[data-testid="stMetric"] { background-color: #262730; border: 1px solid #464b5c; padding: 15px; border-radius: 10px; }
+    .ticket-box { background-color: #1e1e1e; border: 1px solid #ffd700; padding: 15px; border-radius: 10px; margin-bottom: 10px; }
+    .best-bet-card { background-color: #1c2e24; border-left: 5px solid #00ff00; padding: 15px; margin-bottom: 10px; border-radius: 5px; }
     h1, h2, h3 { text-align: center; }
 </style>
 """, unsafe_allow_html=True)
 
 # ======================================================
-# 2. FUNCIONES DE DATOS Y API (CACHÉ INTELIGENTE) 🧠
+# 2. FUNCIONES LÓGICAS 🧠
 # ======================================================
 
 @st.cache_data(ttl=3600)
 def fetch_live_soccer_data(league_code="SP1"):
-    """Descarga historial de football-data.co.uk (Cache 1 hora)"""
     url = f"https://www.football-data.co.uk/mmz4281/2526/{league_code}.csv"
     try:
         df = pd.read_csv(url)
@@ -75,16 +56,12 @@ def fetch_live_soccer_data(league_code="SP1"):
         return df
     except: return pd.DataFrame()
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_odds_from_api(sport_key, api_key):
-    """
-    Llamada a The Odds API con caché de 1 hora.
-    Devuelve datos + cabeceras de uso de cuota.
-    """
+# --- FUNCIÓN API SIN CACHÉ DE STREAMLIT (CONTROL MANUAL) ---
+# Quitamos @st.cache_data para controlar nosotros cuándo se llama exactamente
+def call_api_real(sport_key, api_key):
     url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/?regions=eu&markets=h2h&oddsFormat=decimal&apiKey={api_key}"
     try:
         res = requests.get(url)
-        # Extraemos headers de uso
         used = res.headers.get('x-requests-used', 0)
         remaining = res.headers.get('x-requests-remaining', 500)
         
@@ -100,26 +77,18 @@ def fetch_odds_from_api(sport_key, api_key):
     except Exception as e:
         return {"success": False, "error": "Excepción", "message": str(e)}
 
-# ======================================================
-# 3. MODELO MATEMÁTICO DIXON-COLES 🧮
-# ======================================================
-
 def calculate_strengths(df):
     last_date = df['date'].max()
     df['days_ago'] = (last_date - df['date']).dt.days
-    alpha = 0.004 # Factor de olvido (Time Decay)
+    alpha = 0.004
     df['weight'] = np.exp(-alpha * df['days_ago'])
-    
     avg_home = np.average(df['home_goals'], weights=df['weight'])
     avg_away = np.average(df['away_goals'], weights=df['weight'])
     avg_global = (avg_home + avg_away) / 2
-    
     team_stats = {}
     all_teams = sorted(list(set(df['home'].unique()) | set(df['away'].unique())))
     MIX_FACTOR = 0.7 
-    
     for team in all_teams:
-        # Stats Generales
         team_matches = df[(df['home'] == team) | (df['away'] == team)].copy()
         if not team_matches.empty:
             team_matches['goals_scored'] = np.where(team_matches['home'] == team, team_matches['home_goals'], team_matches['away_goals'])
@@ -127,21 +96,16 @@ def calculate_strengths(df):
             att_global = np.average(team_matches['goals_scored'], weights=team_matches['weight']) / avg_global
             def_global = np.average(team_matches['goals_conceded'], weights=team_matches['weight']) / avg_global
         else: att_global, def_global = 1.0, 1.0
-
-        # Stats Local
         h_m = df[df['home'] == team]
         if not h_m.empty:
             att_h_pure = np.average(h_m['home_goals'], weights=h_m['weight']) / avg_home
             def_h_pure = np.average(h_m['away_goals'], weights=h_m['weight']) / avg_away
         else: att_h_pure, def_h_pure = 1.0, 1.0
-
-        # Stats Visita
         a_m = df[df['away'] == team]
         if not a_m.empty:
             att_a_pure = np.average(a_m['away_goals'], weights=a_m['weight']) / avg_away
             def_a_pure = np.average(a_m['home_goals'], weights=a_m['weight']) / avg_home
         else: att_a_pure, def_a_pure = 1.0, 1.0
-            
         team_stats[team] = {
             'att_h': (att_h_pure * MIX_FACTOR) + (att_global * (1 - MIX_FACTOR)),
             'def_h': (def_h_pure * MIX_FACTOR) + (def_global * (1 - MIX_FACTOR)),
@@ -153,11 +117,9 @@ def calculate_strengths(df):
 def predict_match_dixon_coles(home, away, team_stats, avg_h, avg_a):
     h_exp = team_stats[home]['att_h'] * team_stats[away]['def_a'] * avg_h
     a_exp = team_stats[away]['att_a'] * team_stats[home]['def_h'] * avg_a
-    
     max_goals = 10
     probs = np.zeros((max_goals, max_goals))
-    rho = -0.13 # Corrección para marcadores bajos
-
+    rho = -0.13 
     for x in range(max_goals):
         for y in range(max_goals):
             p_base = poisson.pmf(x, h_exp) * poisson.pmf(y, a_exp)
@@ -167,27 +129,22 @@ def predict_match_dixon_coles(home, away, team_stats, avg_h, avg_a):
             elif x==1 and y==0: correction = 1.0 + (a_exp * rho)
             elif x==1 and y==1: correction = 1.0 - (rho)
             probs[x][y] = p_base * correction
-            
     probs = np.maximum(0, probs)
     probs = probs / probs.sum()
-
     p_home = np.tril(probs, -1).sum()
     p_draw = np.diag(probs).sum()
     p_away = np.triu(probs, 1).sum()
-    
     p_o15, p_o25, p_btts = 0, 0, 0
     for i in range(max_goals):
         for j in range(max_goals):
             if (i+j) > 1.5: p_o15 += probs[i][j]
             if (i+j) > 2.5: p_o25 += probs[i][j]
             if i > 0 and j > 0: p_btts += probs[i][j]
-
     flat_indices = np.argsort(probs.ravel())[::-1][:3]
     top_scores = []
     for idx in flat_indices:
         i, j = np.unravel_index(idx, probs.shape)
         top_scores.append((f"{i}-{j}", probs[i][j]))
-
     return h_exp, a_exp, p_home, p_draw, p_away, p_o15, p_o25, p_btts, top_scores, probs
 
 def run_backtest(df, team_stats, avg_h, avg_a):
@@ -206,9 +163,6 @@ def run_backtest(df, team_stats, avg_h, avg_a):
         results.append({"Partido": f"{row['home']} vs {row['away']}", "Predicción": f"{pred} ({prob*100:.0f}%)", "Realidad": f"{int(row['home_goals'])}-{int(row['away_goals'])}", "Cuota": odd, "Res": "✅" if is_win else "❌", "P/L": profit})
     return pd.DataFrame(results), correct, bal
 
-# ======================================================
-# 4. UTILIDADES VISUALES Y GESTIÓN 🛠️
-# ======================================================
 def plot_gauge(val, title, color):
     return go.Figure(go.Indicator(mode="gauge+number", value=val*100, title={'text': title}, gauge={'axis': {'range': [0, 100]}, 'bar': {'color': color}, 'bgcolor': "white"})).update_layout(height=150, margin=dict(l=20, r=20, t=30, b=20))
 
@@ -259,12 +213,11 @@ def manage_bets(mode, data=None, id_bet=None, status=None):
     return df
 
 # ======================================================
-# 5. INTERFAZ GRÁFICA PRINCIPAL (SIDEBAR) 🌟
+# 5. SIDEBAR Y CARGA DE DATOS 🌟
 # ======================================================
 with st.sidebar:
     st.header("⚙️ Configuración")
     if st.button("🔄 Actualizar Datos"): st.cache_data.clear(); st.rerun()
-    
     leagues = {"SP1": "🇪🇸 La Liga", "E0": "🏴󠁧󠁢󠁥󠁮󠁧󠁿 Premier League", "I1": "🇮🇹 Serie A", "D1": "🇩🇪 Bundesliga", "F1": "🇫🇷 Ligue 1", "N1": "🇳🇱 Eredivisie", "P1": "🇵🇹 Primeira Liga"}
     code = st.selectbox("Liga", list(leagues.keys()), format_func=lambda x: leagues[x])
     df = fetch_live_soccer_data(code)
@@ -295,15 +248,14 @@ c1, c2 = st.columns(2)
 home = c1.selectbox("Local", teams)
 away = c2.selectbox("Visitante", [t for t in teams if t != home])
 
-# CÁLCULO DEL MODELO
 h_exp, a_exp, ph, pd_prob, pa, po15, po25, pbtts, top_sc, probs = predict_match_dixon_coles(home, away, stats, ah, aa)
 
 # ======================================================
-# 6. PESTAÑAS DE LA APLICACIÓN 📑
+# 6. PESTAÑAS 📑
 # ======================================================
-t1, t2, t3, t4, t5 = st.tabs(["📊 Análisis", "💰 Valor y Parlay", "📜 Historial", "💎 Escáner En Vivo (API)", "🧪 Backtest"])
+t1, t2, t3, t4, t5 = st.tabs(["📊 Análisis", "💰 Valor y Parlay", "📜 Historial", "💎 Escáner Seguro", "🧪 Backtest"])
 
-# --- TAB 1: ANÁLISIS DETALLADO ---
+# --- TAB 1: ANÁLISIS ---
 with t1:
     st.markdown("### 🥅 Expectativa de Goles")
     c_g1, c_g2, c_g3 = st.columns(3)
@@ -313,7 +265,6 @@ with t1:
 
     st.plotly_chart(plot_radar_comparison(home, away, stats), use_container_width=True)
     
-    st.markdown("### 📊 Probabilidades")
     mg1, mg2, mg3 = st.columns(3) 
     mg1.metric("Over 1.5", f"{po15*100:.1f}%"); mg2.metric("Over 2.5", f"{po25*100:.1f}%"); mg3.metric("BTTS", f"{pbtts*100:.1f}%")
     
@@ -326,14 +277,9 @@ with t1:
 
     st.markdown("### 📉 Estado de Forma (Últimos 5)")
     cf1, cf2 = st.columns(2)
-    with cf1: 
-        st.write(f"**{home}**")
-        st.dataframe(get_last_5(df, home), use_container_width=True, hide_index=True)
-    with cf2: 
-        st.write(f"**{away}**")
-        st.dataframe(get_last_5(df, away), use_container_width=True, hide_index=True)
+    with cf1: st.write(f"**{home}**"); st.dataframe(get_last_5(df, home), use_container_width=True, hide_index=True)
+    with cf2: st.write(f"**{away}**"); st.dataframe(get_last_5(df, away), use_container_width=True, hide_index=True)
     
-    # --- SIMULADOR MONTE CARLO ---
     st.divider()
     st.markdown("### 🎲 Simulador Monte Carlo (1,000 Partidos)")
     if st.button("▶️ Ejecutar Simulación"):
@@ -353,21 +299,45 @@ with t1:
         fig_sim.update_layout(barmode='overlay', title="Distribución de Goles Simulados", xaxis_title="Goles")
         st.plotly_chart(fig_sim, use_container_width=True)
 
-# --- TAB 2: VALOR, PARLAY Y TICKET ---
+# --- TAB 2: VALOR ---
 with t2:
     col_analisis, col_ticket = st.columns([2, 1])
     with col_analisis:
         st.markdown("### 🏦 Comparador Inteligente")
         
-        # Lógica de auto-completado desde el escáner
+        # --- BÚSQUEDA AUTOMÁTICA EN ALMACÉN MANUAL ---
         def_oh, def_od, def_oa = 2.0, 3.2, 3.5
         match_key = f"{home} vs {away}"
         
-        if match_key in st.session_state.api_odds_cache:
-            saved_odds = st.session_state.api_odds_cache[match_key]
-            def_oh, def_od, def_oa = saved_odds['h'], saved_odds['d'], saved_odds['a']
-            st.success("✅ Momios reales cargados desde la API (Escáner)")
+        # Buscamos si tenemos datos guardados para esta liga y este partido
+        league_data = st.session_state.market_storage.get(code, {})
+        found_in_storage = False
         
+        if 'data' in league_data:
+            # Buscar el partido en el JSON guardado
+            for item in league_data['data']:
+                h_team_api = item['home_team']
+                a_team_api = item['away_team']
+                # Match simple
+                m_h = get_close_matches(h_team_api, [home], n=1, cutoff=0.5)
+                m_a = get_close_matches(a_team_api, [away], n=1, cutoff=0.5)
+                
+                if m_h and m_a:
+                    # Encontramos el partido en memoria!
+                    if item['bookmakers']:
+                        book = item['bookmakers'][0]
+                        for m in book['markets'][0]['outcomes']:
+                            if m['name'] == h_team_api: def_oh = m['price']
+                            elif m['name'] == a_team_api: def_oa = m['price']
+                            else: def_od = m['price']
+                        found_in_storage = True
+                        break
+        
+        if found_in_storage:
+            st.success("✅ Momios cargados automáticamente (desde tu escaneo reciente).")
+        else:
+            st.info("ℹ️ Ingresa cuotas manuales (o ve a 'Escáner' y descarga los datos de la liga).")
+
         co1, co2, co3 = st.columns(3)
         oh = co1.number_input("Cuota Local", 1.01, 100.0, float(def_oh))
         od = co2.number_input("Cuota Empate", 1.01, 100.0, float(def_od))
@@ -415,7 +385,7 @@ with t2:
                 manage_bets("save", {"ID": pd.Timestamp.now().strftime('%Y%m%d%H%M%S'), "Fecha": pd.Timestamp.now().strftime('%Y-%m-%d'), "Liga": tipo_str, "Partido": match_str, "Pick": pick_str, "Cuota": round(total_odd, 2), "Stake": stake_parlay, "Prob": round(total_prob, 4), "Estado": "Pendiente", "Ganancia": 0.0})
                 st.session_state.ticket = []; st.balloons(); st.rerun()
 
-# --- TAB 3: HISTORIAL Y DESCARGAS ---
+# --- TAB 3: HISTORIAL ---
 with t3:
     st.markdown("### 📜 Historial")
     db = manage_bets("load")
@@ -426,11 +396,8 @@ with t3:
         fig_bal.add_trace(go.Scatter(x=pd.to_datetime(df_plot['Fecha']), y=df_plot['Balance Acumulado'], mode='lines+markers', name='Balance', line=dict(color='#00ff00' if df_plot['Balance Acumulado'].iloc[-1] >= 0 else '#ff0000', width=3)))
         st.plotly_chart(fig_bal, use_container_width=True)
         st.dataframe(db.sort_values(by="Fecha", ascending=False), use_container_width=True)
-        
-        # --- DESCARGA (BACKUP) ---
         csv = db.to_csv(index=False).encode('utf-8')
         st.download_button("📥 Descargar Historial (CSV)", data=csv, file_name="mis_apuestas_backup.csv", mime="text/csv")
-        
         with st.expander("Actualizar Estado"):
             pen = db[db['Estado']=='Pendiente']
             if not pen.empty:
@@ -438,115 +405,129 @@ with t3:
                 res = st.selectbox("Resultado", ["Ganada", "Perdida", "Push"])
                 if st.button("Actualizar"): manage_bets("update", id_bet=bid, status=res); st.rerun()
 
-# --- TAB 4: ESCÁNER EN VIVO (AUTOMÁTICO) ---
+# --- TAB 4: ESCÁNER BLINDADO (MANUAL) ---
 with t4:
-    st.markdown("## 💎 Escáner En Vivo (The Odds API)")
-    st.caption("💡 Tip: Los momios escaneados aquí se guardan y aparecerán automáticamente en la pestaña 'Valor'.")
+    st.markdown("## 💎 Escáner Seguro")
     
-    # Barra de Progreso de API
+    # Barra de Progreso
     if st.session_state.api_usage['used'] > 0:
         pct_used = st.session_state.api_usage['used'] / 500
         st.progress(pct_used, text=f"Llamadas API: {st.session_state.api_usage['used']} / 500 usadas")
-        if pct_used > 0.9: st.error("⚠️ ¡Te estás quedando sin llamadas API!")
-    else: st.info("ℹ️ Presiona 'Escanear' para ver consumo.")
-
+    
     api_league_map = {
         "SP1": "soccer_spain_la_liga", "E0": "soccer_epl", "I1": "soccer_italy_serie_a",
         "D1": "soccer_germany_bundesliga", "F1": "soccer_france_ligue_one",
         "N1": "soccer_netherlands_eredivisie", "P1": "soccer_portugal_primeira_liga"
     }
 
+    # API Key
     api_key_input = st.text_input("🔑 API Key:", value=st.session_state.api_key, type="password")
-    if st.button("💾 Guardar Key / Actualizar"):
+    if st.button("💾 Guardar Key"):
         st.session_state.api_key = api_key_input
-        st.success("Clave guardada.")
-        st.rerun()
+        st.success("Guardado."); st.rerun()
     st.divider()
 
+    # --- LÓGICA DE CONTROL MANUAL DE LLAMADAS ---
     if st.session_state.api_key:
-        st.write(f"📡 Buscando partidos **(Próxima Semana)** para: **{leagues[code]}**...")
+        sport_key = api_league_map.get(code)
         
-        if st.button("🚀 Escanear Mercado Real (Crea Cache)"):
-            with st.spinner("Conectando con la API..."):
-                sport_key = api_league_map.get(code)
-                response_obj = fetch_odds_from_api(sport_key, st.session_state.api_key)
+        # Verificar si ya tenemos datos en memoria
+        has_data = False
+        data_to_display = []
+        last_update_time = "Nunca"
+        
+        if code in st.session_state.market_storage:
+            stored = st.session_state.market_storage[code]
+            data_to_display = stored['data']
+            last_update_time = stored['timestamp'].strftime('%H:%M:%S')
+            has_data = True
+            st.info(f"📂 Datos cargados en memoria. Última actualización: {last_update_time}")
+        else:
+            st.warning("⚠️ No hay datos descargados para esta liga.")
+
+        # BOTÓN DE DESCARGA (SOLO ESTE GASTA LLAMADAS)
+        if st.button(f"{'🔄 Actualizar' if has_data else '⬇️ Descargar'} Datos (Gasta 1 llamada)"):
+            with st.spinner("Conectando con API..."):
+                response = call_api_real(sport_key, st.session_state.api_key)
                 
-                if response_obj.get('success'):
-                    st.session_state.api_usage['used'] = response_obj.get('used', 0)
-                    st.session_state.api_usage['remaining'] = response_obj.get('remaining', 500)
-                
-                if not response_obj['success']:
-                    st.error(f"{response_obj['error']}: {response_obj['message']}")
+                if response['success']:
+                    # Guardamos en Session State
+                    st.session_state.market_storage[code] = {
+                        'timestamp': datetime.now(),
+                        'data': response['data']
+                    }
+                    # Actualizamos uso
+                    st.session_state.api_usage['used'] = response['used']
+                    st.session_state.api_usage['remaining'] = response['remaining']
+                    st.success("✅ Datos descargados exitosamente.")
+                    st.rerun() # Recargamos para mostrar los datos nuevos
                 else:
-                    data = response_obj['data']
-                    if not data: st.warning("✅ Conexión exitosa, pero NO hay partidos programados.")
-                    else:
-                        live_results = []
-                        for item in data:
-                            match_date = pd.to_datetime(item['commence_time'])
-                            now = pd.Timestamp.now(tz='UTC')
-                            diff_hours = (match_date - now).total_seconds() / 3600
-                            if diff_hours > 168 or diff_hours < -5: continue # Filtro 7 días
+                    st.error(f"Error API: {response['message']}")
 
-                            h_team_api = item['home_team']
-                            a_team_api = item['away_team']
-                            odds_h, odds_d, odds_a = 0, 0, 0
-                            
-                            if item['bookmakers']:
-                                book = item['bookmakers'][0] 
-                                markets = book['markets'][0]['outcomes']
-                                for m in markets:
-                                    if m['name'] == h_team_api: odds_h = m['price']
-                                    elif m['name'] == a_team_api: odds_a = m['price']
-                                    else: odds_d = m['price']
-                            
-                            match_home = get_close_matches(h_team_api, teams, n=1, cutoff=0.5)
-                            match_away = get_close_matches(a_team_api, teams, n=1, cutoff=0.5)
-                            
-                            if match_home and match_away:
-                                real_home, real_away = match_home[0], match_away[0]
-                                st.session_state.api_odds_cache[f"{real_home} vs {real_away}"] = {'h': odds_h, 'd': odds_d, 'a': odds_a}
+        # VISUALIZACIÓN (GRATIS, USA MEMORIA)
+        if has_data and data_to_display:
+            live_results = []
+            for item in data_to_display:
+                match_date = pd.to_datetime(item['commence_time'])
+                now = pd.Timestamp.now(tz='UTC')
+                diff_hours = (match_date - now).total_seconds() / 3600
+                if diff_hours > 168 or diff_hours < -5: continue
 
-                                if real_home in stats and real_away in stats:
-                                    _, _, ph, pd_prob, pa, o25, _, btts, _, _ = predict_match_dixon_coles(real_home, real_away, stats, ah, aa)
-                                    ev_h = (ph * odds_h) - 1; ev_a = (pa * odds_a) - 1; ev_d = (pd_prob * odds_d) - 1
-                                    best_pick, best_ev = "No Bet", -10.0
-                                    if ev_h > 0: best_pick, best_ev = f"Gana {real_home}", ev_h
-                                    if ev_a > ev_h and ev_a > 0: best_pick, best_ev = f"Gana {real_away}", ev_a
-                                    if ev_d > ev_h and ev_d > ev_a and ev_d > 0: best_pick, best_ev = "Empate", ev_d
-                                    
-                                    live_results.append({
-                                        "Hora": pd.to_datetime(item['commence_time']).strftime('%d/%m %H:%M'),
-                                        "Partido": f"{real_home} vs {real_away}",
-                                        "Prob Modelo": f"L:{ph*100:.0f}% E:{pd_prob*100:.0f}% V:{pa*100:.0f}%",
-                                        "Cuotas Reales": f"L:{odds_h} E:{odds_d} V:{odds_a}",
-                                        "Pick Valor": best_pick, "EV": best_ev
-                                    })
+                h_team_api = item['home_team']
+                a_team_api = item['away_team']
+                odds_h, odds_d, odds_a = 0, 0, 0
+                
+                if item['bookmakers']:
+                    book = item['bookmakers'][0] 
+                    markets = book['markets'][0]['outcomes']
+                    for m in markets:
+                        if m['name'] == h_team_api: odds_h = m['price']
+                        elif m['name'] == a_team_api: odds_a = m['price']
+                        else: odds_d = m['price']
+                
+                match_home = get_close_matches(h_team_api, teams, n=1, cutoff=0.5)
+                match_away = get_close_matches(a_team_api, teams, n=1, cutoff=0.5)
+                
+                if match_home and match_away:
+                    real_home, real_away = match_home[0], match_away[0]
+                    if real_home in stats and real_away in stats:
+                        _, _, ph, pd_prob, pa, o25, _, btts, _, _ = predict_match_dixon_coles(real_home, real_away, stats, ah, aa)
+                        ev_h = (ph * odds_h) - 1; ev_a = (pa * odds_a) - 1; ev_d = (pd_prob * odds_d) - 1
+                        best_pick, best_ev = "No Bet", -10.0
+                        if ev_h > 0: best_pick, best_ev = f"Gana {real_home}", ev_h
+                        if ev_a > ev_h and ev_a > 0: best_pick, best_ev = f"Gana {real_away}", ev_a
+                        if ev_d > ev_h and ev_d > ev_a and ev_d > 0: best_pick, best_ev = "Empate", ev_d
                         
-                        if live_results:
-                            df_live = pd.DataFrame(live_results).sort_values(by="EV", ascending=False)
-                            st.markdown(f"### 🎯 Oportunidades (Semana) - {len(df_live)} Partidos")
-                            st.success("✅ Momios guardados en memoria.")
-                            for i, row in df_live.iterrows():
-                                color = "#4CAF50" if row['EV'] > 0 else "#FF5252"
-                                val_txt = f"+{row['EV']*100:.1f}%" if row['EV'] > 0 else f"{row['EV']*100:.1f}%"
-                                st.markdown(f"""
-                                <div style="background-color: #262730; border-left: 5px solid {color}; padding: 10px; margin-bottom: 10px; border-radius: 5px;">
-                                    <div style="display:flex; justify-content:space-between;">
-                                        <strong>⏰ {row['Hora']} | {row['Partido']}</strong>
-                                        <span style="color:{color}; font-weight:bold; font-size:1.2em">EV: {val_txt}</span>
-                                    </div>
-                                    <div style="display:flex; justify-content:space-between; font-size:0.9em; margin-top:5px; color:#ccc;">
-                                        <span>🧠 {row['Prob Modelo']}</span>
-                                        <span>🏦 {row['Cuotas Reales']}</span>
-                                    </div>
-                                    <div style="margin-top:5px; font-size:1.1em;">
-                                        👉 Recomendación: <strong>{row['Pick Valor']}</strong>
-                                    </div>
-                                </div>
-                                """, unsafe_allow_html=True)
-                        else: st.info("La API no encontró partidos compatibles.")
-    else: st.warning("Por favor ingresa una API Key válida.")
+                        live_results.append({
+                            "Hora": pd.to_datetime(item['commence_time']).strftime('%d/%m %H:%M'),
+                            "Partido": f"{real_home} vs {real_away}",
+                            "Prob Modelo": f"L:{ph*100:.0f}% E:{pd_prob*100:.0f}% V:{pa*100:.0f}%",
+                            "Cuotas Reales": f"L:{odds_h} E:{odds_d} V:{odds_a}",
+                            "Pick Valor": best_pick, "EV": best_ev
+                        })
+            
+            if live_results:
+                df_live = pd.DataFrame(live_results).sort_values(by="EV", ascending=False)
+                st.markdown(f"### 🎯 Oportunidades (Memoria) - {len(df_live)} Partidos")
+                for i, row in df_live.iterrows():
+                    color = "#4CAF50" if row['EV'] > 0 else "#FF5252"
+                    val_txt = f"+{row['EV']*100:.1f}%" if row['EV'] > 0 else f"{row['EV']*100:.1f}%"
+                    st.markdown(f"""
+                    <div style="background-color: #262730; border-left: 5px solid {color}; padding: 10px; margin-bottom: 10px; border-radius: 5px;">
+                        <div style="display:flex; justify-content:space-between;">
+                            <strong>⏰ {row['Hora']} | {row['Partido']}</strong>
+                            <span style="color:{color}; font-weight:bold; font-size:1.2em">EV: {val_txt}</span>
+                        </div>
+                        <div style="display:flex; justify-content:space-between; font-size:0.9em; margin-top:5px; color:#ccc;">
+                            <span>🧠 {row['Prob Modelo']}</span>
+                            <span>🏦 {row['Cuotas Reales']}</span>
+                        </div>
+                        <div style="margin-top:5px; font-size:1.1em;">
+                            👉 Recomendación: <strong>{row['Pick Valor']}</strong>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+            else: st.info("Datos descargados, pero no se encontraron partidos compatibles para esta semana.")
 
 with t5:
     st.markdown("### 🧪 Backtest")
