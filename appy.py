@@ -9,7 +9,7 @@ from datetime import datetime
 # ======================================================
 # 1. CONFIGURACIÓN Y ESTILOS CSS (DARK MODE) 🎨
 # ======================================================
-st.set_page_config(page_title="Dixon-Coles Pro + Scanner", layout="wide", page_icon="⚽")
+st.set_page_config(page_title="Dixon-Coles Pro Completo", layout="wide", page_icon="⚽")
 CSV_FILE = 'mis_apuestas_pro.csv'
 
 # Inicializar Session States
@@ -231,20 +231,20 @@ with st.sidebar:
     code = st.selectbox("Liga", list(leagues.keys()), format_func=lambda x: leagues[x])
     df = fetch_live_soccer_data(code)
     
-    # [CORREGIDO] AQUÍ ESTÁ DE NUEVO EL HISTORIAL DE ÚLTIMOS 5
+    # --- [RESTAURADO] HISTORIAL GLOBAL EN SIDEBAR ---
     if not df.empty:
         stats, ah, aa, teams = calculate_strengths(df)
         st.success(f"✅ {len(df)} partidos cargados")
         
         st.markdown("---")
-        st.markdown("###### 🕒 Últimos 5 Registrados:")
+        st.markdown("###### 🕒 Últimos 5 Registrados (Liga):")
         last_5 = df.tail(5).copy().iloc[::-1]
         last_5['Fecha'] = last_5['date'].dt.strftime('%d/%m')
         last_5['Partido'] = last_5['home'] + " vs " + last_5['away']
         last_5['Score'] = last_5['home_goals'].astype(int).astype(str) + "-" + last_5['away_goals'].astype(int).astype(str)
         st.dataframe(last_5[['Fecha', 'Partido', 'Score']], hide_index=True, use_container_width=True)
     else: st.error("Error cargando datos"); st.stop()
-    # -----------------------------------------------------------
+    # ------------------------------------------------
 
     st.divider()
     bank = st.number_input("💰 Tu Banco ($)", 1000.0, step=50.0)
@@ -285,6 +285,17 @@ with t1:
     g3.plotly_chart(plot_gauge(pa, f"Gana {away}", "#2196F3"), use_container_width=True)
     
     st.plotly_chart(plot_score_heatmap(probs, home, away), use_container_width=True)
+
+    # --- [RESTAURADO] HISTORIAL DE LOS EQUIPOS SELECCIONADOS ---
+    st.markdown("### 📉 Estado de Forma (Últimos 5)")
+    cf1, cf2 = st.columns(2)
+    with cf1: 
+        st.write(f"**{home}**")
+        st.dataframe(get_last_5(df, home), use_container_width=True, hide_index=True)
+    with cf2: 
+        st.write(f"**{away}**")
+        st.dataframe(get_last_5(df, away), use_container_width=True, hide_index=True)
+    # -----------------------------------------------------------
 
 with t2:
     col_analisis, col_ticket = st.columns([2, 1])
