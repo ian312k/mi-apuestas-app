@@ -230,10 +230,22 @@ with st.sidebar:
     leagues = {"SP1": "🇪🇸 La Liga", "E0": "🏴󠁧󠁢󠁥󠁮󠁧󠁿 Premier League", "I1": "🇮🇹 Serie A", "D1": "🇩🇪 Bundesliga", "F1": "🇫🇷 Ligue 1", "N1": "🇳🇱 Eredivisie", "P1": "🇵🇹 Primeira Liga"}
     code = st.selectbox("Liga", list(leagues.keys()), format_func=lambda x: leagues[x])
     df = fetch_live_soccer_data(code)
+    
+    # [CORREGIDO] AQUÍ ESTÁ DE NUEVO EL HISTORIAL DE ÚLTIMOS 5
     if not df.empty:
         stats, ah, aa, teams = calculate_strengths(df)
         st.success(f"✅ {len(df)} partidos cargados")
+        
+        st.markdown("---")
+        st.markdown("###### 🕒 Últimos 5 Registrados:")
+        last_5 = df.tail(5).copy().iloc[::-1]
+        last_5['Fecha'] = last_5['date'].dt.strftime('%d/%m')
+        last_5['Partido'] = last_5['home'] + " vs " + last_5['away']
+        last_5['Score'] = last_5['home_goals'].astype(int).astype(str) + "-" + last_5['away_goals'].astype(int).astype(str)
+        st.dataframe(last_5[['Fecha', 'Partido', 'Score']], hide_index=True, use_container_width=True)
     else: st.error("Error cargando datos"); st.stop()
+    # -----------------------------------------------------------
+
     st.divider()
     bank = st.number_input("💰 Tu Banco ($)", 1000.0, step=50.0)
     if st.session_state.ticket:
@@ -342,7 +354,7 @@ with t3:
                 res = st.selectbox("Resultado", ["Ganada", "Perdida", "Push"])
                 if st.button("Actualizar"): manage_bets("update", id_bet=bid, status=res); st.rerun()
 
-# --- NUEVA SECCIÓN: ESCÁNER ---
+# --- SECCIÓN: ESCÁNER ---
 with t4:
     st.markdown("## 💎 Escáner de Oportunidades")
     st.info("💡 Como los datos se descargan por temporada, usa el **'Cargador de Partidos'** para analizar los juegos reales de hoy.")
