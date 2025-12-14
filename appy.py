@@ -4,17 +4,20 @@ import numpy as np
 from scipy.stats import poisson
 import plotly.graph_objects as go
 import os
+import requests 
+from difflib import get_close_matches
 from datetime import datetime
 
 # ======================================================
 # 1. CONFIGURACIÓN Y ESTILOS CSS (DARK MODE) 🎨
 # ======================================================
-st.set_page_config(page_title="Dixon-Coles Pro Completo", layout="wide", page_icon="⚽")
+st.set_page_config(page_title="Dixon-Coles Pro + API En Vivo", layout="wide", page_icon="⚽")
 CSV_FILE = 'mis_apuestas_pro.csv'
 
-# Inicializar Session States
+# Inicializar Session States (CON TU CLAVE YA CARGADA)
 if 'ticket' not in st.session_state: st.session_state.ticket = []
 if 'daily_matches' not in st.session_state: st.session_state.daily_matches = []
+if 'api_key' not in st.session_state: st.session_state.api_key = "f8b57bf9dc94df0f21b95752a4897c98"
 
 # Estilos CSS
 st.markdown("""
@@ -231,7 +234,6 @@ with st.sidebar:
     code = st.selectbox("Liga", list(leagues.keys()), format_func=lambda x: leagues[x])
     df = fetch_live_soccer_data(code)
     
-    # --- [RESTAURADO] HISTORIAL GLOBAL EN SIDEBAR ---
     if not df.empty:
         stats, ah, aa, teams = calculate_strengths(df)
         st.success(f"✅ {len(df)} partidos cargados")
@@ -244,7 +246,6 @@ with st.sidebar:
         last_5['Score'] = last_5['home_goals'].astype(int).astype(str) + "-" + last_5['away_goals'].astype(int).astype(str)
         st.dataframe(last_5[['Fecha', 'Partido', 'Score']], hide_index=True, use_container_width=True)
     else: st.error("Error cargando datos"); st.stop()
-    # ------------------------------------------------
 
     st.divider()
     bank = st.number_input("💰 Tu Banco ($)", 1000.0, step=50.0)
@@ -264,7 +265,7 @@ away = c2.selectbox("Visitante", [t for t in teams if t != home])
 h_exp, a_exp, ph, pd_prob, pa, po15, po25, pbtts, top_sc, probs = predict_match_dixon_coles(home, away, stats, ah, aa)
 
 # PESTAÑAS
-t1, t2, t3, t4, t5 = st.tabs(["📊 Análisis", "💰 Valor y Parlay", "📜 Historial", "💎 Escáner de Apuestas", "🧪 Backtest"])
+t1, t2, t3, t4, t5 = st.tabs(["📊 Análisis", "💰 Valor y Parlay", "📜 Historial", "💎 Escáner En Vivo (API)", "🧪 Backtest"])
 
 with t1:
     st.markdown("### 🥅 Expectativa de Goles")
@@ -286,7 +287,6 @@ with t1:
     
     st.plotly_chart(plot_score_heatmap(probs, home, away), use_container_width=True)
 
-    # --- [RESTAURADO] HISTORIAL DE LOS EQUIPOS SELECCIONADOS ---
     st.markdown("### 📉 Estado de Forma (Últimos 5)")
     cf1, cf2 = st.columns(2)
     with cf1: 
@@ -295,7 +295,6 @@ with t1:
     with cf2: 
         st.write(f"**{away}**")
         st.dataframe(get_last_5(df, away), use_container_width=True, hide_index=True)
-    # -----------------------------------------------------------
 
 with t2:
     col_analisis, col_ticket = st.columns([2, 1])
@@ -365,94 +364,125 @@ with t3:
                 res = st.selectbox("Resultado", ["Ganada", "Perdida", "Push"])
                 if st.button("Actualizar"): manage_bets("update", id_bet=bid, status=res); st.rerun()
 
-# --- SECCIÓN: ESCÁNER ---
+# --- ESCÁNER CON API ---
 with t4:
-    st.markdown("## 💎 Escáner de Oportunidades")
-    st.info("💡 Como los datos se descargan por temporada, usa el **'Cargador de Partidos'** para analizar los juegos reales de hoy.")
+    st.markdown("## 💎 Escáner En Vivo (The Odds API)")
+    
+    # Mapeo de códigos de tu App a los códigos de la API
+    api_league_map = {
+        "SP1": "soccer_spain_la_liga",
+        "E0": "soccer_epl",
+        "I1": "soccer_italy_serie_a",
+        "D1": "soccer_germany_bundesliga",
+        "F1": "soccer_france_ligue_one",
+        "N1": "soccer_netherlands_eredivisie",
+        "P1": "soccer_portugal_primeira_liga"
+    }
 
-    tab_scan_1, tab_scan_2 = st.tabs(["📅 Cargador de Partidos (Hoy)", "🌍 Radar de Mercado (Simulación)"])
+    # Input de Key (Pre-cargada con tu clave)
+    api_key_input = st.text_input("🔑 API Key:", value=st.session_state.api_key, type="password")
+    if st.button("💾 Guardar Key / Actualizar"):
+        st.session_state.api_key = api_key_input
+        st.success("Clave guardada.")
+        st.rerun()
 
-    with tab_scan_1:
-        st.markdown("#### Configura la jornada de hoy:")
-        c_add1, c_add2, c_add3 = st.columns([2, 2, 1])
-        with c_add1: sh = st.selectbox("Local (Hoy)", teams, key="s_home")
-        with c_add2: sa = st.selectbox("Visita (Hoy)", [t for t in teams if t != sh], key="s_away")
-        with c_add3: 
-            st.write(""); st.write("")
-            if st.button("➕ Añadir"):
-                if f"{sh} vs {sa}" not in [m['id'] for m in st.session_state.daily_matches]:
-                    st.session_state.daily_matches.append({'home': sh, 'away': sa, 'id': f"{sh} vs {sa}"})
+    st.divider()
 
-        if st.session_state.daily_matches:
-            st.write(f"**Partidos cargados:** {len(st.session_state.daily_matches)}")
-            
-            # Botón para borrar lista
-            if st.button("🗑️ Limpiar Lista"): st.session_state.daily_matches = []; st.rerun()
-
-            # --- CÁLCULO DE LAS MEJORES APUESTAS ---
-            daily_results = []
-            for match in st.session_state.daily_matches:
-                mh, ma = match['home'], match['away']
-                # Cálculo Dixon-Coles
-                _, _, d_ph, d_pd, d_pa, d_o15, d_o25, d_btts, _, _ = predict_match_dixon_coles(mh, ma, stats, ah, aa)
-                
-                # Determinamos la predicción más probable
-                if d_ph > d_pa and d_ph > d_pd: pick, prob, color = f"Gana {mh}", d_ph, "#4CAF50"
-                elif d_pa > d_ph and d_pa > d_pd: pick, prob, color = f"Gana {ma}", d_pa, "#2196F3"
-                else: pick, prob, color = "Empate", d_pd, "#FFC107"
-
-                daily_results.append({
-                    "Partido": f"{mh} vs {ma}",
-                    "Mejor Pick": pick,
-                    "Prob (%)": prob,
-                    "Over 2.5": d_o25,
-                    "BTTS": d_btts,
-                    "Color": color
-                })
-            
-            # Convertimos a DataFrame y ordenamos
-            df_daily = pd.DataFrame(daily_results).sort_values(by="Prob (%)", ascending=False)
-
-            st.markdown("### 🔥 Top 5 Apuestas del Día")
-            for i, row in df_daily.head(5).iterrows():
-                st.markdown(f"""
-                <div class="best-bet-card" style="border-left: 5px solid {row['Color']}">
-                    <h4 style="margin:0">{row['Partido']}</h4>
-                    <span style="font-size:1.2em">👉 <strong>{row['Mejor Pick']}</strong> ({row['Prob (%)']*100:.1f}%)</span><br>
-                    <small>Otros datos: Over 2.5: {row['Over 2.5']*100:.0f}% | BTTS: {row['BTTS']*100:.0f}%</small>
-                </div>
-                """, unsafe_allow_html=True)
-
-    with tab_scan_2:
-        st.markdown("#### 🕵️ Buscador de Valor Teórico")
-        st.write("Analiza **todos contra todos** para encontrar los equipos más fiables de la liga actualmente.")
+    if st.session_state.api_key:
+        st.write(f"📡 Buscando partidos HOY para: **{leagues[code]}**...")
         
-        if st.button("🚀 Escanear Liga Completa"):
-            scan_res = []
-            progress = st.progress(0)
-            total_scans = len(teams) * (len(teams)-1)
-            step = 0
+        if st.button("🚀 Escanear Mercado Real"):
+            sport_key = api_league_map.get(code)
             
-            for t_h in teams:
-                for t_a in teams:
-                    if t_h != t_a:
-                        _, _, s_ph, _, s_pa, s_o25, _, _, _, _ = predict_match_dixon_coles(t_h, t_a, stats, ah, aa)
+            try:
+                # 1. Llamada a la API
+                url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/?regions=eu&markets=h2h&oddsFormat=decimal&apiKey={st.session_state.api_key}"
+                res = requests.get(url)
+                data = res.json()
+                
+                if 'message' in data:
+                    st.error(f"Error de API: {data['message']}")
+                elif not data:
+                    st.warning("✅ Conexión exitosa, pero NO hay partidos programados para hoy/mañana en esta liga.")
+                else:
+                    live_results = []
+                    
+                    # 2. Procesar partidos
+                    for item in data:
+                        h_team_api = item['home_team']
+                        a_team_api = item['away_team']
                         
-                        # Guardamos info Local Fuerte
-                        if s_ph > 0.65:
-                            scan_res.append({"Tipo": "Local Muy Fuerte", "Partido": f"{t_h} vs {t_a}", "Pick": t_h, "Prob": s_ph})
-                        # Guardamos info Visita Fuerte
-                        if s_pa > 0.60:
-                            scan_res.append({"Tipo": "Visita Peligrosa", "Partido": f"{t_h} vs {t_a}", "Pick": t_a, "Prob": s_pa})
-                        # Guardamos Goles
-                        if s_o25 > 0.70:
-                            scan_res.append({"Tipo": "Fiesta de Goles", "Partido": f"{t_h} vs {t_a}", "Pick": "Over 2.5", "Prob": s_o25})
+                        odds_h, odds_d, odds_a = 0, 0, 0
                         
-                        step += 1
-            progress.progress(100)
-            
-            df_scan = pd.DataFrame(scan_res).sort_values(by="Prob", ascending=False)
-            st.dataframe(df_scan.head(20), use_container_width=True)
+                        if item['bookmakers']:
+                            book = item['bookmakers'][0] # Usamos el primero disponible
+                            markets = book['markets'][0]['outcomes']
+                            for m in markets:
+                                if m['name'] == h_team_api: odds_h = m['price']
+                                elif m['name'] == a_team_api: odds_a = m['price']
+                                else: odds_d = m['price']
+                        
+                        # 3. Match de Nombres (Fuzzy Logic)
+                        match_home = get_close_matches(h_team_api, teams, n=1, cutoff=0.5)
+                        match_away = get_close_matches(a_team_api, teams, n=1, cutoff=0.5)
+                        
+                        if match_home and match_away:
+                            real_home, real_away = match_home[0], match_away[0]
+                            
+                            # Validar que existan en datos históricos
+                            if real_home in stats and real_away in stats:
+                                # Ejecutar Modelo
+                                _, _, ph, pd_prob, pa, o25, _, btts, _, _ = predict_match_dixon_coles(real_home, real_away, stats, ah, aa)
+                                
+                                # Calcular Valor (EV)
+                                ev_h = (ph * odds_h) - 1
+                                ev_a = (pa * odds_a) - 1
+                                ev_d = (pd_prob * odds_d) - 1
+                                
+                                best_pick, best_ev = "No Bet", -10.0
+                                if ev_h > 0: best_pick, best_ev = f"Gana {real_home}", ev_h
+                                if ev_a > ev_h and ev_a > 0: best_pick, best_ev = f"Gana {real_away}", ev_a
+                                if ev_d > ev_h and ev_d > ev_a and ev_d > 0: best_pick, best_ev = "Empate", ev_d
+                                
+                                live_results.append({
+                                    "Hora": pd.to_datetime(item['commence_time']).strftime('%H:%M'),
+                                    "Partido": f"{real_home} vs {real_away}",
+                                    "Prob Modelo": f"L:{ph*100:.0f}% E:{pd_prob*100:.0f}% V:{pa*100:.0f}%",
+                                    "Cuotas Reales": f"L:{odds_h} E:{odds_d} V:{odds_a}",
+                                    "Pick Valor": best_pick,
+                                    "EV": best_ev
+                                })
+                    
+                    if live_results:
+                        df_live = pd.DataFrame(live_results).sort_values(by="EV", ascending=False)
+                        
+                        st.markdown(f"### 🎯 Oportunidades Encontradas ({len(df_live)})")
+                        for i, row in df_live.iterrows():
+                            color = "#4CAF50" if row['EV'] > 0 else "#FF5252" # Verde si hay valor, Rojo si no
+                            val_txt = f"+{row['EV']*100:.1f}%" if row['EV'] > 0 else f"{row['EV']*100:.1f}%"
+                            
+                            st.markdown(f"""
+                            <div style="background-color: #262730; border-left: 5px solid {color}; padding: 10px; margin-bottom: 10px; border-radius: 5px;">
+                                <div style="display:flex; justify-content:space-between;">
+                                    <strong>⏰ {row['Hora']} | {row['Partido']}</strong>
+                                    <span style="color:{color}; font-weight:bold; font-size:1.2em">EV: {val_txt}</span>
+                                </div>
+                                <div style="display:flex; justify-content:space-between; font-size:0.9em; margin-top:5px; color:#ccc;">
+                                    <span>🧠 {row['Prob Modelo']}</span>
+                                    <span>🏦 {row['Cuotas Reales']}</span>
+                                </div>
+                                <div style="margin-top:5px; font-size:1.1em;">
+                                    👉 Recomendación: <strong>{row['Pick Valor']}</strong>
+                                </div>
+                            </div>
+                            """, unsafe_allow_html=True)
+                    else:
+                        st.info("La API trajo partidos, pero no pude coincidir los nombres de los equipos con tu base de datos histórica. Intenta actualizar los datos.")
+
+            except Exception as e:
+                st.error(f"Error de conexión: {e}")
+    else:
+        st.warning("Por favor ingresa una API Key válida.")
 
 with t5:
     st.markdown("### 🧪 Backtest")
