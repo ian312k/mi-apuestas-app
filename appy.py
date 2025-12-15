@@ -11,12 +11,11 @@ from datetime import datetime, timezone
 # ======================================================
 # 1. CONFIGURACIÓN Y ESTILOS CSS (DARK MODE) 🎨
 # ======================================================
-st.set_page_config(page_title="Dixon-Coles Pro v3.3 Blindada", layout="wide", page_icon="⚽")
+st.set_page_config(page_title="Dixon-Coles Pro v3.4 (xG Lite)", layout="wide", page_icon="⚽")
 CSV_FILE = 'mis_apuestas_pro.csv'
 
 # --- GESTIÓN DE ESTADO (SESSION STATE) ---
 if 'ticket' not in st.session_state: st.session_state.ticket = []
-# CAMBIO 1: API KEY VACÍA POR DEFECTO (PARA INGRESO MANUAL)
 if 'api_key' not in st.session_state: st.session_state.api_key = ""
 if 'api_odds_cache' not in st.session_state: st.session_state.api_odds_cache = {} 
 if 'api_usage' not in st.session_state: st.session_state.api_usage = {"used": 0, "remaining": 500}
@@ -43,16 +42,27 @@ def fetch_live_soccer_data(league_code="SP1"):
     url = f"https://www.football-data.co.uk/mmz4281/2526/{league_code}.csv"
     try:
         df = pd.read_csv(url)
-        cols = ['Date', 'HomeTeam', 'AwayTeam', 'FTHG', 'FTAG', 'B365H', 'B365D', 'B365A']
+        # --- CAMBIO IMPORTANTE: AHORA LEEMOS TIROS A PUERTA (HST, AST) ---
+        cols = ['Date', 'HomeTeam', 'AwayTeam', 'FTHG', 'FTAG', 'B365H', 'B365D', 'B365A', 'HST', 'AST']
         actual_cols = [c for c in cols if c in df.columns]
         df = df[actual_cols]
-        new_names = ['date', 'home', 'away', 'home_goals', 'away_goals', 'odd_h', 'odd_d', 'odd_a']
-        if len(actual_cols) == 8: df.columns = new_names
-        else:
-            df = df[['Date', 'HomeTeam', 'AwayTeam', 'FTHG', 'FTAG']]
-            df.columns = ['date', 'home', 'away', 'home_goals', 'away_goals']
-            df['odd_h'] = 1.0; df['odd_d'] = 1.0; df['odd_a'] = 1.0 
-        df = df.dropna()
+        
+        # Renombramos para estandarizar
+        rename_map = {
+            'Date': 'date', 'HomeTeam': 'home', 'AwayTeam': 'away', 
+            'FTHG': 'home_goals', 'FTAG': 'away_goals', 
+            'B365H': 'odd_h', 'B365D': 'odd_d', 'B365A': 'odd_a',
+            'HST': 'sot_h', 'AST': 'sot_a' # Shots on Target Home/Away
+        }
+        df = df.rename(columns=rename_map)
+        
+        # Si faltan columnas de cuotas o tiros, rellenamos con valores default
+        if 'odd_h' not in df.columns: df['odd_h'] = 1.0; df['odd_d'] = 1.0; df['odd_a'] = 1.0
+        if 'sot_h' not in df.columns: df['sot_h'] = 0; df['sot_a'] = 0 # Relleno si no hay datos de tiros
+        
+        df = df.dropna(subset=['home', 'away', 'home_goals', 'away_goals']) # Solo eliminamos si faltan goles/equipos
+        df = df.fillna(0) # El resto (tiros) a 0 si es nulo
+        
         df['date'] = pd.to_datetime(df['date'], dayfirst=True, errors='coerce')
         return df
     except: return pd.DataFrame()
@@ -77,13 +87,17 @@ def calculate_strengths(df):
     df['days_ago'] = (last_date - df['date']).dt.days
     alpha = 0.004
     df['weight'] = np.exp(-alpha * df['days_ago'])
+    
     avg_home = np.average(df['home_goals'], weights=df['weight'])
     avg_away = np.average(df['away_goals'], weights=df['weight'])
     avg_global = (avg_home + avg_away) / 2
+    
     team_stats = {}
     all_teams = sorted(list(set(df['home'].unique()) | set(df['away'].unique())))
     MIX_FACTOR = 0.7 
+    
     for team in all_teams:
+        # --- LÓGICA DE GOLES (DIXON-COLES) ---
         team_matches = df[(df['home'] == team) | (df['away'] == team)].copy()
         if not team_matches.empty:
             team_matches['goals_scored'] = np.where(team_matches['home'] == team, team_matches['home_goals'], team_matches['away_goals'])
@@ -91,21 +105,35 @@ def calculate_strengths(df):
             att_global = np.average(team_matches['goals_scored'], weights=team_matches['weight']) / avg_global
             def_global = np.average(team_matches['goals_conceded'], weights=team_matches['weight']) / avg_global
         else: att_global, def_global = 1.0, 1.0
+        
         h_m = df[df['home'] == team]
         if not h_m.empty:
             att_h_pure = np.average(h_m['home_goals'], weights=h_m['weight']) / avg_home
             def_h_pure = np.average(h_m['away_goals'], weights=h_m['weight']) / avg_away
-        else: att_h_pure, def_h_pure = 1.0, 1.0
+            # Calculamos promedio de Tiros a Puerta Local Ponderado
+            sot_h_avg = np.average(h_m['sot_h'], weights=h_m['weight'])
+        else: 
+            att_h_pure, def_h_pure = 1.0, 1.0
+            sot_h_avg = 0.0
+            
         a_m = df[df['away'] == team]
         if not a_m.empty:
             att_a_pure = np.average(a_m['away_goals'], weights=a_m['weight']) / avg_away
             def_a_pure = np.average(a_m['home_goals'], weights=a_m['weight']) / avg_home
-        else: att_a_pure, def_a_pure = 1.0, 1.0
+             # Calculamos promedio de Tiros a Puerta Visita Ponderado
+            sot_a_avg = np.average(a_m['sot_a'], weights=a_m['weight'])
+        else: 
+            att_a_pure, def_a_pure = 1.0, 1.0
+            sot_a_avg = 0.0
+
         team_stats[team] = {
             'att_h': (att_h_pure * MIX_FACTOR) + (att_global * (1 - MIX_FACTOR)),
             'def_h': (def_h_pure * MIX_FACTOR) + (def_global * (1 - MIX_FACTOR)),
             'att_a': (att_a_pure * MIX_FACTOR) + (att_global * (1 - MIX_FACTOR)),
-            'def_a': (def_a_pure * MIX_FACTOR) + (def_global * (1 - MIX_FACTOR))
+            'def_a': (def_a_pure * MIX_FACTOR) + (def_global * (1 - MIX_FACTOR)),
+            # Guardamos los datos de tiros también
+            'sot_h_avg': sot_h_avg,
+            'sot_a_avg': sot_a_avg
         }
     return team_stats, avg_home, avg_away, all_teams
 
@@ -182,8 +210,12 @@ def get_last_5(df, team):
     l5 = df[mask].sort_values(by='date', ascending=False).head(5).copy()
     l5['Rival'] = np.where(l5['home'] == team, l5['away'], l5['home'])
     l5['Score'] = l5['home_goals'].astype(int).astype(str) + "-" + l5['away_goals'].astype(int).astype(str)
+    # Mostramos Tiros si existen
+    if 'sot_h' in l5.columns:
+        l5['Tiros'] = np.where(l5['home'] == team, l5['sot_h'], l5['sot_a']).astype(int)
+    else: l5['Tiros'] = 0
     l5['Sede'] = np.where(l5['home'] == team, '🏠', '✈️')
-    return l5[['Sede', 'Rival', 'Score']]
+    return l5[['Sede', 'Rival', 'Score', 'Tiros']]
 
 def calculate_kelly(prob, odd):
     if prob <= 0 or odd <= 1: return 0.0
@@ -235,7 +267,7 @@ with st.sidebar:
         last_5['Partido'] = last_5['home'] + " vs " + last_5['away']
         last_5['Score'] = last_5['home_goals'].astype(int).astype(str) + "-" + last_5['away_goals'].astype(int).astype(str)
         st.dataframe(last_5[['Fecha', 'Partido', 'Score']], hide_index=True, use_container_width=True)
-    else: st.error("Error cargando datos"); st.stop()
+    else: st.error("Error cargando datos. (Puede que no haya temporada activa o falló la conexión)"); st.stop()
 
     st.divider()
     bank = st.number_input("💰 Tu Banco ($)", 1000.0, step=50.0)
@@ -260,11 +292,26 @@ t1, t2, t3, t4, t5, t6 = st.tabs(["📊 Análisis", "💰 Valor", "📜 Historia
 
 # --- TAB 1: ANÁLISIS ---
 with t1:
-    st.markdown("### 🥅 Expectativa de Goles")
+    st.markdown("### 🥅 Expectativa de Goles (Modelo)")
     c_g1, c_g2, c_g3 = st.columns(3)
     c_g1.metric(home, f"{h_exp:.2f}")
     c_g2.metric("Total (xG)", f"{h_exp+a_exp:.2f}") 
     c_g3.metric(away, f"{a_exp:.2f}")
+
+    # --- NUEVA GRÁFICA: REALIDAD VS MODELO ---
+    st.markdown("### 🎯 Realidad Ofensiva (Goles vs Tiros al Arco)")
+    
+    # Obtenemos los promedios de tiros ponderados
+    sot_h_val = stats[home].get('sot_h_avg', 0)
+    sot_a_val = stats[away].get('sot_a_avg', 0)
+    
+    fig_shot = go.Figure(data=[
+        go.Bar(name='Goles Esperados (Modelo)', x=[home, away], y=[h_exp, a_exp], marker_color='#FFA726'),
+        go.Bar(name='Prom. Tiros a Puerta (Real)', x=[home, away], y=[sot_h_val, sot_a_val], marker_color='#29B6F6')
+    ])
+    fig_shot.update_layout(barmode='group', title="¿Suerte o Talento? (Barra Azul debe ser alta)", height=300, margin=dict(t=30, b=20))
+    st.plotly_chart(fig_shot, use_container_width=True)
+    # ----------------------------------------
 
     st.plotly_chart(plot_radar_comparison(home, away, stats), use_container_width=True)
     
@@ -320,7 +367,6 @@ with t2:
         total_imp = imp_h + imp_d + imp_a
         imp_h /= total_imp; imp_d /= total_imp; imp_a /= total_imp
 
-        # --- CAMBIO 2: INTEGRACIÓN DE KELLY CRITERION MEJORADO ---
         st.markdown("#### 🧠 Estrategia Kelly")
         k_ev_h = (ph * oh) - 1
         k_ev_d = (pd_prob * od) - 1
@@ -337,7 +383,6 @@ with t2:
             st.success(f"💎 **Recomendación Kelly:** {k_sel} | Stake: ${k_stake:.2f} ({k_pct:.2f}%)")
         else:
             st.warning("📉 Kelly sugiere: **No apostar** (Sin valor esperado positivo)")
-        # ---------------------------------------------------------
 
         fig_val = go.Figure(data=[
             go.Bar(name='Tu Modelo', x=[home, 'Empate', away], y=[ph, pd_prob, pa], marker_color='#00CC96'),
@@ -418,8 +463,18 @@ with t4:
         st.progress(pct_used, text=f"Llamadas API: {st.session_state.api_usage['used']} / 500 usadas")
     
     api_league_map = { "SP1": "soccer_spain_la_liga", "E0": "soccer_epl", "I1": "soccer_italy_serie_a", "D1": "soccer_germany_bundesliga", "F1": "soccer_france_ligue_one", "N1": "soccer_netherlands_eredivisie", "P1": "soccer_portugal_primeira_liga" }
-    api_key_input = st.text_input("🔑 API Key:", value=st.session_state.api_key, type="password")
-    if st.button("💾 Guardar Key"): st.session_state.api_key = api_key_input; st.success("Guardado."); st.rerun()
+    
+    # --- CAMBIO: INPUT CON KEY PARA DETECTAR ENTER ---
+    api_key_input = st.text_input("🔑 API Key (Pega y presiona Enter):", value=st.session_state.api_key, type="password", key="api_key_input")
+    
+    # Logica para guardar cuando se presiona Enter o el Botón
+    if api_key_input != st.session_state.api_key:
+        st.session_state.api_key = api_key_input
+        st.rerun() # Recarga inmediata para mostrar el panel
+
+    if st.button("💾 Guardar Key Manualmente"): 
+        st.session_state.api_key = api_key_input
+        st.success("Guardado."); st.rerun()
     st.divider()
 
     if st.session_state.api_key:
