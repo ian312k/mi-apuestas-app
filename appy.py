@@ -16,7 +16,8 @@ CSV_FILE = 'mis_apuestas_pro.csv'
 
 # --- GESTIÓN DE ESTADO (SESSION STATE) ---
 if 'ticket' not in st.session_state: st.session_state.ticket = []
-if 'api_key' not in st.session_state: st.session_state.api_key = "f8b57bf9dc94df0f21b95752a4897c98"
+# CAMBIO 1: API KEY VACÍA POR DEFECTO (PARA INGRESO MANUAL)
+if 'api_key' not in st.session_state: st.session_state.api_key = ""
 if 'api_odds_cache' not in st.session_state: st.session_state.api_odds_cache = {} 
 if 'api_usage' not in st.session_state: st.session_state.api_usage = {"used": 0, "remaining": 500}
 
@@ -318,6 +319,25 @@ with t2:
         imp_h = (1/oh); imp_d = (1/od); imp_a = (1/oa) 
         total_imp = imp_h + imp_d + imp_a
         imp_h /= total_imp; imp_d /= total_imp; imp_a /= total_imp
+
+        # --- CAMBIO 2: INTEGRACIÓN DE KELLY CRITERION MEJORADO ---
+        st.markdown("#### 🧠 Estrategia Kelly")
+        k_ev_h = (ph * oh) - 1
+        k_ev_d = (pd_prob * od) - 1
+        k_ev_a = (pa * oa) - 1
+        k_max_ev = max(k_ev_h, k_ev_d, k_ev_a)
+        
+        if k_max_ev > 0:
+            if k_max_ev == k_ev_h: k_sel, k_p, k_o = f"Gana {home}", ph, oh
+            elif k_max_ev == k_ev_d: k_sel, k_p, k_o = "Empate", pd_prob, od
+            else: k_sel, k_p, k_o = f"Gana {away}", pa, oa
+            
+            k_pct = calculate_kelly(k_p, k_o)
+            k_stake = (k_pct / 100) * bank
+            st.success(f"💎 **Recomendación Kelly:** {k_sel} | Stake: ${k_stake:.2f} ({k_pct:.2f}%)")
+        else:
+            st.warning("📉 Kelly sugiere: **No apostar** (Sin valor esperado positivo)")
+        # ---------------------------------------------------------
 
         fig_val = go.Figure(data=[
             go.Bar(name='Tu Modelo', x=[home, 'Empate', away], y=[ph, pd_prob, pa], marker_color='#00CC96'),
