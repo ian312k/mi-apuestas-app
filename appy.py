@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 # ======================================================
 # 1. CONFIGURACIÓN Y ESTILOS CSS (DARK MODE) 🎨
 # ======================================================
-st.set_page_config(page_title="Dixon-Coles Pro v3.2", layout="wide", page_icon="⚽")
+st.set_page_config(page_title="Dixon-Coles Pro v3.3 Blindada", layout="wide", page_icon="⚽")
 CSV_FILE = 'mis_apuestas_pro.csv'
 
 # --- GESTIÓN DE ESTADO (SESSION STATE) ---
@@ -19,6 +19,8 @@ if 'ticket' not in st.session_state: st.session_state.ticket = []
 if 'api_key' not in st.session_state: st.session_state.api_key = "f8b57bf9dc94df0f21b95752a4897c98"
 if 'api_odds_cache' not in st.session_state: st.session_state.api_odds_cache = {} 
 if 'api_usage' not in st.session_state: st.session_state.api_usage = {"used": 0, "remaining": 500}
+
+# ESTE ES EL ALMACÉN BLINDADO
 if 'market_storage' not in st.session_state: st.session_state.market_storage = {}
 
 # Estilos CSS
@@ -26,13 +28,13 @@ st.markdown("""
 <style>
     div[data-testid="stMetric"] { background-color: #262730; border: 1px solid #464b5c; padding: 15px; border-radius: 10px; }
     .ticket-box { background-color: #1e1e1e; border: 1px solid #ffd700; padding: 15px; border-radius: 10px; margin-bottom: 10px; }
-    .best-bet-card { background-color: #1c2e24; border-left: 5px solid #00ff00; padding: 15px; margin-bottom: 10px; border-radius: 5px; }
+    .success-box { background-color: #1c2e24; border: 1px solid #4CAF50; padding: 15px; border-radius: 5px; margin-bottom: 10px; }
     h1, h2, h3 { text-align: center; }
 </style>
 """, unsafe_allow_html=True)
 
 # ======================================================
-# 2. FUNCIONES LÓGICAS Y API 🧠
+# 2. FUNCIONES LÓGICAS 🧠
 # ======================================================
 
 @st.cache_data(ttl=3600)
@@ -54,7 +56,7 @@ def fetch_live_soccer_data(league_code="SP1"):
         return df
     except: return pd.DataFrame()
 
-# API MANUAL
+# API MANUAL (CONTROL TOTAL)
 def call_api_real(sport_key, api_key):
     url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/?regions=eu&markets=h2h&oddsFormat=decimal&apiKey={api_key}"
     try:
@@ -204,9 +206,8 @@ def manage_bets(mode, data=None, id_bet=None, status=None):
             profit = (df.at[i, 'Stake'] * df.at[i, 'Cuota']) - df.at[i, 'Stake'] if status == 'Ganada' else (-df.at[i, 'Stake'] if status == 'Perdida' else 0)
             df.at[i, 'Ganancia'] = profit
             df.to_csv(CSV_FILE, index=False)
-    
+            
     elif mode == "delete":
-        # --- LÓGICA DE BORRADO ---
         df = df[df['ID'].astype(str) != str(id_bet)]
         df.to_csv(CSV_FILE, index=False)
         
@@ -218,6 +219,7 @@ def manage_bets(mode, data=None, id_bet=None, status=None):
 with st.sidebar:
     st.header("⚙️ Configuración")
     if st.button("🔄 Actualizar Datos"): st.cache_data.clear(); st.rerun()
+    
     leagues = {"SP1": "🇪🇸 La Liga", "E0": "🏴󠁧󠁢󠁥󠁮󠁧󠁿 Premier League", "I1": "🇮🇹 Serie A", "D1": "🇩🇪 Bundesliga", "F1": "🇫🇷 Ligue 1", "N1": "🇳🇱 Eredivisie", "P1": "🇵🇹 Primeira Liga"}
     code = st.selectbox("Liga", list(leagues.keys()), format_func=lambda x: leagues[x])
     df = fetch_live_soccer_data(code)
@@ -355,7 +357,7 @@ with t2:
                 manage_bets("save", {"ID": pd.Timestamp.now().strftime('%Y%m%d%H%M%S'), "Fecha": pd.Timestamp.now().strftime('%Y-%m-%d'), "Liga": tipo_str, "Partido": match_str, "Pick": pick_str, "Cuota": round(total_odd, 2), "Stake": stake_parlay, "Prob": round(total_prob, 4), "Estado": "Pendiente", "Ganancia": 0.0})
                 st.session_state.ticket = []; st.balloons(); st.rerun()
 
-# --- TAB 3: HISTORIAL (CON BORRADO) ---
+# --- TAB 3: HISTORIAL ---
 with t3:
     st.markdown("### 📜 Historial")
     db = manage_bets("load")
@@ -479,7 +481,7 @@ with t4:
                     """, unsafe_allow_html=True)
             else: st.info("Datos descargados, pero no se encontraron partidos compatibles para esta semana.")
 
-# --- TAB 5: LABORATORIO (BACKTEST + MONTE CARLO) ---
+# --- TAB 5: LABORATORIO ---
 with t5:
     st.markdown("## 🧪 Laboratorio de Simulación")
     
@@ -503,8 +505,8 @@ with t5:
         st.plotly_chart(fig_sim, use_container_width=True)
 
     st.divider()
-    st.markdown("### 📜 Backtest Histórico (Validación del Modelo)")
-    if st.button("▶️ Validar con últimos 50 partidos reales"):
+    st.markdown("### 📜 Backtest Histórico")
+    if st.button("▶️ Validar con últimos 50 partidos"):
         test_df, ok, profit = run_backtest(df, stats, ah, aa) 
         m1, m2, m3 = st.columns(3)
         m1.metric("Aciertos", f"{ok}/50 ({ok/50*100:.0f}%)") 
