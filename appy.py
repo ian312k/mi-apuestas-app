@@ -11,9 +11,9 @@ import xgboost as xgb
 from sklearn.metrics import log_loss
 
 # ======================================================
-# 1. CONFIGURACIÓN Y ESTILOS CSS (DARK MODE) 🎨
+# 1. CONFIGURACIÓN Y ESTILOS CSS
 # ======================================================
-st.set_page_config(page_title="Dixon-Coles Pro v6.0 (Hybrid AI)", layout="wide", page_icon="🧠")
+st.set_page_config(page_title="Dixon-Coles Pro v6.1 (Stable)", layout="wide", page_icon="🛡️")
 CSV_FILE = "mis_apuestas_pro.csv"
 N_SEASONS = 3  # ✅ Toma las últimas 3 temporadas
 
@@ -235,13 +235,10 @@ def run_backtest_no_leak(df, n_test=50, min_train=200, window_matches=800, stake
     return pd.DataFrame(results), correct, bal, roi, n_bets, total_stake
 
 # ======================================================
-# 🧠 FUNCIÓN PARA ENTRENAR XGBOOST HÍBRIDO (NUEVO)
+# 🧠 FUNCIÓN PARA ENTRENAR XGBOOST HÍBRIDO
 # ======================================================
 def train_hybrid_model(df, window_matches=800, train_size=500):
-    """
-    Genera dataset para ML: [Probs Dixon-Coles, Cuotas Mercado] -> [Resultado]
-    Evalúa con LogLoss.
-    """
+    """ Genera dataset para ML: [Probs Dixon-Coles, Cuotas Mercado] -> [Resultado] """
     df_sorted = df.dropna(subset=["date", "odd_h", "odd_d", "odd_a"]).sort_values("date").reset_index(drop=True)
     if len(df_sorted) > train_size + 100:
         dataset = df_sorted.tail(train_size + 100).copy()
@@ -249,7 +246,7 @@ def train_hybrid_model(df, window_matches=800, train_size=500):
         dataset = df_sorted.copy()
         
     X, y = [], []
-    progress_text = "Generando features para IA..."
+    progress_text = "Entrenando IA Híbrida..."
     my_bar = st.progress(0, text=progress_text)
     total_rows = len(dataset)
     start_idx = 100 
@@ -615,25 +612,34 @@ with t7:
             with st.spinner("Generando dataset y entrenando IA..."):
                 model_xgb, test_data, metrics, msg = train_hybrid_model(df, train_size=train_size)
                 if msg == "OK":
-                    st.session_state['ml_model'] = model_xgb; st.session_state['ml_metrics'] = metrics
-                    st.success("Modelo Entrenado")
+                    st.session_state.ml_model = model_xgb
+                    st.session_state.ml_metrics = metrics
+                    st.success("Modelo Entrenado Correctamente")
+                    st.rerun()
                 else: st.error(msg)
     
     with c_ml2:
-        if 'ml_metrics' in st.session_state:
-            met = st.session_state['ml_metrics']
+        if st.session_state.ml_metrics is not None:
+            met = st.session_state.ml_metrics
             st.markdown("### 📉 Evaluación (LogLoss - Menor es mejor)")
             k1, k2, k3 = st.columns(3)
-            k1.metric("LogLoss Mercado", f"{met['LogLoss Mkt']:.4f}")
-            k2.metric("LogLoss DC", f"{met['LogLoss DC']:.4f}")
-            k3.metric("LogLoss XGB", f"{met['LogLoss XGB']:.4f}", delta=f"{met['Mejora vs Mkt']:.2f}% vs Mkt")
+            val_mkt = met.get('LogLoss Mkt', 0)
+            val_dc = met.get('LogLoss DC', 0)
+            val_xgb = met.get('LogLoss XGB', 0)
+            imp = met.get('Mejora vs Mkt', 0)
+
+            k1.metric("LogLoss Mercado", f"{val_mkt:.4f}")
+            k2.metric("LogLoss DC", f"{val_dc:.4f}")
+            k3.metric("LogLoss XGB", f"{val_xgb:.4f}", delta=f"{imp:.2f}% vs Mkt")
             
-            fig_metrics = go.Figure(go.Bar(x=['Dixon-Coles', 'Mercado', 'XGBoost'], y=[met['LogLoss DC'], met['LogLoss Mkt'], met['LogLoss XGB']], marker_color=['#FFC107', '#FF5252', '#4CAF50'], textposition='auto'))
+            fig_metrics = go.Figure(go.Bar(x=['Dixon-Coles', 'Mercado', 'XGBoost'], y=[val_dc, val_mkt, val_xgb], marker_color=['#FFC107', '#FF5252', '#4CAF50'], textposition='auto'))
             st.plotly_chart(fig_metrics, use_container_width=True)
+        else:
+            st.info("👈 Entrena el modelo en la izquierda para ver las métricas.")
             
     st.divider()
     
-    if 'ml_model' in st.session_state and st.session_state['ml_model']:
+    if st.session_state.ml_model is not None:
         st.markdown(f"### 🤖 Predicción Híbrida: {home} vs {away}")
         c_p1, c_p2, c_p3 = st.columns(3)
         cur_oh = c_p1.number_input("Cuota Local (Actual)", 1.01, 100.0, 2.0)
@@ -643,7 +649,7 @@ with t7:
         if st.button("🔮 Predecir con IA"):
             margen_now = (1/cur_oh + 1/cur_od + 1/cur_oa)
             input_vector = np.array([[ph, pd_prob, pa, (1/cur_oh)/margen_now, (1/cur_od)/margen_now, (1/cur_oa)/margen_now, ph - (1/cur_oh)/margen_now, pa - (1/cur_oa)/margen_now]])
-            xgb_probs = st.session_state['ml_model'].predict_proba(input_vector)[0]
+            xgb_probs = st.session_state.ml_model.predict_proba(input_vector)[0]
             
             col_res1, col_res2 = st.columns(2)
             with col_res1:
