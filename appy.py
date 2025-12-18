@@ -11,9 +11,9 @@ from datetime import datetime
 # ======================================================
 # 1. CONFIGURACIÓN Y ESTILOS CSS (DARK MODE) 🎨
 # ======================================================
-st.set_page_config(page_title="Dixon-Coles Pro v5.1 (Risk Manager)", layout="wide", page_icon="🛡️")
+st.set_page_config(page_title="Dixon-Coles Pro v5.2 (Validator)", layout="wide", page_icon="🛡️")
 CSV_FILE = "mis_apuestas_pro.csv"
-N_SEASONS = 3  # ✅ Toma las últimas 3 temporadas
+N_SEASONS = 3  # ✅ últimas 3 temporadas
 
 # --- GESTIÓN DE ESTADO (SESSION STATE) ---
 if "ticket" not in st.session_state: st.session_state.ticket = []
@@ -48,7 +48,6 @@ def fetch_live_soccer_data(league_code="SP1", n_seasons=3):
         return f"{yy:02d}{yy2:02d}"
 
     today = datetime.now()
-    # Si estamos en la segunda mitad del año, la temporada empieza este año. Si no, empezó el año pasado.
     current_start_year = today.year if today.month >= 7 else (today.year - 1)
     seasons = [season_code(current_start_year - i) for i in range(n_seasons)]
 
@@ -70,6 +69,7 @@ def fetch_live_soccer_data(league_code="SP1", n_seasons=3):
             }
             tmp = tmp.rename(columns=rename_map)
 
+            # defaults
             for c in ["odd_h", "odd_d", "odd_a"]:
                 if c not in tmp.columns: tmp[c] = 1.0
             for c in ["sot_h", "sot_a"]:
@@ -104,25 +104,19 @@ def call_api_real(sport_key, api_key):
         return {"success": False, "error": "Excepción", "message": str(e)}
 
 # ----------------------------
-# STRENGTHS (Calculadora de Fuerza)
+# STRENGTHS (ref_date evita fuga por ponderación)
 # ----------------------------
 def calculate_strengths(df, ref_date=None, alpha=0.004, mix_factor=0.7, window_matches=None):
     df = df.copy()
     df = df.dropna(subset=["date", "home", "away", "home_goals", "away_goals"])
     df = df.sort_values("date").reset_index(drop=True)
 
-    # Si hay ventana, recortamos antes de calcular
     if window_matches is not None and len(df) > window_matches:
         df = df.tail(window_matches).reset_index(drop=True)
 
-    # Definir fecha de referencia para ponderación
     last_date = pd.to_datetime(ref_date) if ref_date is not None else df["date"].max()
-    
-    # Calcular días pasados (evitar números negativos si hay error en fecha)
     df["days_ago"] = (last_date - df["date"]).dt.days
     df["days_ago"] = df["days_ago"].clip(lower=0)
-    
-    # Peso exponencial (lo más reciente vale más)
     df["weight"] = np.exp(-alpha * df["days_ago"])
 
     if df.empty or df["weight"].sum() == 0:
@@ -178,8 +172,7 @@ def calculate_strengths(df, ref_date=None, alpha=0.004, mix_factor=0.7, window_m
 # ----------------------------
 def predict_match_dixon_coles(home, away, team_stats, avg_h, avg_a, rho=-0.13, max_goals=10):
     if home not in team_stats or away not in team_stats:
-        # Retorno seguro si faltan datos
-        return 0,0,0,0,0,0,0,0,[],np.zeros((1,1))
+        return 0, 0, 0, 0, 0, 0, 0, 0, [], np.zeros((1, 1))
 
     h_exp = team_stats[home]["att_h"] * team_stats[away]["def_a"] * avg_h
     a_exp = team_stats[away]["att_a"] * team_stats[home]["def_h"] * avg_a
@@ -196,7 +189,12 @@ def predict_match_dixon_coles(home, away, team_stats, avg_h, avg_a, rho=-0.13, m
             probs[x][y] = p_base * correction
 
     probs = np.maximum(0, probs)
-    probs = probs / probs.sum()
+    s = probs.sum()
+    if s <= 0:
+        probs = np.zeros_like(probs)
+        probs[0, 0] = 1.0
+    else:
+        probs = probs / s
 
     p_home = np.tril(probs, -1).sum()
     p_draw = np.diag(probs).sum()
@@ -215,84 +213,181 @@ def predict_match_dixon_coles(home, away, team_stats, avg_h, avg_a, rho=-0.13, m
     return h_exp, a_exp, p_home, p_draw, p_away, p_o15, p_o25, p_btts, top_scores, probs
 
 # ----------------------------
-# BACKTEST SIN FUGAS (Walk-Forward)
+# MÉTRICAS (probabilísticas)
 # ----------------------------
-def run_backtest_no_leak(df, n_test=50, min_train=200, window_matches=800, stake_unit=1.0):
+def _clip_prob(p, eps=1e-12):
+    return float(np.clip(p, eps, 1 - eps))
+
+def multiclass_log_loss(p_vec, y_idx):
+    p = _clip_prob(p_vec[y_idx])
+    return -np.log(p)
+
+def multiclass_brier(p_vec, y_idx):
+    y = np.zeros(3)
+    y[y_idx] = 1.0
+    p = np.array(p_vec, dtype=float)
+    return float(np.mean((p - y) ** 2))
+
+def implied_probs_no_margin(odd_h, odd_d, odd_a):
+    ih, id_, ia = 1.0/odd_h, 1.0/odd_d, 1.0/odd_a
+    s = ih + id_ + ia
+    return (ih/s, id_/s, ia/s)
+
+# ----------------------------
+# BACKTEST SIN FUGAS + ROI + LOGLOSS/BRIER + CALIBRACIÓN + SALTADOS
+# ----------------------------
+def run_backtest_no_leak(df, n_test=50, min_train=200, window_matches=800, stake_unit=1.0, min_ev=0.0):
     """
-    Simula apuestas en el pasado recalculando el modelo día a día.
-    EVITA LOOK-AHEAD BIAS (Fuga de datos).
+    Walk-forward sin fugas.
+    Evalúa:
+      - ROI, Profit, Accuracy
+      - LogLoss / Brier del modelo (1X2)
+      - LogLoss / Brier baseline (prob implícita del book sin margen)
+      - Calibración (binning por prob del pick)
+      - Contadores de saltados
+    Estrategia:
+      - pick = argmax(model_probs)
+      - bet sólo si EV >= min_ev
     """
     df_sorted = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
-    
-    # Tomamos el bloque final para testear
     test_block = df_sorted.tail(n_test)
 
     results = []
     correct, bal = 0, 0.0
     n_bets = 0
 
-    # Iteramos partido a partido (Cronológico)
+    # métricas prob
+    ll_model_list, ll_book_list = [], []
+    br_model_list, br_book_list = [], []
+
+    # calibración (por prob del pick)
+    calib_rows = []  # (p_pick, is_win)
+
+    skipped = {"min_train": 0, "missing_team": 0, "bad_odds": 0, "no_value": 0}
+
     for _, row in test_block.iterrows():
         cut_date = row["date"]
-        
-        # 1. Conjunto de entrenamiento: Solo lo ocurrido ANTES de este partido
         train_df = df_sorted[df_sorted["date"] < cut_date].copy()
         if len(train_df) < min_train:
+            skipped["min_train"] += 1
             continue
 
-        # 2. Recalcular fuerzas en ese momento del tiempo
         team_stats, avg_h, avg_a, _ = calculate_strengths(train_df, ref_date=cut_date, window_matches=window_matches)
-        
-        # Si equipos no existen en el pasado (recién ascendidos sin historia), saltamos
         if row["home"] not in team_stats or row["away"] not in team_stats:
+            skipped["missing_team"] += 1
             continue
 
-        # 3. Predecir
         _, _, ph, pd_prob, pa, *_ = predict_match_dixon_coles(row["home"], row["away"], team_stats, avg_h, avg_a)
 
-        # 4. Verificar Valor (EV) y Resultado
         odd_h = float(row.get("odd_h", np.nan))
         odd_d = float(row.get("odd_d", np.nan))
         odd_a = float(row.get("odd_a", np.nan))
 
-        # Filtro de cuotas inválidas
         if (np.isnan(odd_h) or odd_h <= 1.01) or (np.isnan(odd_d) or odd_d <= 1.01) or (np.isnan(odd_a) or odd_a <= 1.01):
+            skipped["bad_odds"] += 1
             continue
 
-        # Estrategia simple: Apostar a la mayor probabilidad (Se puede mejorar con filtro EV > 5%)
-        if ph > pd_prob and ph > pa:
-            pred, prob, odd = "Local", ph, odd_h
-            res_real = "Local" if row["home_goals"] > row["away_goals"] else "Fallo"
-        elif pa > ph and pa > pd_prob:
-            pred, prob, odd = "Visita", pa, odd_a
-            res_real = "Visita" if row["away_goals"] > row["home_goals"] else "Fallo"
+        # outcome real -> índice (0=H,1=D,2=A)
+        if row["home_goals"] > row["away_goals"]:
+            y_idx = 0
+            res_real = "Local"
+        elif row["home_goals"] == row["away_goals"]:
+            y_idx = 1
+            res_real = "Empate"
         else:
-            pred, prob, odd = "Empate", pd_prob, odd_d
-            res_real = "Empate" if row["home_goals"] == row["away_goals"] else "Fallo"
+            y_idx = 2
+            res_real = "Visita"
 
-        is_win = (pred == res_real)
-        profit_u = (odd - 1) * stake_unit if is_win else -stake_unit
+        p_model = (float(ph), float(pd_prob), float(pa))
+        p_book = implied_probs_no_margin(odd_h, odd_d, odd_a)
+
+        ll_model_list.append(multiclass_log_loss(p_model, y_idx))
+        ll_book_list.append(multiclass_log_loss(p_book, y_idx))
+        br_model_list.append(multiclass_brier(p_model, y_idx))
+        br_book_list.append(multiclass_brier(p_book, y_idx))
+
+        # pick del modelo
+        pick_idx = int(np.argmax(p_model))
+        pick_name = ["Local", "Empate", "Visita"][pick_idx]
+        pick_prob = p_model[pick_idx]
+        pick_odd = [odd_h, odd_d, odd_a][pick_idx]
+        ev = (pick_prob * pick_odd) - 1.0
+
+        # filtro de valor
+        if ev < min_ev:
+            skipped["no_value"] += 1
+            calib_rows.append((pick_prob, 0.0))  # lo contamos para calibración si quieres, pero sin apuesta real
+            continue
+
+        is_win = (pick_name == res_real)
+        profit_u = (pick_odd - 1) * stake_unit if is_win else -stake_unit
 
         correct += int(is_win)
         bal += profit_u
         n_bets += 1
+        calib_rows.append((pick_prob, float(is_win)))
 
         results.append({
             "Fecha": row["date"].strftime("%Y-%m-%d"),
             "Temporada": row.get("season", ""),
             "Partido": f"{row['home']} vs {row['away']}",
-            "Predicción": f"{pred} ({prob*100:.0f}%)",
+            "Pick": pick_name,
+            "Prob(Pick)": round(pick_prob, 4),
+            "EV": round(ev, 4),
+            "Cuota": pick_odd,
             "Realidad": f"{int(row['home_goals'])}-{int(row['away_goals'])}",
-            "Cuota": odd,
+            "Resultado": res_real,
             "Res": "✅" if is_win else "❌",
             "Stake(U)": stake_unit,
-            "P/L(U)": profit_u
+            "P/L(U)": round(profit_u, 3),
         })
 
     total_stake = n_bets * stake_unit
     roi = (bal / total_stake * 100) if total_stake > 0 else 0.0
 
-    return pd.DataFrame(results), correct, bal, roi, n_bets, total_stake
+    metrics = {
+        "logloss_model": float(np.mean(ll_model_list)) if ll_model_list else np.nan,
+        "logloss_book": float(np.mean(ll_book_list)) if ll_book_list else np.nan,
+        "brier_model": float(np.mean(br_model_list)) if br_model_list else np.nan,
+        "brier_book": float(np.mean(br_book_list)) if br_book_list else np.nan,
+    }
+
+    df_res = pd.DataFrame(results)
+
+    # Equity + drawdown (del backtest)
+    if not df_res.empty:
+        df_res["Equity"] = df_res["P/L(U)"].cumsum()
+        df_res["Peak"] = df_res["Equity"].cummax()
+        df_res["Drawdown"] = df_res["Equity"] - df_res["Peak"]
+        max_dd = float(df_res["Drawdown"].min())
+    else:
+        max_dd = 0.0
+
+    # Calibración por bins (prob del pick)
+    calib_df = pd.DataFrame(calib_rows, columns=["p_pick", "is_win"])
+    calib_plot = pd.DataFrame()
+    if not calib_df.empty:
+        bins = np.linspace(0, 1, 6)  # 5 bins
+        calib_df["bin"] = pd.cut(calib_df["p_pick"], bins=bins, include_lowest=True)
+        calib_plot = calib_df.groupby("bin", dropna=False).agg(
+            n=("p_pick", "count"),
+            p_avg=("p_pick", "mean"),
+            acc=("is_win", "mean")
+        ).reset_index()
+
+    # ROI por temporada (solo bets hechos)
+    season_summary = pd.DataFrame()
+    if not df_res.empty and "Temporada" in df_res.columns:
+        tmp = df_res.copy()
+        tmp["StakeTot"] = tmp["Stake(U)"]
+        season_summary = tmp.groupby("Temporada").agg(
+            apuestas=("Stake(U)", "count"),
+            profit=("P/L(U)", "sum"),
+            stake=("StakeTot", "sum")
+        ).reset_index()
+        season_summary["ROI%"] = np.where(season_summary["stake"] > 0, season_summary["profit"] / season_summary["stake"] * 100, 0.0)
+
+    return df_res, correct, float(bal), float(roi), int(n_bets), float(total_stake), metrics, skipped, float(max_dd), calib_plot, season_summary
 
 # ----------------------------
 # GRAFICACIÓN
@@ -371,7 +466,7 @@ def calculate_kelly(prob, odd):
     if prob <= 0 or odd <= 1: return 0.0
     b = odd - 1
     f = (b * prob - (1 - prob)) / b
-    return max(0.0, f * 0.5) * 100  # Kelly Fraccional (0.5)
+    return max(0.0, f * 0.5) * 100  # Kelly fraccional (0.5)
 
 def manage_bets(mode, data=None, id_bet=None, status=None):
     if os.path.exists(CSV_FILE):
@@ -396,6 +491,7 @@ def manage_bets(mode, data=None, id_bet=None, status=None):
         df = df[df["ID"].astype(str) != str(id_bet)]
         df.to_csv(CSV_FILE, index=False)
 
+    # mode == "load" (o cualquier otro) regresa df
     return df
 
 # ======================================================
@@ -421,7 +517,6 @@ with st.sidebar:
     df = fetch_live_soccer_data(code, n_seasons=N_SEASONS)
 
     if not df.empty:
-        # Calculamos fuerzas HOY (para Dashboard)
         stats, ah, aa, teams = calculate_strengths(df, ref_date=df["date"].max(), window_matches=1200)
         seasons_loaded = df["season"].nunique() if "season" in df.columns else 1
         st.success(f"✅ {len(df)} partidos cargados ({seasons_loaded} temporadas)")
@@ -459,7 +554,7 @@ h_exp, a_exp, ph, pd_prob, pa, po15, po25, pbtts, top_sc, probs = predict_match_
 # ======================================================
 # 6. PESTAÑAS 📑
 # ======================================================
-t1, t2, t3, t4, t5, t6 = st.tabs(["📊 Análisis", "💰 Valor", "📜 Historial", "💎 Escáner Seguro", "🧪 Laboratorio", "📈 Rendimiento (Risk)"])
+t1, t2, t3, t4, t5, t6 = st.tabs(["📊 Análisis", "💰 Valor", "📜 Historial", "💎 Escáner Seguro", "🧪 Laboratorio (Validador)", "📈 Rendimiento (Risk)"])
 
 # --- TAB 1: ANÁLISIS ---
 with t1:
@@ -556,9 +651,11 @@ with t2:
         else:
             st.warning("📉 Kelly sugiere: **No apostar** (Sin valor esperado positivo)")
 
+        # barras modelo vs book sin margen
+        imp_h, imp_d, imp_a = implied_probs_no_margin(oh, od, oa)
         fig_val = go.Figure(data=[
             go.Bar(name="Tu Modelo", x=[home, "Empate", away], y=[ph, pd_prob, pa], marker_color="#00CC96"),
-            go.Bar(name="Casa (Sin Margen)", x=[home, "Empate", away], y=[(1/oh)/(1/oh+1/od+1/oa), (1/od)/(1/oh+1/od+1/oa), (1/oa)/(1/oh+1/od+1/oa)], marker_color="#EF553B"),
+            go.Bar(name="Book (Sin Margen)", x=[home, "Empate", away], y=[imp_h, imp_d, imp_a], marker_color="#EF553B"),
         ])
         fig_val.update_layout(barmode="group", height=250, margin=dict(t=20, b=20, l=20, r=20), title="⚖️ Detector de Valor")
         st.plotly_chart(fig_val, use_container_width=True)
@@ -797,119 +894,113 @@ with t4:
             else:
                 st.info("Datos descargados, pero no se encontraron partidos compatibles para esta semana.")
 
-# --- TAB 5: LABORATORIO ---
+# --- TAB 5: LABORATORIO (VALIDACIÓN REAL) ---
 with t5:
-    st.markdown("## 🧪 Laboratorio de Simulación")
+    st.markdown("## 🧪 Validador: ¿Predice bien de verdad?")
+    st.markdown("Aquí validamos **probabilidades**, no solo ‘aciertos’. Si tu modelo es bueno, debería tener **LogLoss/Brier** mejores que el book (sin margen) y buena calibración.")
 
-    st.markdown("### 🎲 Simulador Monte Carlo (Partido Actual)")
-    st.info(f"Simulando: **{home} vs {away}**")
-    if st.button("▶️ Ejecutar Monte Carlo (1,000 Partidos)"):
-        sim_h = np.random.poisson(h_exp, 1000)
-        sim_a = np.random.poisson(a_exp, 1000)
-        sim_diff = sim_h - sim_a
+    n_test = st.slider("Partidos a evaluar", 20, 400, 150, step=10)
+    min_train = st.slider("Mínimo de partidos para entrenar", 50, 1200, 300, step=25)
+    min_ev = st.slider("Filtro de Valor (EV mínimo)", -0.10, 0.20, 0.00, step=0.01, help="EV = p*odd - 1. Si subes esto, apuestas menos pero más ‘selectivo’.")
 
-        wins_h = np.sum(sim_diff > 0)
-        draws = np.sum(sim_diff == 0)
-        wins_a = np.sum(sim_diff < 0)
-
-        sc1, sc2, sc3 = st.columns(3)
-        sc1.metric("Local Gana", f"{wins_h/10:.1f}%")
-        sc2.metric("Empate", f"{draws/10:.1f}%")
-        sc3.metric("Visita Gana", f"{wins_a/10:.1f}%")
-
-        fig_sim = go.Figure()
-        fig_sim.add_trace(go.Histogram(x=sim_h, name=home, marker_color="#4CAF50", opacity=0.75))
-        fig_sim.add_trace(go.Histogram(x=sim_a, name=away, marker_color="#2196F3", opacity=0.75))
-        fig_sim.update_layout(barmode="overlay", title="Distribución de Goles Simulados", xaxis_title="Goles")
-        st.plotly_chart(fig_sim, use_container_width=True)
-
-    st.divider()
-    st.markdown("### 📜 Backtest Histórico (SIN FUGAS) + ROI")
-    st.markdown("Valida si el modelo es rentable usando datos pasados de forma honesta (sin ver el futuro).")
-    
-    n_test = st.slider("Partidos a evaluar", 20, 250, 100, step=10)
-    min_train = st.slider("Mínimo de partidos para entrenar", 50, 900, 250, step=25)
-
-    if st.button("▶️ Validar (walk-forward)"):
-        with st.spinner("Backtesteando sin fugas..."):
-            test_df, ok, profit, roi_bt, n_bets, tot_stake = run_backtest_no_leak(
-                df, n_test=n_test, min_train=min_train, window_matches=900, stake_unit=1.0
+    if st.button("▶️ Validar (walk-forward sin fugas)"):
+        with st.spinner("Backtesteando sin fugas + métricas..."):
+            test_df, ok, profit, roi_bt, n_bets, tot_stake, metrics, skipped, max_dd, calib_plot, season_summary = run_backtest_no_leak(
+                df, n_test=n_test, min_train=min_train, window_matches=900, stake_unit=1.0, min_ev=min_ev
             )
 
-        if test_df.empty:
-            st.warning("No se pudo backtestear (faltan cuotas reales o historial insuficiente).")
-        else:
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Apuestas", f"{n_bets}")
-            m2.metric("Aciertos", f"{ok}/{n_bets} ({(ok/max(1,n_bets))*100:.0f}%)")
-            m3.metric("Profit", f"{profit:.2f} U")
-            m4.metric("ROI", f"{roi_bt:.2f}%")
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Apuestas (bet)", f"{n_bets}")
+        c2.metric("Aciertos", f"{ok}/{max(1,n_bets)} ({(ok/max(1,n_bets))*100:.0f}%)")
+        c3.metric("Profit", f"{profit:.2f} U")
+        c4.metric("ROI", f"{roi_bt:.2f}%")
+        c5.metric("Max Drawdown", f"{max_dd:.2f} U")
+
+        st.markdown("### 🧾 ¿Cuántos partidos se saltaron y por qué?")
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("Saltados: min_train", skipped["min_train"])
+        s2.metric("Saltados: equipos sin historial", skipped["missing_team"])
+        s3.metric("Saltados: cuotas malas", skipped["bad_odds"])
+        s4.metric("Saltados: sin valor (EV)", skipped["no_value"])
+
+        st.markdown("### 📉 Métricas probabilísticas (lo que mide si ‘predice bien’)")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("LogLoss (Modelo)", f"{metrics['logloss_model']:.4f}" if np.isfinite(metrics["logloss_model"]) else "N/A")
+        m2.metric("LogLoss (Book)", f"{metrics['logloss_book']:.4f}" if np.isfinite(metrics["logloss_book"]) else "N/A")
+        m3.metric("Brier (Modelo)", f"{metrics['brier_model']:.4f}" if np.isfinite(metrics["brier_model"]) else "N/A")
+        m4.metric("Brier (Book)", f"{metrics['brier_book']:.4f}" if np.isfinite(metrics["brier_book"]) else "N/A")
+
+        st.caption("Interpretación rápida: **más bajo = mejor** (en LogLoss y Brier). Si tu modelo no mejora al book, ‘acertar’ puede ser engañoso.")
+
+        if not calib_plot.empty:
+            st.markdown("### 🎯 Calibración (¿cuando dices 60% realmente ganas ~60%?)")
+            fig_cal = go.Figure()
+            fig_cal.add_trace(go.Bar(x=calib_plot["bin"].astype(str), y=calib_plot["n"], name="N (muestras)"))
+            fig_cal.add_trace(go.Scatter(x=calib_plot["bin"].astype(str), y=calib_plot["p_avg"], mode="lines+markers", name="Prob media"))
+            fig_cal.add_trace(go.Scatter(x=calib_plot["bin"].astype(str), y=calib_plot["acc"], mode="lines+markers", name="Acierto real"))
+            fig_cal.update_layout(height=320, margin=dict(l=20, r=20, t=40, b=20), title="Calibración por bins (Prob vs Acierto)")
+            st.plotly_chart(fig_cal, use_container_width=True)
+
+        if not season_summary.empty:
+            st.markdown("### 🗓️ ROI por temporada (solo bets hechos)")
+            st.dataframe(season_summary.sort_values("Temporada"), use_container_width=True, hide_index=True)
+
+        if not test_df.empty:
+            st.markdown("### 📈 Curva de equity (backtest)")
+            fig_eq = go.Figure()
+            fig_eq.add_trace(go.Scatter(x=test_df["Fecha"], y=test_df["Equity"], mode="lines+markers", name="Equity"))
+            fig_eq.update_layout(height=300, margin=dict(l=20, r=20, t=30, b=20), xaxis_title="Fecha", yaxis_title="Unidades")
+            st.plotly_chart(fig_eq, use_container_width=True)
+
+            st.markdown("### 📜 Detalle de apuestas (backtest)")
             st.dataframe(test_df, use_container_width=True)
 
-# --- TAB 6: RENDIMIENTO (BI) ---
+        else:
+            st.warning("No se generaron apuestas (con esos filtros). Baja min_train o min_ev, o sube n_test.")
+
+# --- TAB 6: RENDIMIENTO (BI + RIESGO) ---
 with t6:
-    st.markdown("## 📈 Estadísticas de Rendimiento")
+    st.markdown("## 📈 Estadísticas de Rendimiento (tu historial real)")
     if os.path.exists(CSV_FILE):
         df_hist = pd.read_csv(CSV_FILE)
-        # Filtramos solo las finalizadas
         df_finished = df_hist[df_hist["Estado"].isin(["Ganada", "Perdida", "Push"])].copy()
 
         if not df_finished.empty:
-            # Ordenamos por ID para simular la secuencia real
             df_finished = df_finished.sort_values("ID")
 
-            # --- CÁLCULOS FINANCIEROS ---
             tot_inv = df_finished["Stake"].sum()
             tot_prof = df_finished["Ganancia"].sum()
-            roi = (tot_prof / tot_inv * 100) if tot_inv > 0 else 0
+            roi = (tot_prof / tot_inv * 100) if tot_inv > 0 else 0.0
 
-            # --- CÁLCULO DE DRAWDOWN ---
-            # 1. Equity Curve
             df_finished["Equity"] = df_finished["Ganancia"].cumsum()
-            # 2. High Water Mark
             df_finished["Peak"] = df_finished["Equity"].cummax()
-            # 3. Drawdown
             df_finished["Drawdown"] = df_finished["Equity"] - df_finished["Peak"]
-            # 4. Max Drawdown
             max_dd = df_finished["Drawdown"].min()
 
-            # --- METRICAS ---
             k1, k2, k3, k4 = st.columns(4)
             k1.metric("Beneficio Neto", f"${tot_prof:,.2f}")
             k2.metric("ROI", f"{roi:.2f}%")
-            k3.metric("Max Drawdown", f"{max_dd:.2f} U", help="Máxima caída acumulada desde el punto más alto.", delta="Riesgo", delta_color="off")
+            k3.metric("Max Drawdown", f"{max_dd:.2f} U")
             k4.metric("Apuestas", len(df_finished))
 
-            # --- GRÁFICAS ---
             c1, c2 = st.columns(2)
             with c1:
-                st.markdown("##### 🌊 Curva de Drawdown (Riesgo)")
+                st.markdown("##### 🌊 Drawdown (Riesgo)")
                 fig_dd = go.Figure()
                 fig_dd.add_trace(go.Scatter(
-                    x=pd.to_datetime(df_finished["Fecha"]), 
+                    x=pd.to_datetime(df_finished["Fecha"], errors="coerce"),
                     y=df_finished["Drawdown"],
-                    fill='tozeroy',
-                    mode='lines',
-                    line=dict(color='#FF5252', width=2),
-                    name='Drawdown'
+                    fill="tozeroy",
+                    mode="lines",
+                    name="Drawdown"
                 ))
-                fig_dd.update_layout(
-                    height=250, 
-                    margin=dict(l=20, r=20, t=30, b=20),
-                    yaxis_title="Unidades bajo el pico"
-                )
+                fig_dd.update_layout(height=250, margin=dict(l=20, r=20, t=30, b=20), yaxis_title="Unidades bajo el pico")
                 st.plotly_chart(fig_dd, use_container_width=True)
 
             with c2:
-                st.markdown("##### 📊 Distribución por Liga")
+                st.markdown("##### 📊 Ganancia por Liga")
                 prof_league = df_finished.groupby("Liga")["Ganancia"].sum().sort_values()
-                colors = ['#FF5252' if x < 0 else '#4CAF50' for x in prof_league.values]
-                fig_l = go.Figure(go.Bar(
-                    x=prof_league.values, 
-                    y=prof_league.index, 
-                    orientation="h",
-                    marker_color=colors
-                ))
+                fig_l = go.Figure(go.Bar(x=prof_league.values, y=prof_league.index, orientation="h"))
                 fig_l.update_layout(height=250, margin=dict(l=20, r=20, t=30, b=20))
                 st.plotly_chart(fig_l, use_container_width=True)
 
