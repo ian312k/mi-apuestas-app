@@ -13,7 +13,7 @@ from datetime import datetime
 # ======================================================
 st.set_page_config(page_title="Dixon-Coles Pro v3.4 (xG Lite)", layout="wide", page_icon="⚽")
 CSV_FILE = "mis_apuestas_pro.csv"
-N_SEASONS = 3  # ✅ ahora toma 3 temporadas
+N_SEASONS = 3  # ✅ toma 3 temporadas
 
 # --- GESTIÓN DE ESTADO (SESSION STATE) ---
 if "ticket" not in st.session_state: st.session_state.ticket = []
@@ -22,6 +22,7 @@ if "api_odds_cache" not in st.session_state: st.session_state.api_odds_cache = {
 if "api_usage" not in st.session_state: st.session_state.api_usage = {"used": 0, "remaining": 500}
 if "market_storage" not in st.session_state: st.session_state.market_storage = {}
 
+# Estilos CSS
 st.markdown("""
 <style>
     div[data-testid="stMetric"] { background-color: #262730; border: 1px solid #464b5c; padding: 15px; border-radius: 10px; }
@@ -95,7 +96,6 @@ def call_api_real(sport_key, api_key):
         res = requests.get(url, timeout=20)
         used = res.headers.get("x-requests-used", 0)
         remaining = res.headers.get("x-requests-remaining", 500)
-
         if res.status_code == 200:
             return {"success": True, "data": res.json(), "used": int(used), "remaining": int(remaining)}
         return {"success": False, "error": f"Error {res.status_code}", "message": res.text}
@@ -201,14 +201,15 @@ def predict_match_dixon_coles(home, away, team_stats, avg_h, avg_a, rho=-0.13, m
     return h_exp, a_exp, p_home, p_draw, p_away, p_o15, p_o25, p_btts, top_scores, probs
 
 # ----------------------------
-# BACKTEST SIN FUGAS (walk-forward)
+# BACKTEST SIN FUGAS (walk-forward) + ROI
 # ----------------------------
-def run_backtest_no_leak(df, n_test=50, min_train=200, window_matches=800):
+def run_backtest_no_leak(df, n_test=50, min_train=200, window_matches=800, stake_unit=1.0):
     df_sorted = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
     test_block = df_sorted.tail(n_test)
 
     results = []
-    correct, bal = 0, 0
+    correct, bal = 0, 0.0
+    n_bets = 0
 
     for _, row in test_block.iterrows():
         cut_date = row["date"]
@@ -225,6 +226,8 @@ def run_backtest_no_leak(df, n_test=50, min_train=200, window_matches=800):
         odd_h = float(row.get("odd_h", np.nan))
         odd_d = float(row.get("odd_d", np.nan))
         odd_a = float(row.get("odd_a", np.nan))
+
+        # Si cuotas no son reales (relleno 1.0 o faltan), no sirve para ROI/P&L
         if (np.isnan(odd_h) or odd_h <= 1.01) or (np.isnan(odd_d) or odd_d <= 1.01) or (np.isnan(odd_a) or odd_a <= 1.01):
             continue
 
@@ -239,10 +242,11 @@ def run_backtest_no_leak(df, n_test=50, min_train=200, window_matches=800):
             res_real = "Empate" if row["home_goals"] == row["away_goals"] else "Fallo"
 
         is_win = (pred == res_real)
-        profit = (odd - 1) if is_win else -1
+        profit_u = (odd - 1) * stake_unit if is_win else -stake_unit
 
         correct += int(is_win)
-        bal += profit
+        bal += profit_u
+        n_bets += 1
 
         results.append({
             "Fecha": row["date"].strftime("%Y-%m-%d"),
@@ -252,10 +256,14 @@ def run_backtest_no_leak(df, n_test=50, min_train=200, window_matches=800):
             "Realidad": f"{int(row['home_goals'])}-{int(row['away_goals'])}",
             "Cuota": odd,
             "Res": "✅" if is_win else "❌",
-            "P/L": profit
+            "Stake(U)": stake_unit,
+            "P/L(U)": profit_u
         })
 
-    return pd.DataFrame(results), correct, bal
+    total_stake = n_bets * stake_unit
+    roi = (bal / total_stake * 100) if total_stake > 0 else 0.0
+
+    return pd.DataFrame(results), correct, bal, roi, n_bets, total_stake
 
 def plot_gauge(val, title, color):
     return go.Figure(
@@ -378,13 +386,10 @@ with st.sidebar:
     }
 
     code = st.selectbox("Liga", list(leagues.keys()), format_func=lambda x: leagues[x])
-
     df = fetch_live_soccer_data(code, n_seasons=N_SEASONS)
 
     if not df.empty:
-        # stats para "partido actual": usa historial completo (no es fuga para predicción en vivo)
         stats, ah, aa, teams = calculate_strengths(df, ref_date=df["date"].max(), window_matches=1200)
-
         seasons_loaded = df["season"].nunique() if "season" in df.columns else 1
         st.success(f"✅ {len(df)} partidos cargados ({seasons_loaded} temporadas)")
 
@@ -394,10 +399,7 @@ with st.sidebar:
         last_5["Fecha"] = last_5["date"].dt.strftime("%d/%m")
         last_5["Partido"] = last_5["home"] + " vs " + last_5["away"]
         last_5["Score"] = last_5["home_goals"].astype(int).astype(str) + "-" + last_5["away_goals"].astype(int).astype(str)
-        if "season" in last_5.columns:
-            st.dataframe(last_5[["Fecha", "Partido", "Score", "season"]], hide_index=True, use_container_width=True)
-        else:
-            st.dataframe(last_5[["Fecha", "Partido", "Score"]], hide_index=True, use_container_width=True)
+        st.dataframe(last_5[["Fecha", "Partido", "Score", "season"]], hide_index=True, use_container_width=True)
     else:
         st.error("Error cargando datos. (Puede que no haya temporada activa o falló la conexión)")
         st.stop()
@@ -795,21 +797,24 @@ with t5:
         st.plotly_chart(fig_sim, use_container_width=True)
 
     st.divider()
-    st.markdown("### 📜 Backtest Histórico (SIN FUGAS)")
-    n_test = st.slider("Partidos a evaluar", 20, 200, 80, step=10)
-    min_train = st.slider("Mínimo de partidos para entrenar", 50, 800, 250, step=25)
+    st.markdown("### 📜 Backtest Histórico (SIN FUGAS) + ROI")
+    n_test = st.slider("Partidos a evaluar", 20, 250, 100, step=10)
+    min_train = st.slider("Mínimo de partidos para entrenar", 50, 900, 250, step=25)
 
     if st.button("▶️ Validar (walk-forward sin fuga)"):
         with st.spinner("Backtesteando sin fugas..."):
-            test_df, ok, profit = run_backtest_no_leak(df, n_test=n_test, min_train=min_train, window_matches=900)
+            test_df, ok, profit, roi_bt, n_bets, tot_stake = run_backtest_no_leak(
+                df, n_test=n_test, min_train=min_train, window_matches=900, stake_unit=1.0
+            )
 
         if test_df.empty:
             st.warning("No se pudo backtestear (faltan cuotas reales o historial insuficiente).")
         else:
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Aciertos", f"{ok}/{len(test_df)} ({ok/max(1,len(test_df))*100:.0f}%)")
-            m2.metric("Profit", f"{profit:.2f} U")
-            m3.metric("Estado", "🔥 Rentable" if profit > 0 else "❄️ Pérdidas")
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Apuestas", f"{n_bets}")
+            m2.metric("Aciertos", f"{ok}/{n_bets} ({(ok/max(1,n_bets))*100:.0f}%)")
+            m3.metric("Profit", f"{profit:.2f} U")
+            m4.metric("ROI", f"{roi_bt:.2f}%")
             st.dataframe(test_df, use_container_width=True)
 
 # --- TAB 6: RENDIMIENTO (BI) ---
