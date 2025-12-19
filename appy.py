@@ -344,6 +344,10 @@ def get_last_5(df, team):
     l5["Sede"] = np.where(l5["home"] == team, "🏠", "✈️")
     return l5[["Sede", "Rival", "Score", "Tiros"]]
 
+def safe_fair_odds(p, eps=1e-12):
+    p = float(np.clip(p, eps, 1.0))
+    return 1.0 / p
+
 # ======================================================
 # 6. ML ENSEMBLE 1X2 (Odds + DC + XGB/RF)
 # ======================================================
@@ -359,7 +363,6 @@ def outcome_1x2_label(hg, ag):
     return 2
 
 def brier_multiclass(P, y, n_classes=3):
-    # ✅ Brier multiclase estándar (dividido por K)
     y_oh = np.eye(n_classes)[y]
     return float(np.mean(np.sum((P - y_oh) ** 2, axis=1) / n_classes))
 
@@ -655,7 +658,7 @@ t1, t2, t3, t4, t5, t6, t7 = st.tabs(
     ["📊 Análisis", "💰 Valor", "📜 Historial", "💎 Escáner Seguro", "🧪 Laboratorio", "📈 Rendimiento (Risk)", "🤖 ML 1X2 + Jornada"]
 )
 
-# --- TAB 1: ANÁLISIS ---
+# --- TAB 1: ANÁLISIS (AQUÍ VOLVÍ A PONER TODO: 1X2, OVER, BTTS, TOP SCORES) ---
 with t1:
     st.markdown("### 🥅 Expectativa de Goles (Modelo)")
     a, b, c = st.columns(3)
@@ -663,8 +666,48 @@ with t1:
     b.metric("Total (xG)", f"{h_exp + a_exp:.2f}")
     c.metric(away, f"{a_exp:.2f}")
 
+    st.divider()
+    st.markdown("### 🏁 ¿Quién gana? (1X2) + Mercados de goles")
+
+    # 1X2
+    m1, m2, m3 = st.columns(3)
+    m1.metric(f"🏠 {home}", f"{ph*100:.1f}%")
+    m2.metric("🤝 Empate", f"{pd_prob*100:.1f}%")
+    m3.metric(f"✈️ {away}", f"{pa*100:.1f}%")
+
+    # Pick "quién gana"
+    best_1x2 = max(ph, pd_prob, pa)
+    if best_1x2 == ph:
+        pick_1x2 = f"Gana {home}"
+    elif best_1x2 == pa:
+        pick_1x2 = f"Gana {away}"
+    else:
+        pick_1x2 = "Empate"
+
+    # Fair odds (sin margen) de DC
+    fo_h, fo_d, fo_a = safe_fair_odds(ph), safe_fair_odds(pd_prob), safe_fair_odds(pa)
+
+    st.info(
+        f"**Pick modelo (1X2):** {pick_1x2}  |  "
+        f"**Cuotas justas (DC, sin margen):** H={fo_h:.2f}  D={fo_d:.2f}  A={fo_a:.2f}"
+    )
+
+    # Overs / BTTS
+    g1, g2, g3 = st.columns(3)
+    g1.metric("Over 1.5", f"{po15*100:.1f}%")
+    g2.metric("Over 2.5", f"{po25*100:.1f}%")
+    g3.metric("BTTS (Ambos anotan)", f"{pbtts*100:.1f}%")
+
     st.plotly_chart(plot_score_heatmap(probs, home, away), use_container_width=True)
 
+    st.markdown("### ⭐ Top 3 marcadores más probables")
+    if top_sc:
+        top_df = pd.DataFrame([{"Marcador": s, "Prob (%)": p*100} for s, p in top_sc])
+        st.dataframe(top_df.style.format({"Prob (%)":"{:.2f}"}), use_container_width=True, hide_index=True)
+    else:
+        st.write("No disponible.")
+
+    st.divider()
     st.markdown("### 📉 Últimos 5")
     cf1, cf2 = st.columns(2)
     with cf1:
@@ -843,7 +886,7 @@ with t4:
             live_rows = []
             for item in data_to_display:
                 match_date = pd.to_datetime(item.get("commence_time"), utc=True, errors="coerce")
-                if pd.isna(match_date): 
+                if pd.isna(match_date):
                     continue
                 diff_hours = (match_date - now_utc).total_seconds()/3600
                 if diff_hours > 168 or diff_hours < -5:
@@ -915,7 +958,7 @@ with t4:
 
                         for item in data_to_display:
                             match_date = pd.to_datetime(item.get("commence_time"), utc=True, errors="coerce")
-                            if pd.isna(match_date): 
+                            if pd.isna(match_date):
                                 continue
                             diff_hours = (match_date - now_utc).total_seconds()/3600
                             if diff_hours > 168 or diff_hours < -5:
