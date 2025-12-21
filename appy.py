@@ -336,13 +336,32 @@ def plot_score_heatmap(probs, home_team, away_team):
     return fig
 
 def get_last_5(df, team):
-    mask = (df["home"] == team) | (df["away"] == team)
-    l5 = df[mask].sort_values(by="date", ascending=False).head(5).copy()
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["Sede", "Rival", "Score", "Tiros"])
+
+    team = str(team).strip()
+
+    dfx = df.copy()
+    dfx["home"] = dfx["home"].astype(str).str.strip()
+    dfx["away"] = dfx["away"].astype(str).str.strip()
+
+    mask = (dfx["home"] == team) | (dfx["away"] == team)
+    l5 = dfx[mask].sort_values(by="date", ascending=False).head(5).copy()
+
+    if l5.empty:
+        return pd.DataFrame(columns=["Sede", "Rival", "Score", "Tiros"])
+
     l5["Rival"] = np.where(l5["home"] == team, l5["away"], l5["home"])
     l5["Score"] = l5["home_goals"].astype(int).astype(str) + "-" + l5["away_goals"].astype(int).astype(str)
-    l5["Tiros"] = np.where(l5["home"] == team, l5.get("sot_h", 0), l5.get("sot_a", 0)).astype(int)
+
+    # tiros a puerta (si no existe columna, deja 0)
+    sot_h = l5["sot_h"] if "sot_h" in l5.columns else 0
+    sot_a = l5["sot_a"] if "sot_a" in l5.columns else 0
+    l5["Tiros"] = np.where(l5["home"] == team, sot_h, sot_a).astype(int)
+
     l5["Sede"] = np.where(l5["home"] == team, "🏠", "✈️")
     return l5[["Sede", "Rival", "Score", "Tiros"]]
+
 
 def safe_fair_odds(p, eps=1e-12):
     p = float(np.clip(p, eps, 1.0))
@@ -1146,3 +1165,4 @@ with t7:
                     "A": [mk_a, pa, p[2]],
                 })
                 st.dataframe(comp.style.format({"H":"{:.3f}","D":"{:.3f}","A":"{:.3f}"}), use_container_width=True)
+
