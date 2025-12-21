@@ -24,7 +24,7 @@ from sklearn.metrics import log_loss
 # ======================================================
 # 1. CONFIGURACIÓN Y ESTILOS CSS (DARK MODE) 🎨
 # ======================================================
-st.set_page_config(page_title="Dixon-Coles Pro v5.3 (Fixed)", layout="wide", page_icon="🛡️")
+st.set_page_config(page_title="Dixon-Coles Pro v5.4 (Monitor Liga)", layout="wide", page_icon="🛡️")
 CSV_FILE = "mis_apuestas_pro.csv"
 N_SEASONS = 3
 
@@ -45,7 +45,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ======================================================
-# 2. DATA + API (CORREGIDO PARA CARGAR DATOS LIMPIOS)
+# 2. DATA + API (CORREGIDO Y LIMPIO)
 # ======================================================
 @st.cache_data(ttl=3600)
 def fetch_live_soccer_data(league_code="SP1", n_seasons=3):
@@ -55,7 +55,7 @@ def fetch_live_soccer_data(league_code="SP1", n_seasons=3):
         return f"{yy:02d}{yy2:02d}"
 
     today = datetime.now()
-    # Si estamos en la segunda mitad del año, la temporada empieza este año. Si no, empezó el anterior.
+    # Ajuste temporada
     current_start_year = today.year if today.month >= 7 else (today.year - 1)
     seasons = [season_code(current_start_year - i) for i in range(n_seasons)]
 
@@ -63,7 +63,7 @@ def fetch_live_soccer_data(league_code="SP1", n_seasons=3):
     for s in seasons:
         url = f"https://www.football-data.co.uk/mmz4281/{s}/{league_code}.csv"
         try:
-            # Usamos encoding 'latin1' para evitar errores de caracteres extraños
+            # Encoding latin1 para caracteres especiales
             tmp = pd.read_csv(url, encoding="latin1")
             
             cols = ["Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG", "B365H", "B365D", "B365A", "HST", "AST"]
@@ -79,7 +79,6 @@ def fetch_live_soccer_data(league_code="SP1", n_seasons=3):
             tmp = tmp.rename(columns=rename_map)
 
             # --- LIMPIEZA DE NOMBRES (TRIM) ---
-            # Esto quita espacios al final "Real Madrid " -> "Real Madrid"
             tmp["home"] = tmp["home"].astype(str).str.strip()
             tmp["away"] = tmp["away"].astype(str).str.strip()
             # ----------------------------------
@@ -91,7 +90,7 @@ def fetch_live_soccer_data(league_code="SP1", n_seasons=3):
 
             tmp = tmp.dropna(subset=["home", "away", "home_goals", "away_goals"])
             
-            # Formato de fecha robusto
+            # Formato fecha robusto
             tmp["date"] = pd.to_datetime(tmp["date"], dayfirst=True, errors="coerce")
             
             tmp = tmp.dropna(subset=["date"]).fillna(0)
@@ -348,7 +347,7 @@ def plot_score_heatmap(probs, home_team, away_team):
     return fig
 
 def get_last_5(df, team):
-    # CORRECCIÓN: Limpiar espacios en blanco y convertir a string
+    # CORRECCIÓN: Limpiar espacios y string
     team = str(team).strip()
     
     # Filtrar
@@ -360,14 +359,14 @@ def get_last_5(df, team):
 
     l5["Rival"] = np.where(l5["home"] == team, l5["away"], l5["home"])
     
-    # CORRECCIÓN: Convertir a int para evitar "2.0-1.0"
+    # Formateo Score seguro
     l5["Score"] = (
         l5["home_goals"].astype(float).astype(int).astype(str) + 
         "-" + 
         l5["away_goals"].astype(float).astype(int).astype(str)
     )
     
-    # CORRECCIÓN: Manejo seguro de Tiros (fillna)
+    # Manejo seguro de tiros
     sot_h = l5.get("sot_h", 0).replace("", 0).astype(float).fillna(0).astype(int)
     sot_a = l5.get("sot_a", 0).replace("", 0).astype(float).fillna(0).astype(int)
     l5["Tiros"] = np.where(l5["home"] == team, sot_h, sot_a)
@@ -658,7 +657,21 @@ with st.sidebar:
 
     if not df.empty:
         stats, ah, aa, teams = calculate_strengths(df, ref_date=df["date"].max(), window_matches=1200)
-        st.success(f"✅ {len(df)} partidos cargados ({df['season'].nunique()} temporadas)")
+        st.success(f"✅ {len(df)} partidos cargados")
+        
+        # --- SECCIÓN NUEVA: MONITOR DE LA LIGA ---
+        st.divider()
+        st.markdown("### 🗓️ Estado de la Liga")
+        last_date = df["date"].max()
+        st.write(f"**Última actualización:** {last_date.strftime('%d/%m/%Y')}")
+
+        with st.expander("🔎 Ver últimos 5 partidos globales"):
+            # Obtenemos los últimos 5 partidos globales de la base de datos
+            latest_matches = df.sort_values("date", ascending=False).head(5).copy()
+            latest_matches["Score"] = latest_matches["home_goals"].astype(int).astype(str) + "-" + latest_matches["away_goals"].astype(int).astype(str)
+            latest_matches["date"] = latest_matches["date"].dt.strftime("%d/%m")
+            st.dataframe(latest_matches[["date", "home", "Score", "away"]], hide_index=True, use_container_width=True)
+        # -----------------------------------------
     else:
         st.error("Error cargando datos.")
         st.stop()
