@@ -1,4 +1,4 @@
-# appy.py  (COPIA Y PEGA TODO)
+# appy.py
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -24,7 +24,7 @@ from sklearn.metrics import log_loss
 # ======================================================
 # 1. CONFIGURACIÓN Y ESTILOS CSS (DARK MODE) 🎨
 # ======================================================
-st.set_page_config(page_title="Dixon-Coles Pro v5.2 (Risk + ML Jornada)", layout="wide", page_icon="🛡️")
+st.set_page_config(page_title="Dixon-Coles Pro v5.3 (Fixed)", layout="wide", page_icon="🛡️")
 CSV_FILE = "mis_apuestas_pro.csv"
 N_SEASONS = 3
 
@@ -45,7 +45,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ======================================================
-# 2. DATA + API
+# 2. DATA + API (CORREGIDO PARA CARGAR DATOS LIMPIOS)
 # ======================================================
 @st.cache_data(ttl=3600)
 def fetch_live_soccer_data(league_code="SP1", n_seasons=3):
@@ -55,6 +55,7 @@ def fetch_live_soccer_data(league_code="SP1", n_seasons=3):
         return f"{yy:02d}{yy2:02d}"
 
     today = datetime.now()
+    # Si estamos en la segunda mitad del año, la temporada empieza este año. Si no, empezó el anterior.
     current_start_year = today.year if today.month >= 7 else (today.year - 1)
     seasons = [season_code(current_start_year - i) for i in range(n_seasons)]
 
@@ -62,7 +63,9 @@ def fetch_live_soccer_data(league_code="SP1", n_seasons=3):
     for s in seasons:
         url = f"https://www.football-data.co.uk/mmz4281/{s}/{league_code}.csv"
         try:
-            tmp = pd.read_csv(url)
+            # Usamos encoding 'latin1' para evitar errores de caracteres extraños
+            tmp = pd.read_csv(url, encoding="latin1")
+            
             cols = ["Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG", "B365H", "B365D", "B365A", "HST", "AST"]
             actual_cols = [c for c in cols if c in tmp.columns]
             tmp = tmp[actual_cols].copy()
@@ -75,13 +78,22 @@ def fetch_live_soccer_data(league_code="SP1", n_seasons=3):
             }
             tmp = tmp.rename(columns=rename_map)
 
+            # --- LIMPIEZA DE NOMBRES (TRIM) ---
+            # Esto quita espacios al final "Real Madrid " -> "Real Madrid"
+            tmp["home"] = tmp["home"].astype(str).str.strip()
+            tmp["away"] = tmp["away"].astype(str).str.strip()
+            # ----------------------------------
+
             for c in ["odd_h", "odd_d", "odd_a"]:
                 if c not in tmp.columns: tmp[c] = 1.0
             for c in ["sot_h", "sot_a"]:
                 if c not in tmp.columns: tmp[c] = 0
 
             tmp = tmp.dropna(subset=["home", "away", "home_goals", "away_goals"])
+            
+            # Formato de fecha robusto
             tmp["date"] = pd.to_datetime(tmp["date"], dayfirst=True, errors="coerce")
+            
             tmp = tmp.dropna(subset=["date"]).fillna(0)
             tmp["season"] = s
             frames.append(tmp)
@@ -300,7 +312,7 @@ def run_backtest_no_leak(df, n_test=50, min_train=200, window_matches=800, stake
     return pd.DataFrame(results), correct, bal, roi, n_bets, total_stake
 
 # ======================================================
-# 5. PLOTS
+# 5. PLOTS (Y FUNCION GET_LAST_5 CORREGIDA)
 # ======================================================
 def plot_gauge(val, title, color):
     return go.Figure(
@@ -336,32 +348,32 @@ def plot_score_heatmap(probs, home_team, away_team):
     return fig
 
 def get_last_5(df, team):
-    if df is None or df.empty:
-        return pd.DataFrame(columns=["Sede", "Rival", "Score", "Tiros"])
-
+    # CORRECCIÓN: Limpiar espacios en blanco y convertir a string
     team = str(team).strip()
-
-    dfx = df.copy()
-    dfx["home"] = dfx["home"].astype(str).str.strip()
-    dfx["away"] = dfx["away"].astype(str).str.strip()
-
-    mask = (dfx["home"] == team) | (dfx["away"] == team)
-    l5 = dfx[mask].sort_values(by="date", ascending=False).head(5).copy()
-
+    
+    # Filtrar
+    mask = (df["home"] == team) | (df["away"] == team)
+    l5 = df[mask].sort_values(by="date", ascending=False).head(5).copy()
+    
     if l5.empty:
         return pd.DataFrame(columns=["Sede", "Rival", "Score", "Tiros"])
 
     l5["Rival"] = np.where(l5["home"] == team, l5["away"], l5["home"])
-    l5["Score"] = l5["home_goals"].astype(int).astype(str) + "-" + l5["away_goals"].astype(int).astype(str)
-
-    # tiros a puerta (si no existe columna, deja 0)
-    sot_h = l5["sot_h"] if "sot_h" in l5.columns else 0
-    sot_a = l5["sot_a"] if "sot_a" in l5.columns else 0
-    l5["Tiros"] = np.where(l5["home"] == team, sot_h, sot_a).astype(int)
-
+    
+    # CORRECCIÓN: Convertir a int para evitar "2.0-1.0"
+    l5["Score"] = (
+        l5["home_goals"].astype(float).astype(int).astype(str) + 
+        "-" + 
+        l5["away_goals"].astype(float).astype(int).astype(str)
+    )
+    
+    # CORRECCIÓN: Manejo seguro de Tiros (fillna)
+    sot_h = l5.get("sot_h", 0).replace("", 0).astype(float).fillna(0).astype(int)
+    sot_a = l5.get("sot_a", 0).replace("", 0).astype(float).fillna(0).astype(int)
+    l5["Tiros"] = np.where(l5["home"] == team, sot_h, sot_a)
+    
     l5["Sede"] = np.where(l5["home"] == team, "🏠", "✈️")
     return l5[["Sede", "Rival", "Score", "Tiros"]]
-
 
 def safe_fair_odds(p, eps=1e-12):
     p = float(np.clip(p, eps, 1.0))
@@ -677,7 +689,7 @@ t1, t2, t3, t4, t5, t6, t7 = st.tabs(
     ["📊 Análisis", "💰 Valor", "📜 Historial", "💎 Escáner Seguro", "🧪 Laboratorio", "📈 Rendimiento (Risk)", "🤖 ML 1X2 + Jornada"]
 )
 
-# --- TAB 1: ANÁLISIS (AQUÍ VOLVÍ A PONER TODO: 1X2, OVER, BTTS, TOP SCORES) ---
+# --- TAB 1: ANÁLISIS ---
 with t1:
     st.markdown("### 🥅 Expectativa de Goles (Modelo)")
     a, b, c = st.columns(3)
@@ -999,7 +1011,7 @@ with t4:
                                 continue
 
                             p, (ev_h, ev_d, ev_a), pick = predict_ml_for_match(h, a, float(oh2), float(od2), float(oa2),
-                                                                              model, team_stats2, avg_h2, avg_a2)
+                                                                        model, team_stats2, avg_h2, avg_a2)
                             best_ev = np.nanmax([ev_h, ev_d, ev_a])
                             if only_positive_ev and (np.isnan(best_ev) or best_ev <= 0):
                                 continue
@@ -1024,11 +1036,11 @@ with t4:
                             out_df = pd.DataFrame(rows).sort_values("Mejor EV", ascending=False).reset_index(drop=True)
                             st.success(f"✅ Jornada generada: {len(out_df)} partidos")
                             st.dataframe(out_df.style.format({"EV_H":"{:.3f}","EV_D":"{:.3f}","EV_A":"{:.3f}","Mejor EV":"{:.3f}"}),
-                                         use_container_width=True)
+                                        use_container_width=True)
                             st.download_button("📥 Descargar jornada (CSV)",
-                                               data=out_df.to_csv(index=False).encode("utf-8"),
-                                               file_name=f"jornada_ml_{code}.csv",
-                                               mime="text/csv")
+                                                data=out_df.to_csv(index=False).encode("utf-8"),
+                                                file_name=f"jornada_ml_{code}.csv",
+                                                mime="text/csv")
     else:
         st.info("Pon tu API key para usar el escáner y jornada.")
 
@@ -1165,4 +1177,3 @@ with t7:
                     "A": [mk_a, pa, p[2]],
                 })
                 st.dataframe(comp.style.format({"H":"{:.3f}","D":"{:.3f}","A":"{:.3f}"}), use_container_width=True)
-
