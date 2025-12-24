@@ -30,17 +30,42 @@ N_SEASONS = 3
 
 # --- TRADUCTOR DE EQUIPOS (API -> CSV HISTÓRICO) ---
 # Esto corrige el problema de "Man City" vs "Manchester City" con el filtro estricto
+# --- TRADUCTOR DE EQUIPOS (API -> CSV HISTÓRICO) ---
+# Se normalizan nombres para que el filtro estricto (0.8) no falle.
 TEAM_MAP = {
+    # 🇬🇧 PREMIER LEAGUE
     "Manchester City": "Man City",
     "Manchester United": "Man United",
     "Nottingham Forest": "Nott'm Forest",
     "Wolverhampton Wanderers": "Wolves",
+    "Brighton & Hove Albion": "Brighton",  # <--- ESTE ES EL QUE TE FALTABA
     "Leeds United": "Leeds",
-    "Sheffield United": "Sheffield United", # A veces la API manda 'Sheffield Utd'
-    "Brighton & Hove Albion": "Brighton",
-    "Tottenham Hotspur": "Tottenham",
     "West Ham United": "West Ham",
-    "Newcastle United": "Newcastle"
+    "Newcastle United": "Newcastle",
+    "Tottenham Hotspur": "Tottenham",
+    "Leicester City": "Leicester",
+    "Sheffield United": "Sheffield United",
+    
+    # 🇪🇸 LA LIGA
+    "Athletic Club": "Ath Bilbao",
+    "Atlético Madrid": "Ath Madrid",
+    "Atletico Madrid": "Ath Madrid",
+    "Real Betis": "Betis",
+    "Celta Vigo": "Celta",
+    "RCD Espanyol": "Espanol",
+    "Espanyol": "Espanol",
+    "Real Sociedad": "Sociedad",
+    "Rayo Vallecano": "Vallecano",
+    "Deportivo Alavés": "Alaves",
+    "Alavés": "Alaves",
+    
+    # 🇮🇹 SERIE A
+    "Internazionale": "Inter",
+    "Inter Milan": "Inter",
+    "AC Milan": "Milan",
+    "AS Roma": "Roma",
+    "Hellas Verona": "Verona",
+    "Parma Calcio 1913": "Parma",
 }
 
 def normalize_name(name):
@@ -1225,3 +1250,4 @@ with t7:
                     "A": [mk_a, pa, p[2]],
                 })
                 st.dataframe(comp.style.format({"H":"{:.3f}","D":"{:.3f}","A":"{:.3f}"}), use_container_width=True)
+
