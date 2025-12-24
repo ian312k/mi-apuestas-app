@@ -1,4 +1,4 @@
-# appy.py
+# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -642,6 +642,13 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
+    # --- BOTÓN NUEVO PARA LIMPIAR CACHE API ---
+    if st.button("🧹 Limpiar Cache API"):
+        st.session_state.market_storage = {}
+        st.success("Memoria del escáner limpia.")
+        st.rerun()
+    # ------------------------------------------
+
     leagues = {
         "SP1": "🇪🇸 La Liga",
         "E0": "🏴 Premier League",
@@ -776,8 +783,12 @@ with t2:
             for item in league_data["data"]:
                 h_team_api = item.get("home_team", "")
                 a_team_api = item.get("away_team", "")
-                m_h = get_close_matches(h_team_api, [home], n=1, cutoff=0.5)
-                m_a = get_close_matches(a_team_api, [away], n=1, cutoff=0.5)
+                
+                # --- FIX: CUTOFF MAS ESTRICTO (0.8) ---
+                m_h = get_close_matches(h_team_api, [home], n=1, cutoff=0.8)
+                m_a = get_close_matches(a_team_api, [away], n=1, cutoff=0.8)
+                # --------------------------------------
+                
                 if m_h and m_a and item.get("bookmakers"):
                     oh2, od2, oa2 = match_odds_from_scanner_item(item)
                     if not np.isnan(oh2) and not np.isnan(od2) and not np.isnan(oa2):
@@ -942,8 +953,11 @@ with t4:
                 if np.isnan(oh2) or np.isnan(od2) or np.isnan(oa2):
                     continue
 
-                m_h = get_close_matches(h_api, teams, n=1, cutoff=0.5)
-                m_a = get_close_matches(a_api, teams, n=1, cutoff=0.5)
+                # --- FIX: CUTOFF MAS ESTRICTO (0.8) ---
+                m_h = get_close_matches(h_api, teams, n=1, cutoff=0.8)
+                m_a = get_close_matches(a_api, teams, n=1, cutoff=0.8)
+                # --------------------------------------
+
                 if not m_h or not m_a:
                     continue
                 h = m_h[0]; a = m_a[0]
@@ -1011,8 +1025,11 @@ with t4:
                             h_api = item.get("home_team","")
                             a_api = item.get("away_team","")
 
-                            m_h = get_close_matches(h_api, teams, n=1, cutoff=0.5)
-                            m_a = get_close_matches(a_api, teams, n=1, cutoff=0.5)
+                            # --- FIX: CUTOFF MAS ESTRICTO (0.8) ---
+                            m_h = get_close_matches(h_api, teams, n=1, cutoff=0.8)
+                            m_a = get_close_matches(a_api, teams, n=1, cutoff=0.8)
+                            # --------------------------------------
+
                             if not m_h or not m_a:
                                 continue
                             h = m_h[0]; a = m_a[0]
@@ -1024,7 +1041,7 @@ with t4:
                                 continue
 
                             p, (ev_h, ev_d, ev_a), pick = predict_ml_for_match(h, a, float(oh2), float(od2), float(oa2),
-                                                                        model, team_stats2, avg_h2, avg_a2)
+                                                                                model, team_stats2, avg_h2, avg_a2)
                             best_ev = np.nanmax([ev_h, ev_d, ev_a])
                             if only_positive_ev and (np.isnan(best_ev) or best_ev <= 0):
                                 continue
@@ -1049,7 +1066,7 @@ with t4:
                             out_df = pd.DataFrame(rows).sort_values("Mejor EV", ascending=False).reset_index(drop=True)
                             st.success(f"✅ Jornada generada: {len(out_df)} partidos")
                             st.dataframe(out_df.style.format({"EV_H":"{:.3f}","EV_D":"{:.3f}","EV_A":"{:.3f}","Mejor EV":"{:.3f}"}),
-                                        use_container_width=True)
+                                         use_container_width=True)
                             st.download_button("📥 Descargar jornada (CSV)",
                                                 data=out_df.to_csv(index=False).encode("utf-8"),
                                                 file_name=f"jornada_ml_{code}.csv",
