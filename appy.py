@@ -24,21 +24,18 @@ from sklearn.metrics import log_loss
 # ======================================================
 # 1. CONFIGURACIÓN Y ESTILOS CSS (DARK MODE) 🎨
 # ======================================================
-st.set_page_config(page_title="Dixon-Coles Pro v5.4 (Monitor Liga)", layout="wide", page_icon="🛡️")
+st.set_page_config(page_title="Dixon-Coles Pro v5.5 (Gestión Total)", layout="wide", page_icon="🛡️")
 CSV_FILE = "mis_apuestas_pro.csv"
 N_SEASONS = 3
 
 # --- TRADUCTOR DE EQUIPOS (API -> CSV HISTÓRICO) ---
-# Esto corrige el problema de "Man City" vs "Manchester City" con el filtro estricto
-# --- TRADUCTOR DE EQUIPOS (API -> CSV HISTÓRICO) ---
-# Se normalizan nombres para que el filtro estricto (0.8) no falle.
 TEAM_MAP = {
     # 🇬🇧 PREMIER LEAGUE
     "Manchester City": "Man City",
     "Manchester United": "Man United",
     "Nottingham Forest": "Nott'm Forest",
     "Wolverhampton Wanderers": "Wolves",
-    "Brighton & Hove Albion": "Brighton",  # <--- ESTE ES EL QUE TE FALTABA
+    "Brighton & Hove Albion": "Brighton",
     "Leeds United": "Leeds",
     "West Ham United": "West Ham",
     "Newcastle United": "Newcastle",
@@ -69,7 +66,6 @@ TEAM_MAP = {
 }
 
 def normalize_name(name):
-    # Si el nombre exacto está en el mapa, lo traduce. Si no, lo deja igual.
     return TEAM_MAP.get(name, name)
 
 # --- SESSION STATE ---
@@ -78,7 +74,8 @@ if "api_key" not in st.session_state: st.session_state.api_key = ""
 if "api_usage" not in st.session_state: st.session_state.api_usage = {"used": 0, "remaining": 500}
 if "market_storage" not in st.session_state: st.session_state.market_storage = {}
 if "odds_inputs" not in st.session_state:
-    st.session_state.odds_inputs = {"oh": 2.0, "od": 3.2, "oa": 3.5}
+    # Agregamos o_o25 y o_btts al estado por defecto
+    st.session_state.odds_inputs = {"oh": 2.0, "od": 3.2, "oa": 3.5, "o_o25": 1.90, "o_btts": 1.90}
 
 st.markdown("""
 <style>
@@ -89,7 +86,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ======================================================
-# 2. DATA + API (CORREGIDO Y LIMPIO)
+# 2. DATA + API
 # ======================================================
 @st.cache_data(ttl=3600)
 def fetch_live_soccer_data(league_code="SP1", n_seasons=3):
@@ -99,7 +96,6 @@ def fetch_live_soccer_data(league_code="SP1", n_seasons=3):
         return f"{yy:02d}{yy2:02d}"
 
     today = datetime.now()
-    # Ajuste temporada
     current_start_year = today.year if today.month >= 7 else (today.year - 1)
     seasons = [season_code(current_start_year - i) for i in range(n_seasons)]
 
@@ -107,7 +103,6 @@ def fetch_live_soccer_data(league_code="SP1", n_seasons=3):
     for s in seasons:
         url = f"https://www.football-data.co.uk/mmz4281/{s}/{league_code}.csv"
         try:
-            # Encoding latin1 para caracteres especiales
             tmp = pd.read_csv(url, encoding="latin1")
             
             cols = ["Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG", "B365H", "B365D", "B365A", "HST", "AST"]
@@ -122,10 +117,8 @@ def fetch_live_soccer_data(league_code="SP1", n_seasons=3):
             }
             tmp = tmp.rename(columns=rename_map)
 
-            # --- LIMPIEZA DE NOMBRES (TRIM) ---
             tmp["home"] = tmp["home"].astype(str).str.strip()
             tmp["away"] = tmp["away"].astype(str).str.strip()
-            # ----------------------------------
 
             for c in ["odd_h", "odd_d", "odd_a"]:
                 if c not in tmp.columns: tmp[c] = 1.0
@@ -133,10 +126,7 @@ def fetch_live_soccer_data(league_code="SP1", n_seasons=3):
                 if c not in tmp.columns: tmp[c] = 0
 
             tmp = tmp.dropna(subset=["home", "away", "home_goals", "away_goals"])
-            
-            # Formato fecha robusto
             tmp["date"] = pd.to_datetime(tmp["date"], dayfirst=True, errors="coerce")
-            
             tmp = tmp.dropna(subset=["date"]).fillna(0)
             tmp["season"] = s
             frames.append(tmp)
@@ -281,15 +271,24 @@ def manage_bets(mode, data=None, id_bet=None, status=None):
         df.to_csv(CSV_FILE, index=False)
 
     elif mode == "update":
+        # Corregido: convertir ID a string para evitar errores de tipo
         idx = df[df["ID"].astype(str) == str(id_bet)].index
         if not idx.empty:
             i = idx[0]
             df.at[i, "Estado"] = status
-            profit = (df.at[i, "Stake"] * df.at[i, "Cuota"]) - df.at[i, "Stake"] if status == "Ganada" else (-df.at[i, "Stake"] if status == "Perdida" else 0)
+            # Cálculo de ganancia
+            if status == "Ganada":
+                profit = (float(df.at[i, "Stake"]) * float(df.at[i, "Cuota"])) - float(df.at[i, "Stake"])
+            elif status == "Perdida":
+                profit = -float(df.at[i, "Stake"])
+            else: # Push o Cancelada
+                profit = 0.0
+            
             df.at[i, "Ganancia"] = profit
             df.to_csv(CSV_FILE, index=False)
 
     elif mode == "delete":
+        # Corregido: convertir ID a string
         df = df[df["ID"].astype(str) != str(id_bet)]
         df.to_csv(CSV_FILE, index=False)
 
@@ -355,18 +354,8 @@ def run_backtest_no_leak(df, n_test=50, min_train=200, window_matches=800, stake
     return pd.DataFrame(results), correct, bal, roi, n_bets, total_stake
 
 # ======================================================
-# 5. PLOTS (Y FUNCION GET_LAST_5 CORREGIDA)
+# 5. PLOTS
 # ======================================================
-def plot_gauge(val, title, color):
-    return go.Figure(
-        go.Indicator(
-            mode="gauge+number",
-            value=val * 100,
-            title={"text": title},
-            gauge={"axis": {"range": [0, 100]}, "bar": {"color": color}, "bgcolor": "white"},
-        )
-    ).update_layout(height=150, margin=dict(l=20, r=20, t=30, b=20))
-
 def plot_score_heatmap(probs, home_team, away_team):
     limit = 6
     probs_cut = probs[:limit, :limit]
@@ -391,10 +380,7 @@ def plot_score_heatmap(probs, home_team, away_team):
     return fig
 
 def get_last_5(df, team):
-    # CORRECCIÓN: Limpiar espacios y string
     team = str(team).strip()
-    
-    # Filtrar
     mask = (df["home"] == team) | (df["away"] == team)
     l5 = df[mask].sort_values(by="date", ascending=False).head(5).copy()
     
@@ -402,15 +388,12 @@ def get_last_5(df, team):
         return pd.DataFrame(columns=["Sede", "Rival", "Score", "Tiros"])
 
     l5["Rival"] = np.where(l5["home"] == team, l5["away"], l5["home"])
-    
-    # Formateo Score seguro
     l5["Score"] = (
         l5["home_goals"].astype(float).astype(int).astype(str) + 
         "-" + 
         l5["away_goals"].astype(float).astype(int).astype(str)
     )
     
-    # Manejo seguro de tiros
     sot_h = l5.get("sot_h", 0).replace("", 0).astype(float).fillna(0).astype(int)
     sot_a = l5.get("sot_a", 0).replace("", 0).astype(float).fillna(0).astype(int)
     l5["Tiros"] = np.where(l5["home"] == team, sot_h, sot_a)
@@ -423,7 +406,7 @@ def safe_fair_odds(p, eps=1e-12):
     return 1.0 / p
 
 # ======================================================
-# 6. ML ENSEMBLE 1X2 (Odds + DC + XGB/RF)
+# 6. ML ENSEMBLE 1X2
 # ======================================================
 def odds_to_probs(oh, od, oa, eps=1e-12):
     oh = max(float(oh), 1.01); od = max(float(od), 1.01); oa = max(float(oa), 1.01)
@@ -610,7 +593,7 @@ def strict_walkforward_eval_ml_blocks(df, n_test=200, min_train=500, window_matc
     return {"mode": f"estricto-bloques (K={retrain_every}, step={train_step})", "n": int(len(y)), "logloss": ll, "brier": br}
 
 # ======================================================
-# 7. JORNADA ML (desde escáner)
+# 7. JORNADA ML
 # ======================================================
 @st.cache_data(ttl=1800)
 def train_snapshot_cached(df, window_matches=1200, seed=42):
@@ -659,7 +642,7 @@ def match_odds_from_scanner_item(item):
 def predict_ml_for_match(home_team, away_team, oh, od, oa, model, team_stats, avg_h, avg_a):
     row_now = {"home": home_team, "away": away_team, "odd_h": oh, "odd_d": od, "odd_a": oa, "sot_h": 0.0, "sot_a": 0.0}
     x = build_features_for_match(row_now, team_stats, avg_h, avg_a).reshape(1, -1)
-    p = model.predict_proba(x)[0]  # [H,D,A]
+    p = model.predict_proba(x)[0]
 
     ev_h = (p[0] * oh) - 1 if (oh and oh > 1.01) else np.nan
     ev_d = (p[1] * od) - 1 if (od and od > 1.01) else np.nan
@@ -708,19 +691,16 @@ with st.sidebar:
         stats, ah, aa, teams = calculate_strengths(df, ref_date=df["date"].max(), window_matches=1200)
         st.success(f"✅ {len(df)} partidos cargados")
         
-        # --- SECCIÓN NUEVA: MONITOR DE LA LIGA ---
         st.divider()
         st.markdown("### 🗓️ Estado de la Liga")
         last_date = df["date"].max()
         st.write(f"**Última actualización:** {last_date.strftime('%d/%m/%Y')}")
 
         with st.expander("🔎 Ver últimos 5 partidos globales"):
-            # Obtenemos los últimos 5 partidos globales de la base de datos
             latest_matches = df.sort_values("date", ascending=False).head(5).copy()
             latest_matches["Score"] = latest_matches["home_goals"].astype(int).astype(str) + "-" + latest_matches["away_goals"].astype(int).astype(str)
             latest_matches["date"] = latest_matches["date"].dt.strftime("%d/%m")
             st.dataframe(latest_matches[["date", "home", "Score", "away"]], hide_index=True, use_container_width=True)
-        # -----------------------------------------
     else:
         st.error("Error cargando datos.")
         st.stop()
@@ -762,22 +742,16 @@ with t1:
     st.divider()
     st.markdown("### 🏁 ¿Quién gana? (1X2) + Mercados de goles")
 
-    # 1X2
     m1, m2, m3 = st.columns(3)
     m1.metric(f"🏠 {home}", f"{ph*100:.1f}%")
     m2.metric("🤝 Empate", f"{pd_prob*100:.1f}%")
     m3.metric(f"✈️ {away}", f"{pa*100:.1f}%")
 
-    # Pick "quién gana"
     best_1x2 = max(ph, pd_prob, pa)
-    if best_1x2 == ph:
-        pick_1x2 = f"Gana {home}"
-    elif best_1x2 == pa:
-        pick_1x2 = f"Gana {away}"
-    else:
-        pick_1x2 = "Empate"
+    if best_1x2 == ph: pick_1x2 = f"Gana {home}"
+    elif best_1x2 == pa: pick_1x2 = f"Gana {away}"
+    else: pick_1x2 = "Empate"
 
-    # Fair odds (sin margen) de DC
     fo_h, fo_d, fo_a = safe_fair_odds(ph), safe_fair_odds(pd_prob), safe_fair_odds(pa)
 
     st.info(
@@ -785,7 +759,6 @@ with t1:
         f"**Cuotas justas (DC, sin margen):** H={fo_h:.2f}  D={fo_d:.2f}  A={fo_a:.2f}"
     )
 
-    # Overs / BTTS
     g1, g2, g3 = st.columns(3)
     g1.metric("Over 1.5", f"{po15*100:.1f}%")
     g2.metric("Over 2.5", f"{po25*100:.1f}%")
@@ -818,16 +791,16 @@ with t2:
         st.markdown("### 🏦 Comparador Inteligente")
 
         def_oh, def_od, def_oa = st.session_state.odds_inputs["oh"], st.session_state.odds_inputs["od"], st.session_state.odds_inputs["oa"]
+        def_o25, def_btts = st.session_state.odds_inputs["o_o25"], st.session_state.odds_inputs["o_btts"]
+        
         league_data = st.session_state.market_storage.get(code, {})
         found_in_storage = False
 
         if "data" in league_data:
             for item in league_data["data"]:
-                # --- APLICAR MAPEO AQUÍ ---
                 h_team_api = normalize_name(item.get("home_team", ""))
                 a_team_api = normalize_name(item.get("away_team", ""))
                 
-                # FIX: CUTOFF MAS ESTRICTO (0.8) PERO YA CON NOMBRES NORMALIZADOS
                 m_h = get_close_matches(h_team_api, [home], n=1, cutoff=0.8)
                 m_a = get_close_matches(a_team_api, [away], n=1, cutoff=0.8)
                 
@@ -838,7 +811,7 @@ with t2:
                         found_in_storage = True
                         break
 
-        if found_in_storage: st.success("✅ Momios cargados automáticamente (Escáner).")
+        if found_in_storage: st.success("✅ Momios cargados automáticamente (Escáner 1X2).")
         else: st.info("ℹ️ Momios por defecto (No encontrados en escáner).")
 
         co1, co2, co3 = st.columns(3)
@@ -846,9 +819,17 @@ with t2:
         od = co2.number_input("Cuota Empate", 1.01, 100.0, float(def_od))
         oa = co3.number_input("Cuota Visita", 1.01, 100.0, float(def_oa))
 
-        st.session_state.odds_inputs = {"oh": float(oh), "od": float(od), "oa": float(oa)}
+        st.caption("👇 Ingresa tus cuotas manuales para mercados alternativos:")
+        cx1, cx2 = st.columns(2)
+        odd_o25 = cx1.number_input("Cuota Over 2.5", 1.01, 100.0, float(def_o25))
+        odd_btts = cx2.number_input("Cuota BTTS (Sí)", 1.01, 100.0, float(def_btts))
 
-        st.markdown("#### 🧠 Kelly")
+        st.session_state.odds_inputs = {
+            "oh": float(oh), "od": float(od), "oa": float(oa),
+            "o_o25": float(odd_o25), "o_btts": float(odd_btts)
+        }
+
+        st.markdown("#### 🧠 Kelly (1X2)")
         k_ev_h = (ph * oh) - 1
         k_ev_d = (pd_prob * od) - 1
         k_ev_a = (pa * oa) - 1
@@ -868,10 +849,29 @@ with t2:
         st.divider()
         st.markdown("### ➕ Agregar al Ticket")
         with st.form("add_to_ticket"):
-            sel_pick = st.selectbox("Selección", [f"Gana {home}", "Empate", f"Gana {away}"])
-            if f"Gana {home}" in sel_pick: sel_odd, sel_prob = oh, ph
-            elif "Empate" in sel_pick: sel_odd, sel_prob = od, pd_prob
-            else: sel_odd, sel_prob = oa, pa
+            # AHORA EL SELECTOR INCLUYE LOS NUEVOS MERCADOS
+            sel_pick_options = [
+                f"Gana {home}", 
+                "Empate", 
+                f"Gana {away}",
+                "Over 2.5 Goles",
+                "BTTS (Ambos Anotan)"
+            ]
+            sel_pick = st.selectbox("Selección", sel_pick_options)
+            
+            # Lógica para asignar cuota y probabilidad según selección
+            if f"Gana {home}" in sel_pick: 
+                sel_odd, sel_prob = oh, ph
+            elif "Empate" in sel_pick: 
+                sel_odd, sel_prob = od, pd_prob
+            elif f"Gana {away}" in sel_pick: 
+                sel_odd, sel_prob = oa, pa
+            elif "Over 2.5" in sel_pick:
+                sel_odd, sel_prob = odd_o25, po25
+            elif "BTTS" in sel_pick:
+                sel_odd, sel_prob = odd_btts, pbtts
+            else:
+                sel_odd, sel_prob = 1.0, 0.0
 
             if st.form_submit_button("Añadir selección"):
                 st.session_state.ticket.append({
@@ -927,12 +927,50 @@ with t2:
                 st.balloons()
                 st.rerun()
 
-# --- TAB 3: HISTORIAL ---
+# --- TAB 3: HISTORIAL (MEJORADO) ---
 with t3:
-    st.markdown("### 📜 Historial")
+    st.markdown("### 📜 Historial de Apuestas")
     db = manage_bets("load")
+    
     if not db.empty:
+        # Mostramos la tabla general
         st.dataframe(db.sort_values(by="Fecha", ascending=False), use_container_width=True)
+        
+        st.divider()
+        st.markdown("### 🛠️ Administrar Apuestas")
+        
+        # Crear lista de opciones legibles para el selector
+        # Formato: ID | Fecha | Partido | Pick
+        db["Display"] = db.apply(lambda x: f"{x['ID']} | {x['Fecha']} | {x['Partido']} | {x['Pick']}", axis=1)
+        
+        opciones_apuestas = db["Display"].tolist()
+        seleccion_str = st.selectbox("Selecciona la apuesta a editar/borrar:", ["-- Seleccionar --"] + opciones_apuestas)
+        
+        if seleccion_str != "-- Seleccionar --":
+            # Extraer el ID (está al principio de la cadena)
+            bet_id = seleccion_str.split(" | ")[0]
+            
+            # Buscar la fila correspondiente
+            fila = db[db["ID"].astype(str) == bet_id].iloc[0]
+            
+            st.info(f"**Seleccionado:** {fila['Partido']} - {fila['Pick']} (Cuota: {fila['Cuota']})")
+            
+            c_edit1, c_edit2 = st.columns(2)
+            
+            with c_edit1:
+                nuevo_estado = st.selectbox("Actualizar Estado:", ["Pendiente", "Ganada", "Perdida", "Push"], index=["Pendiente", "Ganada", "Perdida", "Push"].index(fila["Estado"]) if fila["Estado"] in ["Pendiente", "Ganada", "Perdida", "Push"] else 0)
+                if st.button("💾 Actualizar Estado"):
+                    manage_bets("update", id_bet=bet_id, status=nuevo_estado)
+                    st.success(f"Apuesta {bet_id} actualizada a {nuevo_estado}.")
+                    st.rerun()
+            
+            with c_edit2:
+                st.write("Zona de peligro")
+                if st.button("🗑️ Eliminar Apuesta definitivamente", type="primary"):
+                    manage_bets("delete", id_bet=bet_id)
+                    st.warning(f"Apuesta {bet_id} eliminada.")
+                    st.rerun()
+
     else:
         st.warning("Aún no hay historial.")
 
@@ -977,7 +1015,6 @@ with t4:
                 else:
                     st.error(f"Error API: {resp['message']}")
 
-        # Mostrar oportunidades (DC EV)
         if data_to_display:
             now_utc = pd.Timestamp.now(tz="UTC")
             live_rows = []
@@ -989,15 +1026,9 @@ with t4:
                 if diff_hours > 168 or diff_hours < -5:
                     continue
 
-                # --- APLICAR MAPEO AQUÍ ---
                 h_api = normalize_name(item.get("home_team",""))
                 a_api = normalize_name(item.get("away_team",""))
                 
-                oh2, od2, oa2 = match_odds_from_scanner_item(item)
-                if np.isnan(oh2) or np.isnan(od2) or np.isnan(oa2):
-                    continue
-
-                # FIX: CUTOFF MAS ESTRICTO (0.8) PERO YA CON NOMBRES NORMALIZADOS
                 m_h = get_close_matches(h_api, teams, n=1, cutoff=0.8)
                 m_a = get_close_matches(a_api, teams, n=1, cutoff=0.8)
 
@@ -1008,6 +1039,10 @@ with t4:
                     continue
 
                 _, _, ph2, pd2, pa2, *_ = predict_match_dixon_coles(h, a, stats, ah, aa)
+                oh2, od2, oa2 = match_odds_from_scanner_item(item)
+                if np.isnan(oh2) or np.isnan(od2) or np.isnan(oa2):
+                    continue
+
                 ev_h = (ph2*oh2)-1
                 ev_d = (pd2*od2)-1
                 ev_a = (pa2*oa2)-1
@@ -1029,7 +1064,6 @@ with t4:
                 df_live = pd.DataFrame(live_rows).sort_values("Mejor EV", ascending=False)
                 st.dataframe(df_live, use_container_width=True)
 
-        # ===== Jornada ML (desde escáner) =====
         st.divider()
         st.markdown("## 😁 Jornada ML (desde Escáner)")
         st.caption("Entrena 1 snapshot (cacheado) y predice TODOS los partidos de la semana (próx 7 días).")
@@ -1065,11 +1099,9 @@ with t4:
                             if diff_hours > 168 or diff_hours < -5:
                                 continue
 
-                            # --- APLICAR MAPEO AQUÍ ---
                             h_api = normalize_name(item.get("home_team",""))
                             a_api = normalize_name(item.get("away_team",""))
 
-                            # FIX: CUTOFF MAS ESTRICTO (0.8) PERO YA CON NOMBRES NORMALIZADOS
                             m_h = get_close_matches(h_api, teams, n=1, cutoff=0.8)
                             m_a = get_close_matches(a_api, teams, n=1, cutoff=0.8)
                             
@@ -1250,4 +1282,4 @@ with t7:
                     "A": [mk_a, pa, p[2]],
                 })
                 st.dataframe(comp.style.format({"H":"{:.3f}","D":"{:.3f}","A":"{:.3f}"}), use_container_width=True)
-
+                
