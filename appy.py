@@ -1395,7 +1395,10 @@ with t8:
                 oh2, od2, oa2 = match_odds_from_scanner_item(item)
                 if np.isnan(oh2) or np.isnan(od2) or np.isnan(oa2) or oh2<=1.01: continue
 
-                # Predicción ML
+                # A) Predicción Dixon-Coles (para mostrar en columna)
+                _, _, dc_h, dc_d, dc_a, *_ = predict_match_dixon_coles(h_team, a_team, stats_loop, avgh_loop, avga_loop)
+
+                # B) Predicción ML (para el cálculo de EV y Pick)
                 p, (ev_h, ev_d, ev_a), pick = predict_ml_for_match(
                     h_team, a_team, float(oh2), float(od2), float(oa2),
                     model_loop, stats_loop, avgh_loop, avga_loop
@@ -1409,6 +1412,7 @@ with t8:
                     "Fecha": match_date.strftime("%d/%m %H:%M"),
                     "Partido": f"{h_team} vs {a_team}",
                     "Cuotas": f"{oh2:.2f}|{od2:.2f}|{oa2:.2f}",
+                    "DC Prob": f"{dc_h:.2f}|{dc_d:.2f}|{dc_a:.2f}",   # <--- NUEVA COLUMNA AGREGADA
                     "ML Prob": f"{p[0]:.2f}|{p[1]:.2f}|{p[2]:.2f}",
                     "EV": best_ev,
                     "Pick": pick
@@ -1420,6 +1424,7 @@ with t8:
                 master_results.extend(league_rows)
                 
                 with st.expander(f"⚽ {l_name} ({len(league_rows)} picks)", expanded=True):
+                    # Formato visual para las columnas nuevas
                     st.dataframe(
                         df_res_league.style.format({"EV": "{:.3f}"}), 
                         use_container_width=True, 
@@ -1444,3 +1449,4 @@ with t8:
             )
     else:
         st.info("Presiona el botón para iniciar el escaneo de todas las ligas configuradas.")
+
