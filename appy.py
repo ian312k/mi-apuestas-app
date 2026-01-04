@@ -729,8 +729,8 @@ h_exp, a_exp, ph, pd_prob, pa, po15, po25, pbtts, top_sc, probs = predict_match_
 # ======================================================
 # 9. TABS
 # ======================================================
-t1, t2, t3, t4, t5, t6, t7 = st.tabs(
-    ["📊 Análisis", "💰 Valor", "📜 Historial", "💎 Escáner Seguro", "🧪 Laboratorio", "📈 Rendimiento (Risk)", "🤖 ML 1X2 + Jornada"]
+t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs(
+    ["📊 Análisis", "💰 Valor", "📜 Historial", "💎 Escáner Seguro", "🧪 Laboratorio", "📈 Rendimiento (Risk)", "🤖 ML 1X2 + Jornada", "🌎 Multi-Liga"]
 )
 
 # --- TAB 1: ANÁLISIS ---
@@ -1118,7 +1118,7 @@ with t4:
                                 continue
 
                             p, (ev_h, ev_d, ev_a), pick = predict_ml_for_match(h, a, float(oh2), float(od2), float(oa2),
-                                                                                model, team_stats2, avg_h2, avg_a2)
+                                                                        model, team_stats2, avg_h2, avg_a2)
                             best_ev = np.nanmax([ev_h, ev_d, ev_a])
                             if only_positive_ev and (np.isnan(best_ev) or best_ev <= 0):
                                 continue
@@ -1317,3 +1317,130 @@ with t7:
                         st.plotly_chart(fig_imp, use_container_width=True)
                     else:
                         st.write("Dimensiones de features no coinciden para graficar.")
+
+# --- TAB 8: MULTI-LIGA SUPER ESCANER ---
+with t8:
+    st.markdown("## 🌎 Super Escáner: Todas las Ligas")
+    st.caption("Analiza las 7 ligas configuradas de una sola vez. Requiere que hayas descargado datos del escáner previamente para cada liga o uses los datos en memoria.")
+
+    col_multi_1, col_multi_2 = st.columns(2)
+    win_multi = col_multi_1.slider("Ventana entrenamiento (Multi)", 300, 3000, 1200, step=100)
+    min_ev_multi = col_multi_2.slider("EV mínimo (Multi)", 0.0, 0.20, 0.00, step=0.01)
+
+    if st.button("🚀 Ejecutar Análisis Masivo (7 Ligas)"):
+        master_results = []
+        
+        # Barra de progreso general
+        prog_bar = st.progress(0)
+        status_text = st.empty()
+        
+        total_leagues = len(leagues)
+        idx_league = 0
+
+        for l_code, l_name in leagues.items():
+            idx_league += 1
+            prog = int((idx_league / total_leagues) * 100)
+            prog_bar.progress(prog)
+            status_text.text(f"Analizando {l_name} ({l_code})...")
+
+            # 1. Verificar si hay datos de mercado (Odds) en memoria
+            if l_code not in st.session_state.market_storage:
+                continue # Saltamos si no hay datos descargados para esta liga
+            
+            stored = st.session_state.market_storage[l_code]
+            data_api = stored.get("data", [])
+            if not data_api:
+                continue
+
+            # 2. Cargar histórico y Entrenar Modelo específico para esta liga
+            # Nota: Usamos fetch_live_soccer_data con el código de la liga del loop, no la seleccionada en sidebar
+            df_loop = fetch_live_soccer_data(l_code, n_seasons=N_SEASONS)
+            
+            if df_loop.empty or len(df_loop) < 200:
+                continue
+
+            snap_loop = train_snapshot_cached(df_loop, window_matches=win_multi, seed=42)
+            
+            if snap_loop is None:
+                continue
+
+            model_loop, stats_loop, avgh_loop, avga_loop = snap_loop
+            
+            # 3. Predecir partidos
+            now_utc = pd.Timestamp.now(tz="UTC")
+            league_rows = []
+
+            for item in data_api:
+                match_date = pd.to_datetime(item.get("commence_time"), utc=True, errors="coerce")
+                if pd.isna(match_date): continue
+                
+                # Filtro de tiempo (próxima semana)
+                diff_hours = (match_date - now_utc).total_seconds()/3600
+                if diff_hours > 168 or diff_hours < -5: continue
+
+                h_api = normalize_name(item.get("home_team",""))
+                a_api = normalize_name(item.get("away_team",""))
+                
+                # Obtener lista de equipos del DF de ESTA liga
+                teams_loop = sorted(list(set(df_loop["home"].unique()) | set(df_loop["away"].unique())))
+
+                m_h = get_close_matches(h_api, teams_loop, n=1, cutoff=0.8)
+                m_a = get_close_matches(a_api, teams_loop, n=1, cutoff=0.8)
+
+                if not m_h or not m_a: continue
+                h_team, a_team = m_h[0], m_a[0]
+
+                if h_team not in stats_loop or a_team not in stats_loop: continue
+
+                oh2, od2, oa2 = match_odds_from_scanner_item(item)
+                if np.isnan(oh2) or np.isnan(od2) or np.isnan(oa2) or oh2<=1.01: continue
+
+                # Predicción ML
+                p, (ev_h, ev_d, ev_a), pick = predict_ml_for_match(
+                    h_team, a_team, float(oh2), float(od2), float(oa2),
+                    model_loop, stats_loop, avgh_loop, avga_loop
+                )
+
+                best_ev = np.nanmax([ev_h, ev_d, ev_a])
+                if best_ev < min_ev_multi: continue
+
+                league_rows.append({
+                    "Liga": l_name,
+                    "Fecha": match_date.strftime("%d/%m %H:%M"),
+                    "Partido": f"{h_team} vs {a_team}",
+                    "Cuotas": f"{oh2:.2f}|{od2:.2f}|{oa2:.2f}",
+                    "ML Prob": f"{p[0]:.2f}|{p[1]:.2f}|{p[2]:.2f}",
+                    "EV": best_ev,
+                    "Pick": pick
+                })
+
+            if league_rows:
+                # Guardar resultados y mostrar Expander
+                df_res_league = pd.DataFrame(league_rows).sort_values("EV", ascending=False)
+                master_results.extend(league_rows)
+                
+                with st.expander(f"⚽ {l_name} ({len(league_rows)} picks)", expanded=True):
+                    st.dataframe(
+                        df_res_league.style.format({"EV": "{:.3f}"}), 
+                        use_container_width=True, 
+                        hide_index=True
+                    )
+            else:
+                with st.expander(f"⚽ {l_name} (Sin oportunidades)", expanded=False):
+                    st.write("No se encontraron partidos con valor positivo o datos insuficientes.")
+
+        status_text.text("✅ Análisis completo finalizado.")
+        prog_bar.progress(100)
+
+        if master_results:
+            st.divider()
+            st.markdown("### 📥 Descargar Todo")
+            df_master = pd.DataFrame(master_results).sort_values("EV", ascending=False)
+            st.download_button(
+                "Descargar CSV Combinado (Todas las Ligas)",
+                data=df_master.to_csv(index=False).encode("utf-8"),
+                file_name="super_jornada_ml.csv",
+                mime="text/csv"
+            )
+    else:
+        st.info("Presiona el botón para iniciar el escaneo de todas las ligas configuradas.")
