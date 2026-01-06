@@ -341,18 +341,29 @@ def manage_bets(mode, data=None, id_bet=None, status=None):
 
     return df
 
-def run_backtest_no_leak(df, n_test=50, min_train=100, window_matches=400, stake_unit=1.0, alpha=0.008, rho=-0.13, min_ev_threshold=0.05):
-    """CORREGIDO: Elegir por máximo EV en lugar de máxima probabilidad"""
+# ======================================================
+# BACKTEST CORREGIDO - MEJOR CALIBRACIÓN
+# ======================================================
+def run_backtest_no_leak(df, n_test=50, min_train=100, window_matches=400, stake_unit=1.0, 
+                         alpha=0.008, rho=-0.13, min_ev_threshold=0.05, min_prob_threshold=0.35,
+                         use_probability_cap=True):
+    """CORREGIDO: Calibración mejorada y filtros más estrictos"""
     df_sorted = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
     
-    if len(df_sorted) > 800:
-        df_sorted = df_sorted.tail(800).reset_index(drop=True)
+    # Filtrar para tener datos más recientes y relevantes
+    if len(df_sorted) > 600:
+        df_sorted = df_sorted.tail(600).reset_index(drop=True)
     
     test_block = df_sorted.tail(n_test)
 
     results = []
     correct, bal = 0, 0.0
     n_bets = 0
+    total_ev = 0.0
+    
+    # Estadísticas para calibración
+    predicted_probs = []
+    actual_outcomes = []
 
     for _, row in test_block.iterrows():
         cut_date = row["date"]
@@ -367,6 +378,7 @@ def run_backtest_no_leak(df, n_test=50, min_train=100, window_matches=400, stake
         if row["home"] not in team_stats or row["away"] not in team_stats:
             continue
 
+        # Obtener probabilidades
         _, _, ph, pd_prob, pa, *_ = predict_match_dixon_coles(
             row["home"], row["away"], team_stats, avg_h, avg_a, rho=rho
         )
@@ -375,10 +387,23 @@ def run_backtest_no_leak(df, n_test=50, min_train=100, window_matches=400, stake
         odd_d = float(row.get("odd_d", np.nan))
         odd_a = float(row.get("odd_a", np.nan))
         
-        if (np.isnan(odd_h) or odd_h <= 1.01) or (np.isnan(odd_d) or odd_d <= 1.01) or (np.isnan(odd_a) or odd_a <= 1.01):
+        # Filtrar odds inválidas o muy bajas
+        if (np.isnan(odd_h) or odd_h <= 1.10) or (np.isnan(odd_d) or odd_d <= 1.10) or (np.isnan(odd_a) or odd_a <= 1.10):
             continue
 
-        # CORRECCIÓN: Calcular EVs y elegir el máximo
+        # CORRECCIÓN: Aplicar calibración a las probabilidades
+        # Si el modelo está sobreestimando, ajustamos las probabilidades
+        if use_probability_cap:
+            # Limitar probabilidades máximas para evitar sobreconfianza
+            ph = min(ph, 0.65)  # Máximo 65% para cualquier resultado
+            pd_prob = min(pd_prob, 0.45)  # Máximo 45% para empate
+            pa = min(pa, 0.65)
+            
+            # Normalizar después del cap
+            total = ph + pd_prob + pa
+            ph, pd_prob, pa = ph/total, pd_prob/total, pa/total
+
+        # Calcular EVs
         ev_h = (ph * odd_h) - 1
         ev_d = (pd_prob * odd_d) - 1
         ev_a = (pa * odd_a) - 1
@@ -387,10 +412,15 @@ def run_backtest_no_leak(df, n_test=50, min_train=100, window_matches=400, stake
         probs = {"Local": ph, "Empate": pd_prob, "Visita": pa}
         odds = {"Local": odd_h, "Empate": odd_d, "Visita": odd_a}
         
+        # Filtrar por probabilidad mínima
+        max_prob = max(ph, pd_prob, pa)
+        if max_prob < min_prob_threshold:
+            continue
+        
         # Elegir la opción con máximo EV
         best_option = max(evs.items(), key=lambda x: x[1])
         
-        # Solo apostar si el EV supera el umbral
+        # Solo apostar si el EV supera el umbral Y la probabilidad es razonable
         if best_option[1] < min_ev_threshold:
             continue
             
@@ -399,13 +429,19 @@ def run_backtest_no_leak(df, n_test=50, min_train=100, window_matches=400, stake
         odd = odds[pred]
         ev = best_option[1]
         
+        # Track para calibración
+        predicted_probs.append(prob)
+        
         # Determinar resultado real
         if row["home_goals"] > row["away_goals"]:
             res_real = "Local"
+            actual_outcomes.append(1 if pred == "Local" else 0)
         elif row["home_goals"] < row["away_goals"]:
             res_real = "Visita"
+            actual_outcomes.append(1 if pred == "Visita" else 0)
         else:
             res_real = "Empate"
+            actual_outcomes.append(1 if pred == "Empate" else 0)
         
         is_win = (pred == res_real)
         profit_u = (odd - 1) * stake_unit if is_win else -stake_unit
@@ -413,6 +449,7 @@ def run_backtest_no_leak(df, n_test=50, min_train=100, window_matches=400, stake
         correct += int(is_win)
         bal += profit_u
         n_bets += 1
+        total_ev += ev
 
         results.append({
             "Fecha": row["date"].strftime("%Y-%m-%d"),
@@ -426,10 +463,98 @@ def run_backtest_no_leak(df, n_test=50, min_train=100, window_matches=400, stake
             "Stake(U)": stake_unit,
             "P/L(U)": profit_u
         })
+    
+    # Calibrar modelo si hay suficientes datos
+    calibration_info = ""
+    if len(predicted_probs) > 10 and len(actual_outcomes) == len(predicted_probs):
+        avg_pred_prob = np.mean(predicted_probs)
+        actual_win_rate = np.mean(actual_outcomes)
+        calibration_error = avg_pred_prob - actual_win_rate
+        
+        if calibration_error > 0.1:
+            calibration_info = f"⚠️ Modelo sobreestima en {calibration_error*100:.1f}%"
+        elif calibration_error < -0.1:
+            calibration_info = f"⚠️ Modelo subestima en {abs(calibration_error)*100:.1f}%"
+        else:
+            calibration_info = f"✅ Modelo bien calibrado (error: {calibration_error*100:.1f}%)"
 
     total_stake = n_bets * stake_unit
     roi = (bal / total_stake * 100) if total_stake > 0 else 0.0
-    return pd.DataFrame(results), correct, bal, roi, n_bets, total_stake
+    avg_ev_real = (total_ev / n_bets * 100) if n_bets > 0 else 0.0
+    
+    return pd.DataFrame(results), correct, bal, roi, n_bets, total_stake, calibration_info, avg_ev_real
+
+# ======================================================
+# NUEVA FUNCIÓN: EVALUACIÓN DE CALIBRACIÓN
+# ======================================================
+def evaluate_calibration(df, n_test=100, window_matches=400, alpha=0.008, rho=-0.13):
+    """Evalúa la calibración del modelo Dixon-Coles"""
+    df_sorted = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+    
+    if len(df_sorted) < n_test + 200:
+        return None
+    
+    test_block = df_sorted.tail(n_test)
+    
+    # Bin las probabilidades
+    bins = [0, 0.2, 0.4, 0.5, 0.6, 0.8, 1.0]
+    bin_counts = np.zeros(len(bins)-1)
+    bin_wins = np.zeros(len(bins)-1)
+    
+    for _, row in test_block.iterrows():
+        cut_date = row["date"]
+        train_df = df_sorted[df_sorted["date"] < cut_date].copy()
+        
+        if len(train_df) < 100:
+            continue
+            
+        team_stats, avg_h, avg_a, _ = calculate_strengths(
+            train_df, ref_date=cut_date, window_matches=window_matches, alpha=alpha
+        )
+        
+        if row["home"] not in team_stats or row["away"] not in team_stats:
+            continue
+        
+        _, _, ph, pd_prob, pa, *_ = predict_match_dixon_coles(
+            row["home"], row["away"], team_stats, avg_h, avg_a, rho=rho
+        )
+        
+        # Determinar resultado real
+        if row["home_goals"] > row["away_goals"]:
+            actual_outcome = "Local"
+            max_prob = ph
+        elif row["home_goals"] < row["away_goals"]:
+            actual_outcome = "Visita"
+            max_prob = pa
+        else:
+            actual_outcome = "Empate"
+            max_prob = pd_prob
+        
+        # Encontrar bin
+        for i in range(len(bins)-1):
+            if bins[i] <= max_prob < bins[i+1]:
+                bin_counts[i] += 1
+                # Verificar si la predicción fue correcta (mayor probabilidad = predicción)
+                predicted_outcome = "Local" if ph == max(ph, pd_prob, pa) else ("Empate" if pd_prob == max(ph, pd_prob, pa) else "Visita")
+                if predicted_outcome == actual_outcome:
+                    bin_wins[i] += 1
+                break
+    
+    # Calcular tasas de acierto por bin
+    calibration_data = []
+    for i in range(len(bins)-1):
+        if bin_counts[i] > 0:
+            win_rate = bin_wins[i] / bin_counts[i]
+            expected_prob = (bins[i] + bins[i+1]) / 2
+            calibration_data.append({
+                "Bin": f"{bins[i]:.1f}-{bins[i+1]:.1f}",
+                "Muestras": int(bin_counts[i]),
+                "Prob. Esperada": expected_prob,
+                "Tasa Acierto": win_rate,
+                "Diferencia": win_rate - expected_prob
+            })
+    
+    return pd.DataFrame(calibration_data)
 
 # ======================================================
 # 5. PLOTS
@@ -2231,3 +2356,4 @@ st.markdown("""
     <p>⚠️ Disclaimer: Las apuestas deportivas conllevan riesgo. Este es un tool de análisis, no garantía de ganancias.</p>
 </div>
 """, unsafe_allow_html=True)
+
