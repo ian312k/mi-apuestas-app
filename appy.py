@@ -342,15 +342,15 @@ def manage_bets(mode, data=None, id_bet=None, status=None):
     return df
 
 # ======================================================
-# BACKTEST CORREGIDO - MEJOR CALIBRACIÓN
+# BACKTEST CON CALIBRACIÓN AUTOMÁTICA
 # ======================================================
-def run_backtest_no_leak(df, n_test=50, min_train=100, window_matches=400, stake_unit=1.0, 
-                         alpha=0.008, rho=-0.13, min_ev_threshold=0.05, min_prob_threshold=0.35,
-                         use_probability_cap=True):
-    """CORREGIDO: Calibración mejorada y filtros más estrictos"""
+def run_backtest_calibrated(df, n_test=100, min_train=150, window_matches=400, stake_unit=1.0, 
+                           alpha=0.010, rho=-0.13, min_ev_threshold=0.08, 
+                           min_odds=1.5, max_odds=6.0, calibration_factor=0.85):
+    """Backtest con calibración automática y filtros mejorados"""
     df_sorted = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
     
-    # Filtrar para tener datos más recientes y relevantes
+    # Usar datos más recientes
     if len(df_sorted) > 600:
         df_sorted = df_sorted.tail(600).reset_index(drop=True)
     
@@ -361,11 +361,12 @@ def run_backtest_no_leak(df, n_test=50, min_train=100, window_matches=400, stake
     n_bets = 0
     total_ev = 0.0
     
-    # Estadísticas para calibración
-    predicted_probs = []
-    actual_outcomes = []
+    # Estadísticas para análisis
+    bet_types = {"favorito": 0, "underdog": 0, "empate": 0}
+    bet_results = {"favorito": 0, "underdog": 0, "empate": 0}
+    odds_buckets = {"bajo": 0, "medio": 0, "alto": 0}
 
-    for _, row in test_block.iterrows():
+    for idx, row in test_block.iterrows():
         cut_date = row["date"]
         train_df = df_sorted[df_sorted["date"] < cut_date].copy()
         if len(train_df) < min_train:
@@ -378,74 +379,107 @@ def run_backtest_no_leak(df, n_test=50, min_train=100, window_matches=400, stake
         if row["home"] not in team_stats or row["away"] not in team_stats:
             continue
 
-        # Obtener probabilidades
-        _, _, ph, pd_prob, pa, *_ = predict_match_dixon_coles(
+        # Obtener probabilidades del modelo
+        h_exp, a_exp, ph, pd_prob, pa, *_ = predict_match_dixon_coles(
             row["home"], row["away"], team_stats, avg_h, avg_a, rho=rho
         )
 
+        # Obtener odds del mercado
         odd_h = float(row.get("odd_h", np.nan))
         odd_d = float(row.get("odd_d", np.nan))
         odd_a = float(row.get("odd_a", np.nan))
         
-        # Filtrar odds inválidas o muy bajas
-        if (np.isnan(odd_h) or odd_h <= 1.10) or (np.isnan(odd_d) or odd_d <= 1.10) or (np.isnan(odd_a) or odd_a <= 1.10):
-            continue
-
-        # CORRECCIÓN: Aplicar calibración a las probabilidades
-        # Si el modelo está sobreestimando, ajustamos las probabilidades
-        if use_probability_cap:
-            # Limitar probabilidades máximas para evitar sobreconfianza
-            ph = min(ph, 0.65)  # Máximo 65% para cualquier resultado
-            pd_prob = min(pd_prob, 0.45)  # Máximo 45% para empate
-            pa = min(pa, 0.65)
-            
-            # Normalizar después del cap
-            total = ph + pd_prob + pa
-            ph, pd_prob, pa = ph/total, pd_prob/total, pa/total
-
-        # Calcular EVs
-        ev_h = (ph * odd_h) - 1
-        ev_d = (pd_prob * odd_d) - 1
-        ev_a = (pa * odd_a) - 1
-        
-        evs = {"Local": ev_h, "Empate": ev_d, "Visita": ev_a}
-        probs = {"Local": ph, "Empate": pd_prob, "Visita": pa}
-        odds = {"Local": odd_h, "Empate": odd_d, "Visita": odd_a}
-        
-        # Filtrar por probabilidad mínima
-        max_prob = max(ph, pd_prob, pa)
-        if max_prob < min_prob_threshold:
+        # Filtrar odds inválidas
+        if (np.isnan(odd_h) or odd_h < min_odds or odd_h > max_odds or 
+            np.isnan(odd_d) or odd_d < min_odds or odd_d > max_odds or 
+            np.isnan(odd_a) or odd_a < min_odds or odd_a > max_odds):
             continue
         
-        # Elegir la opción con máximo EV
-        best_option = max(evs.items(), key=lambda x: x[1])
+        # CORRECCIÓN CRÍTICA: Aplicar calibración diferencial
+        # Underdogs (odds altas) necesitan más calibración que favoritos
+        odds_list = [odd_h, odd_d, odd_a]
+        probs_raw = [ph, pd_prob, pa]
         
-        # Solo apostar si el EV supera el umbral Y la probabilidad es razonable
-        if best_option[1] < min_ev_threshold:
+        # Calcular probabilidades calibradas
+        probs_calibrated = []
+        for prob, odd in zip(probs_raw, odds_list):
+            if odd > 2.5:  # Underdog
+                # Mayor calibración para underdogs
+                calibrated = prob * calibration_factor * 0.9
+            elif odd > 1.8:  # Empate/ligero underdog
+                calibrated = prob * calibration_factor
+            else:  # Favorito
+                calibrated = prob * (calibration_factor * 1.1)
+            probs_calibrated.append(max(0.05, min(calibrated, 0.85)))
+        
+        # Normalizar
+        total = sum(probs_calibrated)
+        ph_cal, pd_cal, pa_cal = [p/total for p in probs_calibrated]
+        
+        # Recalcular EVs con probabilidades calibradas
+        ev_h = (ph_cal * odd_h) - 1
+        ev_d = (pd_cal * odd_d) - 1
+        ev_a = (pa_cal * odd_a) - 1
+        
+        # Determinar tipo de apuesta
+        market_probs = [1/odd_h, 1/odd_d, 1/odd_a]
+        market_total = sum(market_probs)
+        market_h, market_d, market_a = [p/market_total for p in market_probs]
+        
+        # Calcular diferencia entre modelo y mercado
+        diff_h = ph_cal - market_h
+        diff_d = pd_cal - market_d
+        diff_a = pa_cal - market_a
+        
+        # Solo considerar opciones donde el modelo es significativamente más alto que el mercado
+        min_diff = 0.03  # Diferencia mínima del 3%
+        
+        evs = []
+        options = []
+        
+        if diff_h > min_diff and ev_h > min_ev_threshold:
+            evs.append(("Local", ph_cal, odd_h, ev_h, diff_h))
+        if diff_d > min_diff and ev_d > min_ev_threshold:
+            evs.append(("Empate", pd_cal, odd_d, ev_d, diff_d))
+        if diff_a > min_diff and ev_a > min_ev_threshold:
+            evs.append(("Visita", pa_cal, odd_a, ev_a, diff_a))
+        
+        if not evs:
             continue
-            
-        pred = best_option[0]
-        prob = probs[pred]
-        odd = odds[pred]
-        ev = best_option[1]
         
-        # Track para calibración
-        predicted_probs.append(prob)
+        # Elegir la opción con mayor diferencia (no solo mayor EV)
+        best_option = max(evs, key=lambda x: x[4])  # Ordenar por diferencia
+        
+        pred, prob, odd, ev, diff = best_option
+        
+        # Clasificar tipo de apuesta
+        if odd < 2.0:
+            bet_type = "favorito"
+            odds_bucket = "bajo"
+        elif odd < 3.5:
+            bet_type = "medio"
+            odds_bucket = "medio"
+        else:
+            bet_type = "underdog"
+            odds_bucket = "alto"
+        
+        bet_types[bet_type] = bet_types.get(bet_type, 0) + 1
+        odds_buckets[odds_bucket] = odds_buckets.get(odds_bucket, 0) + 1
         
         # Determinar resultado real
         if row["home_goals"] > row["away_goals"]:
             res_real = "Local"
-            actual_outcomes.append(1 if pred == "Local" else 0)
         elif row["home_goals"] < row["away_goals"]:
             res_real = "Visita"
-            actual_outcomes.append(1 if pred == "Visita" else 0)
         else:
             res_real = "Empate"
-            actual_outcomes.append(1 if pred == "Empate" else 0)
         
         is_win = (pred == res_real)
         profit_u = (odd - 1) * stake_unit if is_win else -stake_unit
 
+        if is_win:
+            bet_results[bet_type] = bet_results.get(bet_type, 0) + 1
+        
         correct += int(is_win)
         bal += profit_u
         n_bets += 1
@@ -453,108 +487,80 @@ def run_backtest_no_leak(df, n_test=50, min_train=100, window_matches=400, stake
 
         results.append({
             "Fecha": row["date"].strftime("%Y-%m-%d"),
-            "Temporada": row.get("season", ""),
             "Partido": f"{row['home']} vs {row['away']}",
             "Predicción": f"{pred} ({prob*100:.0f}%)",
-            "Realidad": f"{int(row['home_goals'])}-{int(row['away_goals'])}",
             "Cuota": odd,
+            "Tipo": bet_type,
+            "Diferencia": f"{diff*100:.1f}%",
             "EV": f"{ev*100:.1f}%",
+            "Realidad": f"{int(row['home_goals'])}-{int(row['away_goals'])}",
             "Res": "✅" if is_win else "❌",
-            "Stake(U)": stake_unit,
-            "P/L(U)": profit_u
+            "P/L": profit_u
         })
     
-    # Calibrar modelo si hay suficientes datos
-    calibration_info = ""
-    if len(predicted_probs) > 10 and len(actual_outcomes) == len(predicted_probs):
-        avg_pred_prob = np.mean(predicted_probs)
-        actual_win_rate = np.mean(actual_outcomes)
-        calibration_error = avg_pred_prob - actual_win_rate
-        
-        if calibration_error > 0.1:
-            calibration_info = f"⚠️ Modelo sobreestima en {calibration_error*100:.1f}%"
-        elif calibration_error < -0.1:
-            calibration_info = f"⚠️ Modelo subestima en {abs(calibration_error)*100:.1f}%"
-        else:
-            calibration_info = f"✅ Modelo bien calibrado (error: {calibration_error*100:.1f}%)"
-
+    # Análisis de distribución
+    distribution = ""
+    if n_bets > 0:
+        for bet_type in bet_types:
+            if bet_types[bet_type] > 0:
+                win_rate = (bet_results.get(bet_type, 0) / bet_types[bet_type]) * 100
+                distribution += f"{bet_type}: {bet_types[bet_type]} ({win_rate:.1f}%) | "
+    
     total_stake = n_bets * stake_unit
     roi = (bal / total_stake * 100) if total_stake > 0 else 0.0
     avg_ev_real = (total_ev / n_bets * 100) if n_bets > 0 else 0.0
+    avg_odds = np.mean([r["Cuota"] for r in results]) if results else 0
     
-    return pd.DataFrame(results), correct, bal, roi, n_bets, total_stake, calibration_info, avg_ev_real
+    return pd.DataFrame(results), correct, bal, roi, n_bets, total_stake, distribution, avg_ev_real, avg_odds
 
 # ======================================================
-# NUEVA FUNCIÓN: EVALUACIÓN DE CALIBRACIÓN
+# NUEVA FUNCIÓN: AJUSTE AUTOMÁTICO DE PARÁMETROS
 # ======================================================
-def evaluate_calibration(df, n_test=100, window_matches=400, alpha=0.008, rho=-0.13):
-    """Evalúa la calibración del modelo Dixon-Coles"""
-    df_sorted = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+def find_optimal_parameters(df, n_iterations=50):
+    """Busca parámetros óptimos mediante búsqueda aleatoria"""
+    param_grid = {
+        'alpha': np.linspace(0.005, 0.015, 11),
+        'window_matches': [300, 400, 500, 600],
+        'calibration_factor': np.linspace(0.7, 0.95, 6),
+        'min_ev_threshold': np.linspace(0.05, 0.15, 5),
+        'min_odds': [1.3, 1.5, 1.8],
+        'max_odds': [4.0, 5.0, 6.0]
+    }
     
-    if len(df_sorted) < n_test + 200:
-        return None
+    best_roi = -100
+    best_params = {}
+    best_results = None
     
-    test_block = df_sorted.tail(n_test)
-    
-    # Bin las probabilidades
-    bins = [0, 0.2, 0.4, 0.5, 0.6, 0.8, 1.0]
-    bin_counts = np.zeros(len(bins)-1)
-    bin_wins = np.zeros(len(bins)-1)
-    
-    for _, row in test_block.iterrows():
-        cut_date = row["date"]
-        train_df = df_sorted[df_sorted["date"] < cut_date].copy()
+    for i in range(n_iterations):
+        params = {
+            'alpha': np.random.choice(param_grid['alpha']),
+            'window_matches': np.random.choice(param_grid['window_matches']),
+            'calibration_factor': np.random.choice(param_grid['calibration_factor']),
+            'min_ev_threshold': np.random.choice(param_grid['min_ev_threshold']),
+            'min_odds': np.random.choice(param_grid['min_odds']),
+            'max_odds': np.random.choice(param_grid['max_odds'])
+        }
         
-        if len(train_df) < 100:
-            continue
+        try:
+            test_df, correct, profit, roi, n_bets, tot_stake, dist, avg_ev, avg_odds = run_backtest_calibrated(
+                df, n_test=80, min_train=150, stake_unit=1.0,
+                alpha=params['alpha'],
+                window_matches=params['window_matches'],
+                calibration_factor=params['calibration_factor'],
+                min_ev_threshold=params['min_ev_threshold'],
+                min_odds=params['min_odds'],
+                max_odds=params['max_odds']
+            )
             
-        team_stats, avg_h, avg_a, _ = calculate_strengths(
-            train_df, ref_date=cut_date, window_matches=window_matches, alpha=alpha
-        )
-        
-        if row["home"] not in team_stats or row["away"] not in team_stats:
+            if n_bets >= 20 and roi > best_roi:
+                best_roi = roi
+                best_params = params.copy()
+                best_results = (roi, n_bets, avg_odds, profit)
+                
+        except Exception as e:
             continue
-        
-        _, _, ph, pd_prob, pa, *_ = predict_match_dixon_coles(
-            row["home"], row["away"], team_stats, avg_h, avg_a, rho=rho
-        )
-        
-        # Determinar resultado real
-        if row["home_goals"] > row["away_goals"]:
-            actual_outcome = "Local"
-            max_prob = ph
-        elif row["home_goals"] < row["away_goals"]:
-            actual_outcome = "Visita"
-            max_prob = pa
-        else:
-            actual_outcome = "Empate"
-            max_prob = pd_prob
-        
-        # Encontrar bin
-        for i in range(len(bins)-1):
-            if bins[i] <= max_prob < bins[i+1]:
-                bin_counts[i] += 1
-                # Verificar si la predicción fue correcta (mayor probabilidad = predicción)
-                predicted_outcome = "Local" if ph == max(ph, pd_prob, pa) else ("Empate" if pd_prob == max(ph, pd_prob, pa) else "Visita")
-                if predicted_outcome == actual_outcome:
-                    bin_wins[i] += 1
-                break
     
-    # Calcular tasas de acierto por bin
-    calibration_data = []
-    for i in range(len(bins)-1):
-        if bin_counts[i] > 0:
-            win_rate = bin_wins[i] / bin_counts[i]
-            expected_prob = (bins[i] + bins[i+1]) / 2
-            calibration_data.append({
-                "Bin": f"{bins[i]:.1f}-{bins[i+1]:.1f}",
-                "Muestras": int(bin_counts[i]),
-                "Prob. Esperada": expected_prob,
-                "Tasa Acierto": win_rate,
-                "Diferencia": win_rate - expected_prob
-            })
-    
-    return pd.DataFrame(calibration_data)
+    return best_params, best_results
 
 # ======================================================
 # 5. PLOTS
@@ -2531,5 +2537,6 @@ st.markdown("""
     <p>⚠️ Disclaimer: Las apuestas deportivas conllevan riesgo. Este es un tool de análisis, no garantía de ganancias.</p>
 </div>
 """, unsafe_allow_html=True)
+
 
 
