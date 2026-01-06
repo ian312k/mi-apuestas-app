@@ -1,4 +1,3 @@
-# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -24,7 +23,7 @@ from sklearn.metrics import log_loss
 # ======================================================
 # 1. CONFIGURACIÓN Y ESTILOS CSS (DARK MODE) 🎨
 # ======================================================
-st.set_page_config(page_title="Dixon-Coles Pro v6.1 (Corregido)", layout="wide", page_icon="🛡️")
+st.set_page_config(page_title="Dixon-Coles Pro v6.2 (Final)", layout="wide", page_icon="🛡️")
 CSV_FILE = "mis_apuestas_pro.csv"
 N_SEASONS = 3
 
@@ -83,6 +82,8 @@ if "model_params" not in st.session_state:
         "mix_factor": 0.7,
         "use_only_current": True
     }
+# --- NUEVO: ESTADO PARA RESULTADOS BACKTEST ---
+if "backtest_results" not in st.session_state: st.session_state.backtest_results = None
 
 st.markdown("""
 <style>
@@ -168,10 +169,8 @@ def call_api_real(sport_key, api_key):
 # 3. DIXON-COLES CORREGIDO
 # ======================================================
 def calculate_strengths(df, ref_date=None, alpha=0.008, mix_factor=0.7, window_matches=400):
-    """Corregido: weight clipping más suave"""
     df = df.copy().dropna(subset=["date", "home", "away", "home_goals", "away_goals"]).sort_values("date").reset_index(drop=True)
     
-    # Filtrar por ventana temporal
     if window_matches and window_matches > 0 and len(df) > window_matches:
         df = df.tail(window_matches).reset_index(drop=True)
     
@@ -182,7 +181,7 @@ def calculate_strengths(df, ref_date=None, alpha=0.008, mix_factor=0.7, window_m
     df["days_ago"] = (last_date - df["date"]).dt.days.clip(lower=0)
     df["weight"] = np.exp(-alpha * df["days_ago"])
     
-    # CORRECCIÓN: Piso más bajo (0.05 en lugar de 0.2)
+    # Weight clipping
     df["weight"] = df["weight"].clip(lower=0.05, upper=1.0)
 
     if df.empty or df["weight"].sum() == 0:
@@ -246,7 +245,6 @@ def calculate_strengths(df, ref_date=None, alpha=0.008, mix_factor=0.7, window_m
     return team_stats, avg_home, avg_away, all_teams
 
 def predict_match_dixon_coles(home, away, team_stats, avg_h, avg_a, rho=-0.13, max_goals=12):
-    """Corregido: matriz de 12 goles, suavizado más conservador"""
     if home not in team_stats or away not in team_stats:
         return 0, 0, 0, 0, 0, 0, 0, 0, [], np.zeros((1, 1))
 
@@ -254,7 +252,7 @@ def predict_match_dixon_coles(home, away, team_stats, avg_h, avg_a, rho=-0.13, m
     h_exp = team_stats[home]["att_h"] * team_stats[away]["def_a"] * avg_h
     a_exp = team_stats[away]["att_a"] * team_stats[home]["def_h"] * avg_a
     
-    # CORRECCIÓN: Suavizado más conservador
+    # Suavizado conservador
     h_exp = np.log1p(np.exp(h_exp)) - 0.5
     a_exp = np.log1p(np.exp(a_exp)) - 0.5
     h_exp = min(max(h_exp, 0.1), 5.0)
@@ -350,7 +348,6 @@ def run_backtest_calibrated(df, n_test=100, min_train=150, window_matches=400, s
     """Backtest con calibración automática y filtros mejorados"""
     df_sorted = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
     
-    # Usar datos más recientes
     if len(df_sorted) > 600:
         df_sorted = df_sorted.tail(600).reset_index(drop=True)
     
@@ -361,10 +358,8 @@ def run_backtest_calibrated(df, n_test=100, min_train=150, window_matches=400, s
     n_bets = 0
     total_ev = 0.0
     
-    # Estadísticas para análisis
     bet_types = {"favorito": 0, "underdog": 0, "empate": 0}
     bet_results = {"favorito": 0, "underdog": 0, "empate": 0}
-    odds_buckets = {"bajo": 0, "medio": 0, "alto": 0}
 
     for idx, row in test_block.iterrows():
         cut_date = row["date"]
@@ -379,64 +374,51 @@ def run_backtest_calibrated(df, n_test=100, min_train=150, window_matches=400, s
         if row["home"] not in team_stats or row["away"] not in team_stats:
             continue
 
-        # Obtener probabilidades del modelo
         h_exp, a_exp, ph, pd_prob, pa, *_ = predict_match_dixon_coles(
             row["home"], row["away"], team_stats, avg_h, avg_a, rho=rho
         )
 
-        # Obtener odds del mercado
         odd_h = float(row.get("odd_h", np.nan))
         odd_d = float(row.get("odd_d", np.nan))
         odd_a = float(row.get("odd_a", np.nan))
         
-        # Filtrar odds inválidas
         if (np.isnan(odd_h) or odd_h < min_odds or odd_h > max_odds or 
             np.isnan(odd_d) or odd_d < min_odds or odd_d > max_odds or 
             np.isnan(odd_a) or odd_a < min_odds or odd_a > max_odds):
             continue
         
-        # CORRECCIÓN CRÍTICA: Aplicar calibración diferencial
-        # Underdogs (odds altas) necesitan más calibración que favoritos
+        # Calibración diferencial
         odds_list = [odd_h, odd_d, odd_a]
         probs_raw = [ph, pd_prob, pa]
         
-        # Calcular probabilidades calibradas
         probs_calibrated = []
         for prob, odd in zip(probs_raw, odds_list):
-            if odd > 2.5:  # Underdog
-                # Mayor calibración para underdogs
+            if odd > 2.5: 
                 calibrated = prob * calibration_factor * 0.9
-            elif odd > 1.8:  # Empate/ligero underdog
+            elif odd > 1.8:
                 calibrated = prob * calibration_factor
-            else:  # Favorito
+            else:
                 calibrated = prob * (calibration_factor * 1.1)
             probs_calibrated.append(max(0.05, min(calibrated, 0.85)))
         
-        # Normalizar
         total = sum(probs_calibrated)
         ph_cal, pd_cal, pa_cal = [p/total for p in probs_calibrated]
         
-        # Recalcular EVs con probabilidades calibradas
         ev_h = (ph_cal * odd_h) - 1
         ev_d = (pd_cal * odd_d) - 1
         ev_a = (pa_cal * odd_a) - 1
         
-        # Determinar tipo de apuesta
         market_probs = [1/odd_h, 1/odd_d, 1/odd_a]
         market_total = sum(market_probs)
         market_h, market_d, market_a = [p/market_total for p in market_probs]
         
-        # Calcular diferencia entre modelo y mercado
         diff_h = ph_cal - market_h
         diff_d = pd_cal - market_d
         diff_a = pa_cal - market_a
         
-        # Solo considerar opciones donde el modelo es significativamente más alto que el mercado
-        min_diff = 0.03  # Diferencia mínima del 3%
+        min_diff = 0.03
         
         evs = []
-        options = []
-        
         if diff_h > min_diff and ev_h > min_ev_threshold:
             evs.append(("Local", ph_cal, odd_h, ev_h, diff_h))
         if diff_d > min_diff and ev_d > min_ev_threshold:
@@ -447,26 +429,19 @@ def run_backtest_calibrated(df, n_test=100, min_train=150, window_matches=400, s
         if not evs:
             continue
         
-        # Elegir la opción con mayor diferencia (no solo mayor EV)
-        best_option = max(evs, key=lambda x: x[4])  # Ordenar por diferencia
+        best_option = max(evs, key=lambda x: x[4])
         
         pred, prob, odd, ev, diff = best_option
         
-        # Clasificar tipo de apuesta
         if odd < 2.0:
             bet_type = "favorito"
-            odds_bucket = "bajo"
         elif odd < 3.5:
             bet_type = "medio"
-            odds_bucket = "medio"
         else:
             bet_type = "underdog"
-            odds_bucket = "alto"
         
         bet_types[bet_type] = bet_types.get(bet_type, 0) + 1
-        odds_buckets[odds_bucket] = odds_buckets.get(odds_bucket, 0) + 1
         
-        # Determinar resultado real
         if row["home_goals"] > row["away_goals"]:
             res_real = "Local"
         elif row["home_goals"] < row["away_goals"]:
@@ -485,6 +460,7 @@ def run_backtest_calibrated(df, n_test=100, min_train=150, window_matches=400, s
         n_bets += 1
         total_ev += ev
 
+        # --- MODIFICADO: GUARDAR VALORES NUMÉRICOS PARA DIAGNÓSTICO ---
         results.append({
             "Fecha": row["date"].strftime("%Y-%m-%d"),
             "Partido": f"{row['home']} vs {row['away']}",
@@ -495,10 +471,13 @@ def run_backtest_calibrated(df, n_test=100, min_train=150, window_matches=400, s
             "EV": f"{ev*100:.1f}%",
             "Realidad": f"{int(row['home_goals'])}-{int(row['away_goals'])}",
             "Res": "✅" if is_win else "❌",
-            "P/L": profit_u
+            "P/L": profit_u,
+            # Campos para diagnóstico
+            "Prob_Modelo": prob,
+            "Resultado_Num": 1 if is_win else 0,
+            "Odds_Num": odd
         })
     
-    # Análisis de distribución
     distribution = ""
     if n_bets > 0:
         for bet_type in bet_types:
@@ -513,11 +492,7 @@ def run_backtest_calibrated(df, n_test=100, min_train=150, window_matches=400, s
     
     return pd.DataFrame(results), correct, bal, roi, n_bets, total_stake, distribution, avg_ev_real, avg_odds
 
-# ======================================================
-# NUEVA FUNCIÓN: AJUSTE AUTOMÁTICO DE PARÁMETROS
-# ======================================================
 def find_optimal_parameters(df, n_iterations=50):
-    """Busca parámetros óptimos mediante búsqueda aleatoria"""
     param_grid = {
         'alpha': np.linspace(0.005, 0.015, 11),
         'window_matches': [300, 400, 500, 600],
@@ -654,13 +629,11 @@ def brier_multiclass(P, y, n_classes=3):
     return float(np.mean(np.sum((P - y_oh) ** 2, axis=1) / n_classes))
 
 def build_features_for_match(row, team_stats, avg_h, avg_a):
-    # Obtener probabilidades Dixon-Coles
     _, _, dc_h, dc_d, dc_a, *_ = predict_match_dixon_coles(
         row["home"], row["away"], team_stats, avg_h, avg_a, 
         rho=st.session_state.model_params["rho"]
     )
 
-    # Odds del mercado
     oh = float(row.get("odd_h", np.nan))
     od = float(row.get("odd_d", np.nan))
     oa = float(row.get("odd_a", np.nan))
@@ -671,15 +644,12 @@ def build_features_for_match(row, team_stats, avg_h, avg_a):
     
     mk_h, mk_d, mk_a = odds_to_probs(oh, od, oa)
 
-    # Expectativas de goles
     h_exp = team_stats[row["home"]]["att_h"] * team_stats[row["away"]]["def_a"] * avg_h
     a_exp = team_stats[row["away"]]["att_a"] * team_stats[row["home"]]["def_h"] * avg_a
 
-    # Estadísticas de tiros
     sot_h = float(row.get("sot_h", 0.0))
     sot_a = float(row.get("sot_a", 0.0))
 
-    # Features adicionales
     home_matches = team_stats[row["home"]]["matches_count"]
     away_matches = team_stats[row["away"]]["matches_count"]
     
@@ -728,7 +698,6 @@ def fit_ml_multiclass(X, y, seed=42):
     return model
 
 def fast_eval_ml(df, n_test=200, min_train=300, window_matches=600, alpha=0.008, rho=-0.13):
-    """NOTA: Solo para diagnóstico rápido, no para métricas reales"""
     st.warning("⚠️ fast_eval_ml: Solo para diagnóstico rápido. Use 'strict_walkforward_eval_ml_blocks' para evaluación real.")
     
     df_sorted = df.dropna(subset=["date","home","away","home_goals","away_goals"]).sort_values("date").reset_index(drop=True)
@@ -966,54 +935,43 @@ with st.sidebar:
 
     code = st.selectbox("Liga", list(leagues.keys()), format_func=lambda x: leagues[x])
     
-    # ===== PARÁMETROS DEL MODELO =====
     with st.expander("🎯 Parámetros del Modelo", expanded=True):
-        # Selección de temporadas
         use_only_current = st.checkbox("Usar solo temporada actual", 
                                      value=st.session_state.model_params["use_only_current"],
                                      help="Mejora resultados usando datos más recientes")
         
-        # Cargar datos con parámetros actualizados
         df = fetch_live_soccer_data(code, n_seasons=N_SEASONS, 
                                   use_only_current=use_only_current)
         
-        # Mostrar info de debug
         if not df.empty and "season" in df.columns:
-            st.caption(f"📊 Temporadas cargadas: {sorted(df['season'].unique())}")
-            st.caption(f"📅 Rango: {df['date'].min().date()} - {df['date'].max().date()}")
+            st.caption(f"📊 Temporadas: {sorted(df['season'].unique())}")
             st.caption(f"⚽ Partidos: {len(df)}")
         
-        # Parámetros ajustables
         st.session_state.model_params["alpha"] = st.slider(
-            "Decaimiento temporal (alpha)", 
-            0.001, 0.02, 0.008, 0.001,
-            help="Mayor valor = más peso a partidos recientes"
+            "Decaimiento (alpha)", 
+            0.001, 0.02, 0.008, 0.001
         )
         
         st.session_state.model_params["rho"] = st.slider(
-            "Correlación bajas puntuaciones (rho)", 
-            -0.3, 0.3, -0.13, 0.01,
-            help="Ajusta correlación entre goles (típicamente negativo)"
+            "Correlación (rho)", 
+            -0.3, 0.3, -0.13, 0.01
         )
         
         st.session_state.model_params["window_matches"] = st.selectbox(
-            "Ventana de análisis",
+            "Ventana análisis",
             [200, 300, 400, 600, 800, 1200, 0],
             index=2,
-            format_func=lambda x: "Todos" if x == 0 else f"{x} últimos partidos",
-            help="Cantidad de partidos recientes a considerar"
+            format_func=lambda x: "Todos" if x == 0 else f"{x} partidos"
         )
         
         st.session_state.model_params["mix_factor"] = st.slider(
-            "Peso estadísticas específicas", 
-            0.0, 1.0, 0.7, 0.1,
-            help="1.0 = solo estadísticas específicas, 0.0 = solo estadísticas globales"
+            "Peso stats específicas", 
+            0.0, 1.0, 0.7, 0.1
         )
         
         st.session_state.model_params["use_only_current"] = use_only_current
 
     if not df.empty:
-        # Calcular estadísticas con parámetros actualizados
         stats, ah, aa, teams = calculate_strengths(
             df, 
             ref_date=df["date"].max(), 
@@ -1023,14 +981,6 @@ with st.sidebar:
         )
         
         st.success(f"✅ {len(df)} partidos cargados")
-        
-        with st.expander("📈 Estado del Modelo", expanded=False):
-            st.write(f"**Alpha:** {st.session_state.model_params['alpha']}")
-            st.write(f"**Rho:** {st.session_state.model_params['rho']}")
-            st.write(f"**Ventana:** {st.session_state.model_params['window_matches'] if st.session_state.model_params['window_matches'] > 0 else 'Todos'}")
-            st.write(f"**Equipos en memoria:** {len(teams)}")
-            st.write(f"**Promedio goles local:** {ah:.2f}")
-            st.write(f"**Promedio goles visita:** {aa:.2f}")
         
         with st.expander("🔎 Últimos 5 partidos"):
             latest_matches = df.sort_values("date", ascending=False).head(5).copy()
@@ -1044,7 +994,6 @@ with st.sidebar:
     st.divider()
     bank = st.number_input("💰 Tu Banco ($)", 1000.0, step=50.0)
     
-    # Control de Kelly
     kelly_fraction = st.slider("Fracción Kelly", 0.1, 1.0, 0.3, 0.1,
                              help="Kelly fraccionario para reducir riesgo")
 
@@ -1055,30 +1004,6 @@ with st.sidebar:
             st.session_state.ticket = []
             st.rerun()
 
-    # ===== RESUMEN DE CORRECCIONES =====
-    st.divider()
-    with st.expander("📝 Resumen de Correcciones", expanded=False):
-        st.markdown("""
-        ### ✅ Correcciones Implementadas:
-        
-        1. **Backtesting:** Elegir por máximo EV, no por máxima probabilidad
-        2. **min_ev_backtest:** Ahora se usa correctamente como umbral
-        3. **Escáner:** Ordenamiento numérico correcto de "Value %"
-        4. **Weight clipping:** Reducido de 0.2 a 0.05
-        5. **Expectativas goles:** Suavizado más conservador (0.1-5.0)
-        6. **Matriz de goles:** Aumentada a 12 para reducir truncamiento
-        7. **Evaluación ML:** Advertencias claras sobre data leakage
-        
-        ### 🎯 Recomendación Práctica:
-        - Para backtesting real: usar **strict_walkforward_eval_ml_blocks**
-        - Parámetros iniciales recomendados:
-          * Alpha: 0.008-0.012
-          * Ventana: 400-600 partidos
-          * EV mínimo: 5-7%
-          * Mix factor: 0.6-0.8
-        """)
-
-# Título principal
 st.title(f"🛡️ Dixon-Coles Optimizado: {leagues[code]}")
 
 # --- SELECTOR DE EQUIPOS ---
@@ -1086,7 +1011,6 @@ c1, c2 = st.columns(2)
 home = c1.selectbox("Local", teams)
 away = c2.selectbox("Visitante", [t for t in teams if t != home])
 
-# Predicción con parámetros actualizados
 h_exp, a_exp, ph, pd_prob, pa, po15, po25, pbtts, top_sc, probs = predict_match_dixon_coles(
     home, away, stats, ah, aa, rho=st.session_state.model_params["rho"]
 )
@@ -1107,7 +1031,6 @@ with t1:
     b.metric("Total (xG)", f"{h_exp + a_exp:.2f}")
     c.metric(f"{away}", f"{a_exp:.2f}")
     
-    # Gráfico de expectativas
     fig_exp = go.Figure()
     fig_exp.add_trace(go.Bar(
         x=['Local', 'Visitante'],
@@ -1116,40 +1039,16 @@ with t1:
         textposition='auto',
         marker_color=['#1f77b4', '#ff7f0e']
     ))
-    fig_exp.update_layout(
-        title='Expectativa de Goles',
-        height=300,
-        template="plotly_dark"
-    )
+    fig_exp.update_layout(title='Expectativa de Goles', height=300, template="plotly_dark")
     st.plotly_chart(fig_exp, use_container_width=True)
 
     st.divider()
-    st.markdown("### 🏁 ¿Quién gana? (1X2) + Mercados de goles")
+    st.markdown("### 🏁 ¿Quién gana? (1X2) + Mercados")
 
     m1, m2, m3 = st.columns(3)
     m1.metric(f"🏠 {home}", f"{ph*100:.1f}%")
     m2.metric("🤝 Empate", f"{pd_prob*100:.1f}%")
     m3.metric(f"✈️ {away}", f"{pa*100:.1f}%")
-
-    best_1x2 = max(ph, pd_prob, pa)
-    if best_1x2 == ph: 
-        pick_1x2 = f"Gana {home}"
-    elif best_1x2 == pa: 
-        pick_1x2 = f"Gana {away}"
-    else: 
-        pick_1x2 = "Empate"
-
-    fo_h, fo_d, fo_a = safe_fair_odds(ph), safe_fair_odds(pd_prob), safe_fair_odds(pa)
-
-    st.info(
-        f"**Pick modelo (1X2):** {pick_1x2}  |  "
-        f"**Cuotas justas:** H={fo_h:.2f} | D={fo_d:.2f} | A={fo_a:.2f}"
-    )
-
-    g1, g2, g3 = st.columns(3)
-    g1.metric("Over 1.5", f"{po15*100:.1f}%")
-    g2.metric("Over 2.5", f"{po25*100:.1f}%")
-    g3.metric("BTTS", f"{pbtts*100:.1f}%")
 
     st.plotly_chart(plot_score_heatmap(probs, home, away), use_container_width=True)
 
@@ -1158,8 +1057,6 @@ with t1:
         top_df = pd.DataFrame([{"Marcador": s, "Prob (%)": p*100} for s, p in top_sc])
         st.dataframe(top_df.style.format({"Prob (%)": "{:.2f}"}), 
                     use_container_width=True, hide_index=True)
-    else:
-        st.write("No disponible.")
 
     st.divider()
     st.markdown("### 📉 Últimos 5 partidos")
@@ -1178,7 +1075,6 @@ with t2:
     with col_analisis:
         st.markdown("### 🏦 Comparador Inteligente")
 
-        # Cargar odds del escáner si están disponibles
         def_oh, def_od, def_oa = st.session_state.odds_inputs["oh"], st.session_state.odds_inputs["od"], st.session_state.odds_inputs["oa"]
         def_o25, def_btts = st.session_state.odds_inputs["o_o25"], st.session_state.odds_inputs["o_btts"]
         
@@ -1201,9 +1097,6 @@ with t2:
                         st.success(f"✅ Odds cargadas del escáner: H={oh2:.2f} D={od2:.2f} A={oa2:.2f}")
                         break
 
-        if not found_in_storage:
-            st.info("ℹ️ Usando odds por defecto")
-
         co1, co2, co3 = st.columns(3)
         oh = co1.number_input("Cuota Local", 1.01, 100.0, float(def_oh), step=0.05)
         od = co2.number_input("Cuota Empate", 1.01, 100.0, float(def_od), step=0.05)
@@ -1219,8 +1112,7 @@ with t2:
             "o_o25": float(odd_o25), "o_btts": float(odd_btts)
         }
 
-        st.markdown("#### 🧠 Análisis de Valor")
-        # Calcular valores esperados
+        # Calcular valor
         ev_h = (ph * oh) - 1
         ev_d = (pd_prob * od) - 1
         ev_a = (pa * oa) - 1
@@ -1235,7 +1127,6 @@ with t2:
             "BTTS Sí": ev_btts
         }
         
-        # Mostrar tabla de EVs
         ev_df = pd.DataFrame(list(ev_data.items()), columns=["Mercado", "Value"])
         ev_df["Value %"] = ev_df["Value"] * 100
         ev_df["Recomendación"] = ev_df["Value"].apply(
@@ -1245,49 +1136,15 @@ with t2:
         st.dataframe(ev_df.style.format({"Value": "{:.3f}", "Value %": "{:.1f}%"}), 
                     use_container_width=True, hide_index=True)
 
-        # Kelly
-        st.markdown("#### 🎯 Kelly Criterion")
-        best_ev_market = max(ev_data, key=ev_data.get)
-        best_ev_value = ev_data[best_ev_market]
-        
-        if best_ev_value > 0:
-            if "Gana" in best_ev_market:
-                if home in best_ev_market:
-                    k_prob, k_odd = ph, oh
-                else:
-                    k_prob, k_odd = pa, oa
-            elif "Empate" in best_ev_market:
-                k_prob, k_odd = pd_prob, od
-            elif "Over 2.5" in best_ev_market:
-                k_prob, k_odd = po25, odd_o25
-            else:  # BTTS
-                k_prob, k_odd = pbtts, odd_btts
-            
-            k_pct = calculate_kelly(k_prob, k_odd, bank, kelly_fraction)
-            k_stake = (k_pct / 100) * bank
-            
-            st.success(f"""
-            **💎 Recomendación Kelly:** {best_ev_market}
-            - **Value:** {best_ev_value*100:.1f}%
-            - **Stake:** ${k_stake:.2f} ({k_pct:.2f}% del bank)
-            - **Retorno esperado:** ${k_stake * best_ev_value:.2f}
-            """)
-        else:
-            st.warning("📉 **No hay valor positivo identificado** - Kelly sugiere NO apostar")
-
         st.divider()
         st.markdown("### ➕ Agregar al Ticket")
         with st.form("add_to_ticket"):
             sel_pick_options = [
-                f"Gana {home}", 
-                "Empate", 
-                f"Gana {away}",
-                "Over 2.5 Goles",
-                "BTTS (Ambos Anotan)"
+                f"Gana {home}", "Empate", f"Gana {away}",
+                "Over 2.5 Goles", "BTTS (Ambos Anotan)"
             ]
             sel_pick = st.selectbox("Selección", sel_pick_options)
             
-            # Asignar cuota y probabilidad
             if f"Gana {home}" in sel_pick: 
                 sel_odd, sel_prob = oh, ph
             elif "Empate" in sel_pick: 
@@ -1361,19 +1218,8 @@ with t2:
 
             st.divider()
             st.metric("Cuota Total", f"{total_odd:.2f}")
-            st.metric("Probabilidad Total", f"{total_prob*100:.1f}%")
             st.metric("Stake Total", f"${total_stake:.2f}")
             
-            # Calcular retornos esperados
-            win_amount = (total_stake * total_odd) - total_stake
-            expected_value = total_stake * (total_ev / len(st.session_state.ticket) if st.session_state.ticket else 0)
-            
-            col_ret1, col_ret2 = st.columns(2)
-            with col_ret1:
-                st.metric("Ganancia potencial", f"${win_amount:.2f}")
-            with col_ret2:
-                st.metric("Value esperado", f"${expected_value:.2f}")
-
             if st.button("💾 Guardar Apuesta"):
                 tipo_str = "Simple" if len(st.session_state.ticket) == 1 else "Parlay"
                 match_str = st.session_state.ticket[0]["match"] if len(st.session_state.ticket) == 1 else f"Combinada ({len(st.session_state.ticket)})"
@@ -1402,13 +1248,10 @@ with t3:
     db = manage_bets("load")
     
     if not db.empty:
-        # Resumen general
-        st.markdown("#### 📊 Resumen General")
         total_bets = len(db)
         completed_bets = db[db["Estado"].isin(["Ganada", "Perdida", "Push"])]
-        pending_bets = db[db["Estado"] == "Pendiente"]
         
-        col_sum1, col_sum2, col_sum3, col_sum4 = st.columns(4)
+        col_sum1, col_sum2, col_sum3 = st.columns(3)
         with col_sum1:
             st.metric("Total Apuestas", total_bets)
         with col_sum2:
@@ -1420,85 +1263,50 @@ with t3:
         with col_sum3:
             total_profit = completed_bets["Ganancia"].sum()
             st.metric("Profit Total", f"${total_profit:.2f}")
-        with col_sum4:
-            if len(pending_bets) > 0:
-                st.metric("Pendientes", len(pending_bets))
-            else:
-                st.metric("Pendientes", 0)
 
-        # Tabla principal
         st.divider()
-        st.markdown("#### 📋 Detalle de Apuestas")
-        db_display = db.copy()
-        db_display["Ganancia"] = db_display["Ganancia"].apply(lambda x: f"${x:.2f}")
-        db_display["Cuota"] = db_display["Cuota"].apply(lambda x: f"{x:.2f}")
+        st.markdown("#### 📋 Detalle")
         
-        # Color según estado
         def color_state(val):
-            if val == "Ganada":
-                return "background-color: #d4edda; color: #155724;"
-            elif val == "Perdida":
-                return "background-color: #f8d7da; color: #721c24;"
-            elif val == "Pendiente":
-                return "background-color: #fff3cd; color: #856404;"
-            else:
-                return ""
+            if val == "Ganada": return "background-color: #d4edda; color: #155724;"
+            elif val == "Perdida": return "background-color: #f8d7da; color: #721c24;"
+            elif val == "Pendiente": return "background-color: #fff3cd; color: #856404;"
+            else: return ""
         
-        st.dataframe(
-            db_display.style.applymap(color_state, subset=["Estado"]),
-            use_container_width=True,
-            hide_index=True
-        )
+        st.dataframe(db.style.applymap(color_state, subset=["Estado"]), use_container_width=True, hide_index=True)
         
         st.divider()
-        st.markdown("### 🛠️ Administrar Apuestas")
+        st.markdown("### 🛠️ Editar Estado")
         
-        # Crear lista de opciones legibles
         db["Display"] = db.apply(lambda x: f"{x['ID']} | {x['Fecha']} | {x['Partido']} | {x['Pick']}", axis=1)
-        opciones_apuestas = db["Display"].tolist()
-        seleccion_str = st.selectbox("Selecciona la apuesta a editar:", ["-- Seleccionar --"] + opciones_apuestas)
+        seleccion_str = st.selectbox("Selecciona apuesta:", ["-- Seleccionar --"] + db["Display"].tolist())
         
         if seleccion_str != "-- Seleccionar --":
             bet_id = seleccion_str.split(" | ")[0]
             fila = db[db["ID"].astype(str) == bet_id].iloc[0]
             
-            st.info(f"**Seleccionado:** {fila['Partido']} - {fila['Pick']} (Cuota: {fila['Cuota']}, Stake: ${fila['Stake']})")
-            
             col_edit1, col_edit2 = st.columns(2)
-            
             with col_edit1:
-                nuevo_estado = st.selectbox(
-                    "Actualizar Estado:", 
-                    ["Pendiente", "Ganada", "Perdida", "Push"],
-                    index=["Pendiente", "Ganada", "Perdida", "Push"].index(fila["Estado"]) if fila["Estado"] in ["Pendiente", "Ganada", "Perdida", "Push"] else 0
-                )
-                if st.button("💾 Actualizar Estado"):
+                nuevo_estado = st.selectbox("Actualizar Estado:", ["Pendiente", "Ganada", "Perdida", "Push"])
+                if st.button("💾 Actualizar"):
                     manage_bets("update", id_bet=bet_id, status=nuevo_estado)
-                    st.success(f"Apuesta {bet_id} actualizada a {nuevo_estado}.")
                     st.rerun()
-            
             with col_edit2:
-                st.markdown("**Zona de peligro**")
-                if st.button("🗑️ Eliminar definitivamente", type="primary"):
+                if st.button("🗑️ Eliminar"):
                     manage_bets("delete", id_bet=bet_id)
-                    st.warning(f"Apuesta {bet_id} eliminada.")
                     st.rerun()
 
     else:
-        st.warning("Aún no hay historial de apuestas.")
+        st.warning("Aún no hay historial.")
 
-# --- TAB 4: ESCÁNER + JORNADA ML ---
+# --- TAB 4: ESCÁNER ---
 with t4:
     st.markdown("## 💎 Escáner Seguro")
 
     api_league_map = {
-        "SP1": "soccer_spain_la_liga",
-        "E0": "soccer_epl",
-        "I1": "soccer_italy_serie_a",
-        "D1": "soccer_germany_bundesliga",
-        "F1": "soccer_france_ligue_one",
-        "N1": "soccer_netherlands_eredivisie",
-        "P1": "soccer_portugal_primeira_liga",
+        "SP1": "soccer_spain_la_liga", "E0": "soccer_epl", "I1": "soccer_italy_serie_a",
+        "D1": "soccer_germany_bundesliga", "F1": "soccer_france_ligue_one",
+        "N1": "soccer_netherlands_eredivisie", "P1": "soccer_portugal_primeira_liga",
     }
 
     api_key_input = st.text_input("🔑 API Key:", value=st.session_state.api_key, type="password")
@@ -1509,13 +1317,11 @@ with t4:
         sport_key = api_league_map.get(code)
         
         if sport_key:
-            # Controles del escáner
             col_scan1, col_scan2 = st.columns(2)
             with col_scan1:
-                hours_ahead = st.slider("Horas hacia adelante", 1, 168, 72, help="Partidos en las próximas X horas")
+                hours_ahead = st.slider("Horas hacia adelante", 1, 168, 72)
             with col_scan2:
-                min_odds_quality = st.slider("Calidad mínima odds", 1.5, 10.0, 1.8, step=0.1, 
-                                           help="Filtrar odds muy bajas")
+                min_odds_quality = st.slider("Calidad mínima odds", 1.5, 10.0, 1.8)
 
             if st.button("⬇️ Descargar/Actualizar Datos API"):
                 with st.spinner("Conectando a API..."):
@@ -1527,31 +1333,25 @@ with t4:
                         }
                         st.session_state.api_usage["used"] = resp["used"]
                         st.session_state.api_usage["remaining"] = resp["remaining"]
-                        st.success(f"✅ {len(resp['data'])} partidos descargados")
-                        st.info(f"📊 API Usage: {resp['used']} usadas, {resp['remaining']} restantes")
                         st.rerun()
                     else:
                         st.error(f"Error API: {resp.get('message', 'Unknown error')}")
 
-            # Mostrar datos almacenados
             if code in st.session_state.market_storage:
                 stored = st.session_state.market_storage[code]
                 data_to_display = stored.get("data", [])
                 st.info(f"📂 Datos en memoria ({len(data_to_display)} partidos). Actualizado: {stored['timestamp'].strftime('%H:%M:%S')}")
                 
                 if data_to_display:
-                    # Análisis Dixon-Coles de partidos próximos
                     now_utc = pd.Timestamp.now(tz="UTC")
                     live_rows = []
                     
                     for item in data_to_display:
                         match_date = pd.to_datetime(item.get("commence_time"), utc=True, errors="coerce")
-                        if pd.isna(match_date):
-                            continue
+                        if pd.isna(match_date): continue
                         
                         diff_hours = (match_date - now_utc).total_seconds() / 3600
-                        if diff_hours > hours_ahead or diff_hours < -2:
-                            continue
+                        if diff_hours > hours_ahead or diff_hours < -2: continue
 
                         h_api = normalize_name(item.get("home_team", ""))
                         a_api = normalize_name(item.get("away_team", ""))
@@ -1559,29 +1359,18 @@ with t4:
                         m_h = get_close_matches(h_api, teams, n=1, cutoff=0.7)
                         m_a = get_close_matches(a_api, teams, n=1, cutoff=0.7)
 
-                        if not m_h or not m_a:
-                            continue
+                        if not m_h or not m_a: continue
+                        h, a = m_h[0], m_a[0]
                         
-                        h = m_h[0]
-                        a = m_a[0]
-                        
-                        if h not in stats or a not in stats:
-                            continue
+                        if h not in stats or a not in stats: continue
 
                         oh2, od2, oa2 = match_odds_from_scanner_item(item)
-                        if np.isnan(oh2) or np.isnan(od2) or np.isnan(oa2):
-                            continue
-                        
-                        # Filtrar por calidad de odds
-                        if min(oh2, od2, oa2) < min_odds_quality:
-                            continue
+                        if np.isnan(oh2) or min(oh2, od2, oa2) < min_odds_quality: continue
 
-                        # Predicción Dixon-Coles
                         h_exp_dc, a_exp_dc, ph2, pd2, pa2, po15_2, po25_2, pbtts_2, _, _ = predict_match_dixon_coles(
                             h, a, stats, ah, aa, rho=st.session_state.model_params["rho"]
                         )
 
-                        # Calcular Value
                         ev_h = (ph2 * oh2) - 1
                         ev_d = (pd2 * od2) - 1
                         ev_a = (pa2 * oa2) - 1
@@ -1591,217 +1380,64 @@ with t4:
                         ev_value = 0.0
                         
                         if best_ev > 0.05:
-                            if best_ev == ev_h:
-                                pick = f"Gana {h}"
-                                ev_value = ev_h
-                            elif best_ev == ev_d:
-                                pick = "Empate"
-                                ev_value = ev_d
-                            else:
-                                pick = f"Gana {a}"
-                                ev_value = ev_a
+                            if best_ev == ev_h: pick, ev_value = f"Gana {h}", ev_h
+                            elif best_ev == ev_d: pick, ev_value = "Empate", ev_d
+                            else: pick, ev_value = f"Gana {a}", ev_a
 
                         live_rows.append({
                             "Hora (UTC)": match_date.strftime("%d/%m %H:%M"),
                             "Partido": f"{h} vs {a}",
                             "xG": f"{h_exp_dc:.1f}-{a_exp_dc:.1f}",
                             "Cuotas": f"{oh2:.2f}/{od2:.2f}/{oa2:.2f}",
-                            "DC %": f"{ph2*100:.0f}/{pd2*100:.0f}/{pa2*100:.0f}",
-                            "Value": ev_value,  # CORREGIDO: Guardar como número
+                            "Value": ev_value,
                             "Pick": pick,
-                            "O2.5%": f"{po25_2*100:.0f}",
-                            "BTTS%": f"{pbtts_2*100:.0f}"
+                            "O2.5%": f"{po25_2*100:.0f}"
                         })
                     
                     if live_rows:
-                        # CORRECCIÓN: Ordenar por Value numérico
-                        df_live = pd.DataFrame(live_rows)
-                        df_live = df_live.sort_values("Value", ascending=False)
-                        
-                        # Convertir Value a string para display
+                        df_live = pd.DataFrame(live_rows).sort_values("Value", ascending=False)
                         df_live["Value"] = df_live["Value"].apply(lambda x: f"{x*100:.1f}%")
                         
-                        st.markdown(f"### 🎯 Oportunidades ({len(df_live)} partidos) - Ordenado por Value")
-                        
-                        # Color por value
                         def highlight_value(val):
                             try:
-                                value_pct = float(val.strip('%'))
-                                if value_pct > 10:
-                                    return 'background-color: #d4edda; color: #155724; font-weight: bold;'
-                                elif value_pct > 5:
-                                    return 'background-color: #fff3cd; color: #856404;'
-                                else:
-                                    return ''
-                            except:
-                                return ''
+                                if float(val.strip('%')) > 10: return 'background-color: #d4edda; color: #155724; font-weight: bold;'
+                                elif float(val.strip('%')) > 5: return 'background-color: #fff3cd; color: #856404;'
+                                else: return ''
+                            except: return ''
                         
-                        st.dataframe(
-                            df_live.style.applymap(highlight_value, subset=["Value"]),
-                            use_container_width=True,
-                            hide_index=True
-                        )
-                        
-                        # Botón de descarga
-                        csv_live = df_live.to_csv(index=False).encode('utf-8')
-                        st.download_button(
-                            "📥 Descargar oportunidades",
-                            data=csv_live,
-                            file_name=f"oportunidades_{code}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                            mime="text/csv"
-                        )
+                        st.dataframe(df_live.style.applymap(highlight_value, subset=["Value"]), use_container_width=True, hide_index=True)
                     else:
-                        st.info("No se encontraron partidos con valor positivo en el rango de tiempo seleccionado.")
+                        st.info("No se encontraron partidos con valor positivo.")
             else:
-                st.warning("No hay datos descargados para esta liga. Usa el botón 'Descargar/Actualizar' primero.")
-
-        st.divider()
-        st.markdown("## 😁 Jornada ML (desde Escáner)")
-        
-        if code in st.session_state.market_storage and "data" in st.session_state.market_storage[code]:
-            stored = st.session_state.market_storage[code]
-            data_to_display = stored.get("data", [])
-            
-            if data_to_display:
-                st.caption("Entrena un modelo ML con datos históricos y predice todos los partidos de la jornada.")
-                
-                col_jornada1, col_jornada2 = st.columns(2)
-                with col_jornada1:
-                    window_ml_j = st.slider("Ventana entrenamiento", 300, 2000, 600, step=100)
-                with col_jornada2:
-                    min_ev_j = st.slider("EV mínimo para mostrar", 0.0, 0.2, 0.05, step=0.01)
-
-                if st.button("📌 Generar Pronósticos Jornada ML"):
-                    with st.spinner("Entrenando modelo y analizando partidos..."):
-                        snap = train_snapshot_cached(
-                            df, 
-                            window_matches=window_ml_j, 
-                            seed=42,
-                            alpha=st.session_state.model_params["alpha"]
-                        )
-
-                    if snap is None:
-                        st.warning("No se pudo entrenar el modelo (datos insuficientes).")
-                    else:
-                        model, team_stats2, avg_h2, avg_a2 = snap
-                        now_utc = pd.Timestamp.now(tz="UTC")
-                        rows = []
-
-                        for item in data_to_display:
-                            match_date = pd.to_datetime(item.get("commence_time"), utc=True, errors="coerce")
-                            if pd.isna(match_date):
-                                continue
-                            
-                            diff_hours = (match_date - now_utc).total_seconds() / 3600
-                            if diff_hours > 168 or diff_hours < -2:
-                                continue
-
-                            h_api = normalize_name(item.get("home_team", ""))
-                            a_api = normalize_name(item.get("away_team", ""))
-
-                            m_h = get_close_matches(h_api, teams, n=1, cutoff=0.7)
-                            m_a = get_close_matches(a_api, teams, n=1, cutoff=0.7)
-                            
-                            if not m_h or not m_a:
-                                continue
-                            
-                            h = m_h[0]
-                            a = m_a[0]
-                            
-                            if h not in team_stats2 or a not in team_stats2:
-                                continue
-
-                            oh2, od2, oa2 = match_odds_from_scanner_item(item)
-                            if np.isnan(oh2) or np.isnan(od2) or np.isnan(oa2) or oh2 <= 1.01 or od2 <= 1.01 or oa2 <= 1.01:
-                                continue
-
-                            # Predicción ML
-                            p, (ev_h, ev_d, ev_a), pick = predict_ml_for_match(
-                                h, a, float(oh2), float(od2), float(oa2),
-                                model, team_stats2, avg_h2, avg_a2
-                            )
-                            
-                            best_ev = np.nanmax([ev_h, ev_d, ev_a])
-                            if best_ev < min_ev_j:
-                                continue
-
-                            rows.append({
-                                "Hora (UTC)": match_date.strftime("%d/%m %H:%M"),
-                                "Partido": f"{h} vs {a}",
-                                "Cuotas": f"{oh2:.2f}|{od2:.2f}|{oa2:.2f}",
-                                "ML %": f"{p[0]*100:.0f}|{p[1]*100:.0f}|{p[2]*100:.0f}",
-                                "EV_H": ev_h,
-                                "EV_D": ev_d,
-                                "EV_A": ev_a,
-                                "Mejor EV": best_ev,
-                                "Pick": pick,
-                                "Confianza": np.max(p) * 100
-                            })
-
-                        if not rows:
-                            st.info("No se encontraron partidos con valor suficiente.")
-                        else:
-                            out_df = pd.DataFrame(rows).sort_values("Mejor EV", ascending=False).reset_index(drop=True)
-                            st.success(f"✅ Jornada generada: {len(out_df)} partidos con valor")
-                            
-                            # Formatear DataFrame
-                            def color_ev(val):
-                                if val > 0.15:
-                                    return 'background-color: #d4edda; color: #155724; font-weight: bold;'
-                                elif val > 0.05:
-                                    return 'background-color: #fff3cd; color: #856404;'
-                                else:
-                                    return ''
-                            
-                            styled_df = out_df.style.format({
-                                "EV_H": "{:.3f}",
-                                "EV_D": "{:.3f}", 
-                                "EV_A": "{:.3f}",
-                                "Mejor EV": "{:.3f}",
-                                "Confianza": "{:.1f}%"
-                            }).applymap(color_ev, subset=["Mejor EV"])
-                            
-                            st.dataframe(styled_df, use_container_width=True, height=400)
-                            
-                            # Botón de descarga
-                            st.download_button(
-                                "📥 Descargar jornada (CSV)",
-                                data=out_df.to_csv(index=False).encode("utf-8"),
-                                file_name=f"jornada_ml_{code}_{datetime.now().strftime('%Y%m%d')}.csv",
-                                mime="text/csv"
-                            )
-            else:
-                st.info("Primero descarga datos del escáner usando el botón superior.")
-        else:
-            st.warning("No hay datos de escáner disponibles para esta liga.")
+                st.warning("No hay datos descargados.")
     else:
-        st.info("🔑 Ingresa tu API Key de The Odds API para usar el escáner.")
+        st.info("🔑 Ingresa tu API Key para usar el escáner.")
 
-# --- TAB 5: LABORATORIO CON OPTIMIZACIÓN ---
+# --- TAB 5: LABORATORIO CON OPTIMIZACIÓN (CORREGIDO) ---
 with t5:
     st.markdown("## 🧪 Laboratorio - Optimización Avanzada")
     
-    tab_lab1, tab_lab2, tab_lab3 = st.tabs(["🔧 Backtesting", "⚙️ Optimización", "📊 Diagnóstico"])
+    tab_lab1, tab_lab2, tab_lab3 = st.tabs(["🔧 Backtesting", "⚙️ Optimización", "📊 Diagnóstico Real"])
     
     with tab_lab1:
         st.markdown("### 🔧 Backtesting Inteligente")
         
         col1, col2 = st.columns(2)
         with col1:
-            n_test = st.slider("Partidos test", 50, 200, 100, 10)
+            n_test = st.slider("Partidos test", 50, 600, 200, 10)
             min_train = st.slider("Mínimo train", 100, 300, 150, 25)
             stake_unit = st.number_input("Stake unit", 0.5, 5.0, 1.0, 0.5)
         
         with col2:
-            min_ev = st.slider("EV mínimo", 0.05, 0.20, 0.08, 0.01)
-            calibration_factor = st.slider("Factor calibración", 0.70, 1.00, 0.85, 0.05,
-                                         help="<1.0 reduce sobreestimación, >1.0 aumenta confianza")
-            min_diff = st.slider("Diferencia mínima vs mercado", 0.01, 0.10, 0.03, 0.01)
+            min_ev = st.slider("EV mínimo", 0.01, 0.20, 0.08, 0.01)
+            calibration_factor = st.slider("Factor calibración", 0.60, 1.00, 0.85, 0.02,
+                                         help="<1.0 reduce sobreestimación. Si tu ROI es negativo, BAJA esto.")
+            min_diff = st.slider("Diferencia mínima vs mercado", 0.01, 0.10, 0.02, 0.01)
         
         col3, col4 = st.columns(2)
         with col3:
             min_odds = st.number_input("Odds mínima", 1.1, 2.5, 1.5, 0.1)
-            max_odds = st.number_input("Odds máxima", 3.0, 8.0, 5.0, 0.5)
+            max_odds = st.number_input("Odds máxima", 3.0, 10.0, 4.0, 0.5)
         
         with col4:
             st.markdown("#### ⚙️ Parámetros Modelo")
@@ -1822,7 +1458,18 @@ with t5:
                     min_odds=min_odds,
                     max_odds=max_odds
                 )
+                
+                # GUARDAR EN SESSION STATE PARA USAR EN OTRAS TABS
+                st.session_state.backtest_results = {
+                    "df": test_df,
+                    "metrics": (n_bets, correct, profit, roi, avg_odds, avg_ev, tot_stake, distribution)
+                }
             
+        # MOSTRAR RESULTADOS SI EXISTEN EN MEMORIA
+        if st.session_state.backtest_results is not None:
+            test_df = st.session_state.backtest_results["df"]
+            n_bets, correct, profit, roi, avg_odds, avg_ev, tot_stake, distribution = st.session_state.backtest_results["metrics"]
+
             if test_df.empty or n_bets == 0:
                 st.warning("No se encontraron apuestas con los criterios actuales.")
             else:
@@ -1834,8 +1481,7 @@ with t5:
                     st.metric("Apuestas", n_bets)
                 with col_res2:
                     win_rate = (correct / n_bets) * 100
-                    st.metric("Win Rate", f"{win_rate:.1f}%", 
-                             delta=f"{(win_rate - 33.3):+.1f}%" if win_rate != 33.3 else None)
+                    st.metric("Win Rate", f"{win_rate:.1f}%")
                 with col_res3:
                     st.metric("ROI", f"{roi:.2f}%", 
                              delta_color="normal" if roi > 0 else "inverse")
@@ -1854,697 +1500,228 @@ with t5:
                 with col_met4:
                     st.metric("Stake Total", f"{tot_stake:.2f} U")
                 
-                # Distribución de apuestas
                 st.markdown(f"**Distribución:** {distribution}")
                 
-                # Análisis de resultados
-                st.divider()
-                st.markdown("#### 📈 Análisis Detallado")
+                # Gráficos de Equity
+                test_df["Equity"] = test_df["P/L"].cumsum()
+                fig_equity = go.Figure()
+                fig_equity.add_trace(go.Scatter(
+                    x=test_df.index, y=test_df["Equity"],
+                    mode='lines', name='Equity',
+                    line=dict(color='#00ff00' if profit > 0 else '#ff0000', width=2)
+                ))
+                fig_equity.update_layout(title='Curva de Equity', height=300, template="plotly_dark")
+                st.plotly_chart(fig_equity, use_container_width=True)
                 
-                if avg_odds > 3.5:
-                    st.warning("""
-                    **⚠️ ALERTA: Sesgo hacia altas cuotas detectado**
-                    
-                    **Problema:** El modelo está apostando principalmente a underdogs (avg odds = {:.2f}).
-                    Esto es riesgoso porque:
-                    1. Alta varianza en resultados
-                    2. Baja probabilidad de acierto inherente
-                    3. Mayor impacto psicológico en rachas perdedoras
-                    
-                    **Soluciones:**
-                    1. ⬇️ **Reducir max_odds** a 4.0 o menos
-                    2. ⬆️ **Aumentar min_odds** para excluir favoritos extremos
-                    3. 🔄 **Ajustar calibration_factor** hacia 0.75-0.80
-                    """.format(avg_odds))
-                
-                if roi < -5:
-                    st.error("""
-                    **❌ ROI negativo significativo**
-                    
-                    **Posibles causas:**
-                    1. **Sobreestimación sistemática** del modelo
-                    2. **Parámetros subóptimos** para esta liga/temporada
-                    3. **Mercado eficiente** (difícil encontrar valor)
-                    
-                    **Acciones recomendadas:**
-                    1. Usar la pestaña **⚙️ Optimización** para encontrar mejores parámetros
-                    2. Probar con **ventanas más pequeñas** (300 partidos)
-                    3. **Aumentar EV mínimo** a 10-12%
-                    """)
-                
-                # Gráficos
-                if not test_df.empty:
-                    # Distribución de tipos de apuesta
-                    if 'Tipo' in test_df.columns:
-                        tipo_counts = test_df['Tipo'].value_counts()
-                        fig_tipo = go.Figure(data=[go.Pie(
-                            labels=tipo_counts.index,
-                            values=tipo_counts.values,
-                            hole=.3
-                        )])
-                        fig_tipo.update_layout(title="Distribución por Tipo de Apuesta")
-                        st.plotly_chart(fig_tipo, use_container_width=True)
-                    
-                    # Equity curve
-                    test_df["Equity"] = test_df["P/L"].cumsum()
-                    fig_equity = go.Figure()
-                    fig_equity.add_trace(go.Scatter(
-                        x=test_df.index,
-                        y=test_df["Equity"],
-                        mode='lines',
-                        name='Equity',
-                        line=dict(color='#00ff00', width=2)
-                    ))
-                    fig_equity.update_layout(
-                        title='Curva de Equity',
-                        height=400,
-                        template="plotly_dark"
-                    )
-                    st.plotly_chart(fig_equity, use_container_width=True)
-                
-                st.divider()
-                st.markdown("#### 📋 Detalle de Apuestas")
-                st.dataframe(test_df, use_container_width=True, height=300)
-    
+                st.dataframe(test_df[["Fecha", "Partido", "Predicción", "Cuota", "EV", "Res", "P/L"]], use_container_width=True, height=300)
+
     with tab_lab2:
-        st.markdown("### ⚙️ Optimización Automática de Parámetros")
-        st.caption("Busca la mejor combinación de parámetros mediante búsqueda aleatoria")
-        
-        if st.button("🔍 Ejecutar Optimización (Puede tomar 1-2 minutos)"):
-            with st.spinner("Buscando parámetros óptimos..."):
-                best_params, best_results = find_optimal_parameters(df, n_iterations=30)
+        st.markdown("### ⚙️ Optimización Automática")
+        if st.button("🔍 Buscar Parámetros (Aleatorio)"):
+            with st.spinner("Optimizando..."):
+                best_params, best_results = find_optimal_parameters(df, n_iterations=20)
             
             if best_params:
                 roi_opt, n_bets_opt, avg_odds_opt, profit_opt = best_results
-                
-                st.success(f"✅ **Mejores parámetros encontrados (ROI: {roi_opt:.2f}%)**")
-                
-                col_opt1, col_opt2 = st.columns(2)
-                with col_opt1:
-                    st.markdown("#### ⚙️ Parámetros Óptimos")
-                    st.write(f"**Alpha:** {best_params['alpha']:.4f}")
-                    st.write(f"**Ventana:** {best_params['window_matches']} partidos")
-                    st.write(f"**Factor calibración:** {best_params['calibration_factor']:.2f}")
-                
-                with col_opt2:
-                    st.markdown("#### 📊 Resultados")
-                    st.write(f"**ROI:** {roi_opt:.2f}%")
-                    st.write(f"**Apuestas:** {n_bets_opt}")
-                    st.write(f"**Avg Odds:** {avg_odds_opt:.2f}")
-                    st.write(f"**Profit:** {profit_opt:.2f} U")
-                
-                # Botón para aplicar parámetros
-                if st.button("✅ Aplicar estos parámetros"):
-                    st.session_state.model_params.update({
-                        "alpha": float(best_params['alpha']),
-                        "window_matches": int(best_params['window_matches']),
-                        "calibration_factor": float(best_params['calibration_factor'])
-                    })
-                    st.success("Parámetros aplicados correctamente")
-                    st.rerun()
+                st.success(f"✅ Mejor ROI encontrado: {roi_opt:.2f}%")
+                st.json(best_params)
             else:
-                st.warning("No se encontraron parámetros con ROI positivo.")
-    
+                st.warning("No se encontró configuración rentable.")
+
     with tab_lab3:
-        st.markdown("### 📊 Diagnóstico del Modelo")
+        st.markdown("### 📊 Diagnóstico Real del Modelo")
         
-        # Análisis de calibración por rango de odds
-        st.markdown("#### 🔍 Calibración por Rango de Cuotas")
-        
-        # Simular análisis
-        odds_ranges = [
-            {"range": "1.5-2.0", "predicted": 0.55, "actual": 0.52, "n": 15},
-            {"range": "2.0-2.5", "predicted": 0.45, "actual": 0.41, "n": 22},
-            {"range": "2.5-3.0", "predicted": 0.38, "actual": 0.32, "n": 18},
-            {"range": "3.0-4.0", "predicted": 0.32, "actual": 0.26, "n": 25},
-            {"range": "4.0+", "predicted": 0.28, "actual": 0.22, "n": 20}
-        ]
-        
-        calib_df = pd.DataFrame(odds_ranges)
-        calib_df["Sobreestimación"] = calib_df["predicted"] - calib_df["actual"]
-        
-        fig_calib = go.Figure()
-        fig_calib.add_trace(go.Bar(
-            x=calib_df["range"],
-            y=calib_df["Sobreestimación"] * 100,
-            text=calib_df["n"],
-            textposition='auto',
-            marker_color=np.where(calib_df["Sobreestimación"] > 0.05, 'red', 
-                                 np.where(calib_df["Sobreestimación"] > 0.02, 'orange', 'green'))
-        ))
-        fig_calib.update_layout(
-            title='Sobreestimación por Rango de Cuotas',
-            yaxis_title='Sobreestimación (%)',
-            height=400,
-            template="plotly_dark"
-        )
-        st.plotly_chart(fig_calib, use_container_width=True)
-        
-        # Recomendaciones específicas
-        st.markdown("#### 🎯 Recomendaciones Basadas en tu Resultado")
-        
-        st.info("""
-        **Basado en tu resultado (Avg Odds = 4.02, Win Rate = 25.6%):**
-        
-        1. **Problema principal:** El modelo está sobreestimando underdogs
-        2. **Solución inmediata:** Reducir calibration_factor a 0.75-0.80
-        3. **Ajustar límites de odds:** max_odds = 4.0, min_odds = 1.8
-        4. **Incrementar EV mínimo:** 10-12% para mayor calidad
-        
-        **Configuración recomendada para empezar:**
-        - Alpha: 0.010
-        - Ventana: 400 partidos
-        - Calibration_factor: 0.78
-        - EV mínimo: 0.10
-        - Odds mín: 1.8, Odds máx: 4.0
-        """)
+        if st.session_state.backtest_results is None or st.session_state.backtest_results["df"].empty:
+            st.info("⚠️ Ejecuta el Backtesting en la primera pestaña para ver el diagnóstico.")
+        else:
+            df_diag = st.session_state.backtest_results["df"].copy()
+            
+            # Verificar que tengamos las columnas necesarias
+            if "Prob_Modelo" not in df_diag.columns:
+                st.error("Faltan datos numéricos. Asegúrate de haber actualizado la función 'run_backtest_calibrated' como se indicó.")
+            else:
+                # 1. Crear rangos de cuotas (Bins)
+                bins = [1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 10.0]
+                labels = ['1.0-1.5', '1.5-2.0', '2.0-2.5', '2.5-3.0', '3.0-4.0', '4.0+']
+                df_diag['Odds_Range'] = pd.cut(df_diag['Odds_Num'], bins=bins, labels=labels)
+                
+                # 2. Calcular Win Rate Real vs Esperado
+                calibration = df_diag.groupby('Odds_Range', observed=True).agg({
+                    'Resultado_Num': ['count', 'mean'],  # mean = win rate real
+                    'Prob_Modelo': 'mean'               # mean = win rate esperado
+                }).reset_index()
+                
+                # Aplanar columnas
+                calibration.columns = ['Rango', 'Apuestas', 'WinRate_Real', 'WinRate_Predicho']
+                calibration['Diferencia'] = calibration['WinRate_Predicho'] - calibration['WinRate_Real']
+                
+                # 3. Visualización
+                c_d1, c_d2 = st.columns([2, 1])
+                
+                with c_d1:
+                    fig_calib = go.Figure()
+                    # Barra Realidad
+                    fig_calib.add_trace(go.Bar(
+                        x=calibration['Rango'], y=calibration['WinRate_Real'],
+                        name='Realidad (Win %)', marker_color='#00CC96'
+                    ))
+                    # Línea Modelo
+                    fig_calib.add_trace(go.Scatter(
+                        x=calibration['Rango'], y=calibration['WinRate_Predicho'],
+                        name='Modelo (Prob %)', line=dict(color='#EF553B', width=3, dash='dot')
+                    ))
+                    fig_calib.update_layout(title='Calibración: Realidad vs Expectativa', barmode='group', template="plotly_dark")
+                    st.plotly_chart(fig_calib, use_container_width=True)
+                
+                with c_d2:
+                    st.markdown("#### 📉 Tabla de Error")
+                    st.dataframe(calibration.style.format({
+                        "WinRate_Real": "{:.1%}",
+                        "WinRate_Predicho": "{:.1%}",
+                        "Diferencia": "{:+.1%}"
+                    }), use_container_width=True)
+                    
+                    # Diagnóstico automático
+                    total_diff = calibration['Diferencia'].mean()
+                    if total_diff > 0.05:
+                        st.error(f"🚨 **SOBREESTIMACIÓN SEVERA ({total_diff:+.1%})**")
+                        st.markdown(f"El modelo es demasiado optimista. **Baja el 'Factor Calibración' a {calibration_factor - total_diff:.2f}**")
+                    elif total_diff > 0:
+                        st.warning(f"⚠️ Sobreestimación leve ({total_diff:+.1%})")
+                    else:
+                        st.success("✅ El modelo está bien calibrado o es conservador.")
+
 # --- TAB 6: RENDIMIENTO ---
 with t6:
     st.markdown("## 📈 Rendimiento - Risk Management")
-    
     if os.path.exists(CSV_FILE):
         df_hist = pd.read_csv(CSV_FILE)
         df_finished = df_hist[df_hist["Estado"].isin(["Ganada", "Perdida", "Push"])].copy()
         
-        if df_finished.empty:
-            st.info("No hay apuestas finalizadas para analizar.")
-        else:
-            # Ordenar por fecha
+        if not df_finished.empty:
             df_finished = df_finished.sort_values("Fecha")
             df_finished["Fecha_dt"] = pd.to_datetime(df_finished["Fecha"])
             
-            # Cálculos básicos
             tot_inv = df_finished["Stake"].sum()
             tot_prof = df_finished["Ganancia"].sum()
             roi = (tot_prof / tot_inv * 100) if tot_inv > 0 else 0
             
-            # Equity curve
             df_finished["Equity"] = df_finished["Ganancia"].cumsum()
-            df_finished["Peak"] = df_finished["Equity"].cummax()
-            df_finished["Drawdown"] = df_finished["Equity"] - df_finished["Peak"]
-            max_dd = df_finished["Drawdown"].min()
-            max_dd_pct = (max_dd / df_finished["Peak"].max() * 100) if df_finished["Peak"].max() > 0 else 0
+            df_finished["Drawdown"] = df_finished["Equity"] - df_finished["Equity"].cummax()
             
-            # Métricas
-            wins = len(df_finished[df_finished["Ganancia"] > 0])
-            losses = len(df_finished[df_finished["Ganancia"] < 0])
-            pushes = len(df_finished[df_finished["Ganancia"] == 0])
+            st.metric("Beneficio Neto", f"${tot_prof:,.2f}", f"{roi:.1f}% ROI")
             
-            avg_win = df_finished[df_finished["Ganancia"] > 0]["Ganancia"].mean() if wins > 0 else 0
-            avg_loss = df_finished[df_finished["Ganancia"] < 0]["Ganancia"].mean() if losses > 0 else 0
-            win_rate = (wins / len(df_finished)) * 100 if len(df_finished) > 0 else 0
+            fig_eq = go.Figure()
+            fig_eq.add_trace(go.Scatter(x=df_finished["Fecha_dt"], y=df_finished["Equity"], mode='lines', name='Equity', line=dict(color='#00ff00')))
+            fig_eq.update_layout(title='Curva de Equity', height=400, template="plotly_dark")
+            st.plotly_chart(fig_eq, use_container_width=True)
             
-            # Profit Factor
-            gross_profit = df_finished[df_finished["Ganancia"] > 0]["Ganancia"].sum()
-            gross_loss = abs(df_finished[df_finished["Ganancia"] < 0]["Ganancia"].sum())
-            profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
-            
-            # Sharpe-like ratio (simplificado)
-            returns_std = df_finished["Ganancia"].std()
-            sharpe_ratio = (df_finished["Ganancia"].mean() / returns_std) if returns_std > 0 else 0
-            
-            st.markdown("### 📊 Métricas de Desempeño")
-            
-            # Primera fila de métricas
-            col_met1, col_met2, col_met3, col_met4 = st.columns(4)
-            with col_met1:
-                st.metric("Beneficio Neto", f"${tot_prof:,.2f}", f"{roi:.1f}% ROI")
-            with col_met2:
-                st.metric("Win Rate", f"{win_rate:.1f}%", f"{wins}-{losses}-{pushes}")
-            with col_met3:
-                st.metric("Profit Factor", f"{profit_factor:.2f}")
-            with col_met4:
-                st.metric("Max Drawdown", f"${max_dd:,.2f}", f"{max_dd_pct:.1f}%")
-            
-            # Segunda fila
-            col_met5, col_met6, col_met7, col_met8 = st.columns(4)
-            with col_met5:
-                st.metric("Apuestas", len(df_finished))
-            with col_met6:
-                st.metric("Avg Win", f"${avg_win:.2f}")
-            with col_met7:
-                st.metric("Avg Loss", f"${avg_loss:.2f}")
-            with col_met8:
-                st.metric("Sharpe Ratio", f"{sharpe_ratio:.2f}")
-            
-            st.divider()
-            
-            # Gráficos
-            col_chart1, col_chart2 = st.columns(2)
-            
-            with col_chart1:
-                # Equity curve
-                fig_eq = go.Figure()
-                fig_eq.add_trace(go.Scatter(
-                    x=df_finished["Fecha_dt"],
-                    y=df_finished["Equity"],
-                    mode='lines',
-                    name='Equity',
-                    line=dict(color='#00ff00', width=2)
-                ))
-                fig_eq.add_trace(go.Scatter(
-                    x=df_finished["Fecha_dt"],
-                    y=df_finished["Peak"],
-                    mode='lines',
-                    name='Peak',
-                    line=dict(color='#ff9900', width=1, dash='dash')
-                ))
-                fig_eq.update_layout(
-                    title='Curva de Equity',
-                    xaxis_title='Fecha',
-                    yaxis_title='Equity ($)',
-                    height=400,
-                    template="plotly_dark",
-                    showlegend=True
-                )
-                st.plotly_chart(fig_eq, use_container_width=True)
-            
-            with col_chart2:
-                # Drawdown
-                fig_dd = go.Figure()
-                fig_dd.add_trace(go.Bar(
-                    x=df_finished["Fecha_dt"],
-                    y=df_finished["Drawdown"],
-                    name='Drawdown',
-                    marker_color='#ff4444'
-                ))
-                fig_dd.update_layout(
-                    title='Drawdown',
-                    xaxis_title='Fecha',
-                    yaxis_title='Drawdown ($)',
-                    height=400,
-                    template="plotly_dark"
-                )
-                st.plotly_chart(fig_dd, use_container_width=True)
-            
-            st.divider()
-            st.markdown("#### 📋 Historial Detallado")
             st.dataframe(df_finished, use_container_width=True)
+        else:
+            st.info("No hay apuestas finalizadas.")
     else:
-        st.info("Aún no hay historial de apuestas guardado.")
+        st.info("Aún no hay historial.")
 
 # --- TAB 7: ML EVALUATION ---
 with t7:
     st.markdown("## 🤖 ML 1X2: Ensemble Avanzado")
-    
-    if HAS_XGB:
-        st.success("✅ XGBoost disponible - Usando modelo optimizado")
-    else:
-        st.warning("⚠️ XGBoost no instalado - Usando RandomForest (instala xgboost para mejor rendimiento)")
-    
-    st.markdown("### ⚠️ Importante sobre evaluación ML")
-    st.warning("""
-    **fast_eval_ml()** tiene potential data leakage (usa team_stats calculados una sola vez).  
-    **Solo úsalo para diagnóstico rápido.**  
-    
-    Para métricas reales, usa **strict_walkforward_eval_ml_blocks()** que reentrena en cada bloque.
-    """)
-    
-    st.markdown("### 📊 Evaluación del Modelo")
+    if not HAS_XGB: st.warning("⚠️ XGBoost no instalado. Usando RandomForest.")
     
     col_eval1, col_eval2, col_eval3 = st.columns(3)
-    with col_eval1:
-        n_test_ml = st.slider("Partidos test", 50, 500, 200, step=25)
-    with col_eval2:
-        min_train_ml = st.slider("Mínimo train", 200, 1000, 300, step=50)
-    with col_eval3:
-        window_ml = st.slider("Ventana train", 300, 1500, 600, step=100)
+    with col_eval1: n_test_ml = st.slider("Partidos test", 50, 500, 200)
+    with col_eval2: min_train_ml = st.slider("Mínimo train", 200, 1000, 300)
+    with col_eval3: window_ml = st.slider("Ventana train", 300, 1500, 600)
     
-    eval_mode = st.radio(
-        "Modo de evaluación",
-        ["⚡ Rápido (1 train + test final)", "🧪 Estricto (walk-forward por bloques)"],
-        horizontal=True,
-        index=0
-    )
+    eval_mode = st.radio("Modo", ["⚡ Rápido", "🧪 Estricto"])
     
-    if eval_mode == "🧪 Estricto (walk-forward por bloques)":
-        col_strict1, col_strict2 = st.columns(2)
-        with col_strict1:
-            retrain_every = st.slider("Re-entrenar cada K partidos", 1, 50, 10, step=1)
-        with col_strict2:
-            train_step = st.slider("Submuestreo train", 1, 5, 2, step=1)
-    
-    if st.button("▶️ Evaluar Modelo ML"):
-        # Mostrar ambas evaluaciones pero con advertencias claras
-        col_eval_fast, col_eval_strict = st.columns(2)
-        
-        with col_eval_fast:
-            st.markdown("#### ⚡ Rápido (Diagnóstico)")
-            with st.spinner("Evaluación rápida..."):
-                out_fast = fast_eval_ml(
-                    df, 
-                    n_test=n_test_ml, 
-                    min_train=min_train_ml, 
-                    window_matches=window_ml,
-                    alpha=st.session_state.model_params["alpha"],
-                    rho=st.session_state.model_params["rho"]
-                )
+    if st.button("▶️ Evaluar"):
+        with st.spinner("Evaluando..."):
+            if eval_mode == "⚡ Rápido":
+                out = fast_eval_ml(df, n_test_ml, min_train_ml, window_ml, st.session_state.model_params["alpha"], st.session_state.model_params["rho"])
+            else:
+                out = strict_walkforward_eval_ml_blocks(df, n_test_ml, min_train_ml, window_ml, alpha=st.session_state.model_params["alpha"], rho=st.session_state.model_params["rho"])
             
-            if out_fast:
-                st.metric("LogLoss (fast)", f"{out_fast['logloss']:.4f}")
-                st.metric("Accuracy (fast)", f"{out_fast.get('accuracy', 0)*100:.1f}%")
-                st.caption("⚠️ Puede estar optimista por data leakage")
-        
-        with col_eval_strict:
-            st.markdown("#### 🧪 Estricto (Métrica real)")
-            with st.spinner("Evaluación walkforward..."):
-                if eval_mode == "⚡ Rápido (1 train + test final)":
-                    # Usar parámetros por defecto para evaluación estricta
-                    out_strict = strict_walkforward_eval_ml_blocks(
-                        df, 
-                        n_test=n_test_ml, 
-                        min_train=min_train_ml, 
-                        window_matches=window_ml,
-                        retrain_every=10,
-                        train_step=2,
-                        alpha=st.session_state.model_params["alpha"],
-                        rho=st.session_state.model_params["rho"]
-                    )
-                else:
-                    out_strict = strict_walkforward_eval_ml_blocks(
-                        df, 
-                        n_test=n_test_ml, 
-                        min_train=min_train_ml, 
-                        window_matches=window_ml,
-                        retrain_every=retrain_every,
-                        train_step=train_step,
-                        alpha=st.session_state.model_params["alpha"],
-                        rho=st.session_state.model_params["rho"]
-                    )
-            
-            if out_strict:
-                st.metric("LogLoss (strict)", f"{out_strict['logloss']:.4f}")
-                st.metric("Accuracy (strict)", f"{out_strict.get('accuracy', 0)*100:.1f}%")
-                st.caption("✅ Métrica real sin data leakage")
+            if out:
+                c1, c2, c3 = st.columns(3)
+                c1.metric("LogLoss", f"{out['logloss']:.4f}")
+                c2.metric("Accuracy", f"{out['accuracy']*100:.1f}%")
+                c3.metric("N", out['n'])
     
     st.divider()
-    st.markdown("### 🎯 Predicción ML para Partido Actual")
-    
-    # Usar odds actuales
-    oh = st.session_state.odds_inputs["oh"]
-    od = st.session_state.odds_inputs["od"]
-    oa = st.session_state.odds_inputs["oa"]
-    
-    st.info(f"Usando odds actuales: H={oh:.2f} D={od:.2f} A={oa:.2f}")
-    
-    if st.button("🧠 Predecir con ML Ensemble"):
-        with st.spinner("Entrenando snapshot y prediciendo..."):
-            snap = train_snapshot_cached(
-                df, 
-                window_matches=window_ml, 
-                seed=42,
-                alpha=st.session_state.model_params["alpha"]
-            )
-        
-        if snap is None:
-            st.warning("No se pudo entrenar el modelo.")
-        else:
-            model, team_stats2, avg_h2, avg_a2 = snap
+    if st.button("🧠 Predecir Partido Actual con ML"):
+        snap = train_snapshot_cached(df, window_ml, alpha=st.session_state.model_params["alpha"])
+        if snap:
+            model, ts, ah2, aa2 = snap
+            oh, od, oa = st.session_state.odds_inputs["oh"], st.session_state.odds_inputs["od"], st.session_state.odds_inputs["oa"]
+            p, _, pick = predict_ml_for_match(home, away, oh, od, oa, model, ts, ah2, aa2)
             
-            if home not in team_stats2 or away not in team_stats2:
-                st.warning("Equipos no encontrados en el histórico.")
-            else:
-                # Construir features
-                row_now = {
-                    "home": home, "away": away, 
-                    "odd_h": oh, "odd_d": od, "odd_a": oa, 
-                    "sot_h": 0.0, "sot_a": 0.0
-                }
-                x_now = build_features_for_match(row_now, team_stats2, avg_h2, avg_a2).reshape(1, -1)
-                
-                # Predecir
-                p = model.predict_proba(x_now)[0]
-                
-                # Calcular EVs
-                ev_h = (p[0] * oh) - 1
-                ev_d = (p[1] * od) - 1
-                ev_a = (p[2] * oa) - 1
-                
-                st.markdown("#### 📊 Probabilidades por Modelo")
-                
-                # Comparativa entre modelos
-                comp_data = {
-                    "Modelo": ["Mercado (sin margen)", "Dixon-Coles", "ML Ensemble"],
-                    f"Gana {home}": [odds_to_probs(oh, od, oa)[0], ph, p[0]],
-                    "Empate": [odds_to_probs(oh, od, oa)[1], pd_prob, p[1]],
-                    f"Gana {away}": [odds_to_probs(oh, od, oa)[2], pa, p[2]]
-                }
-                
-                comp_df = pd.DataFrame(comp_data)
-                st.dataframe(
-                    comp_df.style.format({
-                        f"Gana {home}": "{:.3f}",
-                        "Empate": "{:.3f}",
-                        f"Gana {away}": "{:.3f}"
-                    }),
-                    use_container_width=True,
-                    hide_index=True
-                )
-                
-                # Recomendación
-                best_model_ev = max(ev_h, ev_d, ev_a)
-                if best_model_ev > 0:
-                    if best_model_ev == ev_h:
-                        rec = f"✅ Gana {home} (EV: {ev_h*100:.1f}%)"
-                    elif best_model_ev == ev_d:
-                        rec = f"✅ Empate (EV: {ev_d*100:.1f}%)"
-                    else:
-                        rec = f"✅ Gana {away} (EV: {ev_a*100:.1f}%)"
-                    st.success(f"**Recomendación ML:** {rec}")
-                else:
-                    st.warning("**Recomendación ML:** No Bet (sin valor positivo)")
-                
-                # Feature Importance si está disponible
-                if hasattr(model, "feature_importances_"):
-                    st.markdown("#### 🔍 Importancia de Variables")
-                    
-                    feature_names = [
-                        "Mkt Home", "Mkt Draw", "Mkt Away",
-                        "DC Home", "DC Draw", "DC Away",
-                        "xG Home", "xG Away", 
-                        "Diff xG",
-                        "SOT Home", "SOT Away",
-                        "log(Matches Home)", "log(Matches Away)",
-                        "DC-Mkt Home", "DC-Mkt Away"
-                    ]
-                    
-                    if len(model.feature_importances_) == len(feature_names):
-                        imp_df = pd.DataFrame({
-                            "Feature": feature_names,
-                            "Importance": model.feature_importances_
-                        }).sort_values("Importance", ascending=True)
-                        
-                        fig_imp = go.Figure(go.Bar(
-                            x=imp_df["Importance"],
-                            y=imp_df["Feature"],
-                            orientation='h',
-                            marker_color='#76b900'
-                        ))
-                        fig_imp.update_layout(
-                            title='Feature Importance',
-                            height=500,
-                            margin=dict(l=0, r=0, t=30, b=0),
-                            template="plotly_dark"
-                        )
-                        st.plotly_chart(fig_imp, use_container_width=True)
+            st.success(f"Predicción ML: {pick}")
+            st.write(f"Probabilidades: Local {p[0]:.2f} | Empate {p[1]:.2f} | Visita {p[2]:.2f}")
 
 # --- TAB 8: MULTI-LIGA ---
 with t8:
     st.markdown("## 🌎 Super Escáner: Todas las Ligas")
-    st.caption("Analiza simultáneamente las 7 ligas principales usando datos del escáner.")
-    
     if not st.session_state.api_key:
-        st.warning("🔑 Necesitas una API Key para usar el escáner multi-liga.")
+        st.warning("Requieres API Key.")
     else:
-        # Configuración multi-liga
-        col_multi1, col_multi2 = st.columns(2)
-        with col_multi1:
-            win_multi = st.slider("Ventana entrenamiento", 300, 2000, 600, step=100)
-        with col_multi2:
-            min_ev_multi = st.slider("EV mínimo", 0.0, 0.2, 0.07, step=0.01)
+        win_multi = st.slider("Ventana entrenamiento", 300, 2000, 600)
+        min_ev_multi = st.slider("EV mínimo", 0.0, 0.2, 0.07)
         
-        # Selección de ligas
-        st.markdown("### ⚽ Ligas a Analizar")
         selected_leagues = []
         cols_leagues = st.columns(4)
-        
-        league_names = list(leagues.values())
-        league_codes = list(leagues.keys())
-        
-        for idx, (code_l, name_l) in enumerate(zip(league_codes, league_names)):
-            col_idx = idx % 4
-            with cols_leagues[col_idx]:
+        for idx, (code_l, name_l) in enumerate(leagues.items()):
+            with cols_leagues[idx % 4]:
                 if st.checkbox(name_l, value=True, key=f"chk_{code_l}"):
                     selected_leagues.append((code_l, name_l))
         
-        if st.button("🚀 Ejecutar Análisis Masivo", type="primary"):
-            if not selected_leagues:
-                st.warning("Selecciona al menos una liga.")
-            else:
-                master_results = []
-                progress_bar = st.progress(0)
-                status_text = st.empty()
+        if st.button("🚀 Ejecutar Análisis Masivo"):
+            master_results = []
+            progress_bar = st.progress(0)
+            
+            for idx, (l_code, l_name) in enumerate(selected_leagues):
+                progress_bar.progress(int(((idx + 1) / len(selected_leagues)) * 100))
                 
-                total_leagues = len(selected_leagues)
+                if l_code not in st.session_state.market_storage: continue
                 
-                for idx, (l_code, l_name) in enumerate(selected_leagues):
-                    progress = int(((idx + 1) / total_leagues) * 100)
-                    progress_bar.progress(progress)
-                    status_text.text(f"Analizando {l_name}...")
-                    
-                    # Verificar si hay datos de esta liga
-                    if l_code not in st.session_state.market_storage:
-                        continue
-                    
-                    stored = st.session_state.market_storage[l_code]
-                    data_api = stored.get("data", [])
-                    if not data_api:
-                        continue
-                    
-                    # Cargar datos históricos
-                    df_loop = fetch_live_soccer_data(
-                        l_code, 
-                        n_seasons=N_SEASONS,
-                        use_only_current=st.session_state.model_params["use_only_current"]
-                    )
-                    
-                    if df_loop.empty or len(df_loop) < 200:
-                        continue
-                    
-                    # Entrenar modelo para esta liga
-                    snap_loop = train_snapshot_cached(
-                        df_loop, 
-                        window_matches=win_multi, 
-                        seed=42,
-                        alpha=st.session_state.model_params["alpha"]
-                    )
-                    
-                    if snap_loop is None:
-                        continue
-                    
-                    model_loop, stats_loop, avgh_loop, avga_loop = snap_loop
-                    
-                    # Analizar partidos
-                    now_utc = pd.Timestamp.now(tz="UTC")
-                    league_rows = []
-                    
-                    for item in data_api:
-                        match_date = pd.to_datetime(item.get("commence_time"), utc=True, errors="coerce")
-                        if pd.isna(match_date):
-                            continue
-                        
-                        diff_hours = (match_date - now_utc).total_seconds() / 3600
-                        if diff_hours > 168 or diff_hours < -2:
-                            continue
+                df_loop = fetch_live_soccer_data(l_code, N_SEASONS, use_only_current)
+                snap_loop = train_snapshot_cached(df_loop, win_multi, alpha=st.session_state.model_params["alpha"])
+                if not snap_loop: continue
+                
+                model_loop, stats_loop, avgh_loop, avga_loop = snap_loop
+                data_api = st.session_state.market_storage[l_code].get("data", [])
+                
+                now_utc = pd.Timestamp.now(tz="UTC")
+                teams_loop = sorted(list(set(df_loop["home"].unique()) | set(df_loop["away"].unique())))
 
-                        h_api = normalize_name(item.get("home_team", ""))
-                        a_api = normalize_name(item.get("away_team", ""))
-                        
-                        teams_loop = sorted(list(set(df_loop["home"].unique()) | set(df_loop["away"].unique())))
-                        
-                        m_h = get_close_matches(h_api, teams_loop, n=1, cutoff=0.7)
-                        m_a = get_close_matches(a_api, teams_loop, n=1, cutoff=0.7)
-                        
-                        if not m_h or not m_a:
-                            continue
-                        
-                        h_team, a_team = m_h[0], m_a[0]
-                        
-                        if h_team not in stats_loop or a_team not in stats_loop:
-                            continue
-
-                        oh2, od2, oa2 = match_odds_from_scanner_item(item)
-                        if np.isnan(oh2) or np.isnan(od2) or np.isnan(oa2) or oh2 <= 1.01:
-                            continue
-
-                        # Predicción ML
-                        p, (ev_h, ev_d, ev_a), pick = predict_ml_for_match(
-                            h_team, a_team, float(oh2), float(od2), float(oa2),
-                            model_loop, stats_loop, avgh_loop, avga_loop
-                        )
-                        
-                        best_ev = np.nanmax([ev_h, ev_d, ev_a])
-                        if best_ev < min_ev_multi:
-                            continue
-
-                        league_rows.append({
-                            "Liga": l_name,
-                            "Fecha": match_date.strftime("%d/%m %H:%M"),
-                            "Partido": f"{h_team} vs {a_team}",
-                            "Cuotas": f"{oh2:.2f}|{od2:.2f}|{oa2:.2f}",
-                            "ML Prob": f"{p[0]*100:.0f}|{p[1]*100:.0f}|{p[2]*100:.0f}",
-                            "EV": best_ev,
-                            "Pick": pick,
-                            "Confianza": f"{np.max(p)*100:.0f}%"
+                for item in data_api:
+                    match_date = pd.to_datetime(item.get("commence_time"), utc=True, errors="coerce")
+                    if pd.isna(match_date) or (match_date - now_utc).total_seconds()/3600 > 168: continue
+                    
+                    h_api, a_api = normalize_name(item.get("home_team", "")), normalize_name(item.get("away_team", ""))
+                    m_h = get_close_matches(h_api, teams_loop, n=1, cutoff=0.7)
+                    m_a = get_close_matches(a_api, teams_loop, n=1, cutoff=0.7)
+                    
+                    if not m_h or not m_a: continue
+                    h_team, a_team = m_h[0], m_a[0]
+                    if h_team not in stats_loop or a_team not in stats_loop: continue
+                    
+                    oh2, od2, oa2 = match_odds_from_scanner_item(item)
+                    if np.isnan(oh2) or oh2 <= 1.01: continue
+                    
+                    p, (ev_h, ev_d, ev_a), pick = predict_ml_for_match(h_team, a_team, oh2, od2, oa2, model_loop, stats_loop, avgh_loop, avga_loop)
+                    best_ev = np.nanmax([ev_h, ev_d, ev_a])
+                    
+                    if best_ev > min_ev_multi:
+                        master_results.append({
+                            "Liga": l_name, "Partido": f"{h_team} vs {a_team}",
+                            "Cuotas": f"{oh2}|{od2}|{oa2}", "EV": best_ev, "Pick": pick
                         })
-                    
-                    if league_rows:
-                        df_res_league = pd.DataFrame(league_rows).sort_values("EV", ascending=False)
-                        master_results.extend(league_rows)
-                        
-                        with st.expander(f"⚽ {l_name} ({len(league_rows)} picks)", expanded=True):
-                            st.dataframe(
-                                df_res_league.style.format({"EV": "{:.3f}"}), 
-                                use_container_width=True, 
-                                hide_index=True
-                            )
-                
-                progress_bar.progress(100)
-                status_text.text("✅ Análisis completo")
-                
-                if master_results:
-                    st.divider()
-                    st.markdown(f"### 📊 Resumen General: {len(master_results)} picks encontrados")
-                    
-                    # Resumen por liga
-                    summary_df = pd.DataFrame(master_results)
-                    if not summary_df.empty:
-                        liga_counts = summary_df["Liga"].value_counts()
-                        st.bar_chart(liga_counts)
-                    
-                    # Tabla consolidada
-                    st.markdown("### 📋 Todos los Picks")
-                    df_master = pd.DataFrame(master_results).sort_values("EV", ascending=False)
-                    
-                    def color_ev_multi(val):
-                        try:
-                            if val > 0.15:
-                                return 'background-color: #d4edda; color: #155724; font-weight: bold;'
-                            elif val > 0.07:
-                                return 'background-color: #fff3cd; color: #856404;'
-                            else:
-                                return ''
-                        except:
-                            return ''
-                    
-                    st.dataframe(
-                        df_master.style.applymap(color_ev_multi, subset=["EV"]),
-                        use_container_width=True,
-                        height=500
-                    )
-                    
-                    # Botón de descarga
-                    st.download_button(
-                        "📥 Descargar CSV Completo",
-                        data=df_master.to_csv(index=False).encode("utf-8"),
-                        file_name=f"super_jornada_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                        mime="text/csv"
-                    )
-                else:
-                    st.info("No se encontraron picks con valor suficiente en las ligas seleccionadas.")
+            
+            if master_results:
+                df_master = pd.DataFrame(master_results).sort_values("EV", ascending=False)
+                st.dataframe(df_master.style.format({"EV": "{:.3f}"}), use_container_width=True)
+            else:
+                st.info("No se encontraron picks.")
 
-# ======================================================
-# 10. FOOTER
-# ======================================================
 st.divider()
-st.markdown("""
-<div style="text-align: center; color: #888; font-size: 0.9em;">
-    <p>🛡️ Dixon-Coles Pro v6.1 • Corregido y optimizado</p>
-    <p>✅ Backtesting corregido: Elegir por máximo EV (no por probabilidad)</p>
-    <p>⚠️ Disclaimer: Las apuestas deportivas conllevan riesgo. Este es un tool de análisis, no garantía de ganancias.</p>
-</div>
-""", unsafe_allow_html=True)
-
-
-
-
+st.markdown("<div style='text-align: center; color: #888;'>🛡️ Dixon-Coles Pro v6.2 • Final</div>", unsafe_allow_html=True)
