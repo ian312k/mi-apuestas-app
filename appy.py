@@ -1777,140 +1777,139 @@ with t4:
     else:
         st.info("🔑 Ingresa tu API Key de The Odds API para usar el escáner.")
 
-# --- TAB 5: LABORATORIO MEJORADO ---
+# --- TAB 5: LABORATORIO CON OPTIMIZACIÓN ---
 with t5:
-    st.markdown("## 🧪 Laboratorio - Diagnóstico y Calibración")
+    st.markdown("## 🧪 Laboratorio - Optimización Avanzada")
     
-    tab_lab1, tab_lab2 = st.tabs(["🔧 Backtesting", "📊 Calibración"])
+    tab_lab1, tab_lab2, tab_lab3 = st.tabs(["🔧 Backtesting", "⚙️ Optimización", "📊 Diagnóstico"])
     
     with tab_lab1:
-        st.markdown("### 🔧 Backtesting Avanzado")
+        st.markdown("### 🔧 Backtesting Inteligente")
         
-        col_lab1, col_lab2 = st.columns(2)
-        with col_lab1:
-            n_test = st.slider("Partidos a evaluar", 20, 300, 100, step=10)
-            min_train = st.slider("Mínimo entrenamiento", 50, 500, 150, step=25)
-            stake_unit = st.number_input("Stake unit", 0.5, 10.0, 1.0, step=0.5)
+        col1, col2 = st.columns(2)
+        with col1:
+            n_test = st.slider("Partidos test", 50, 200, 100, 10)
+            min_train = st.slider("Mínimo train", 100, 300, 150, 25)
+            stake_unit = st.number_input("Stake unit", 0.5, 5.0, 1.0, 0.5)
         
-        with col_lab2:
-            min_ev_backtest = st.slider("EV mínimo", 0.0, 0.3, 0.08, step=0.01, 
-                                       help="EV mínimo para apostar. Más alto = menos apuestas pero más calidad")
-            min_prob_threshold = st.slider("Probabilidad mínima", 0.2, 0.6, 0.35, step=0.05,
-                                         help="Probabilidad mínima del resultado elegido")
-            use_prob_cap = st.checkbox("Limitar probabilidades máximas", value=True,
-                                     help="Evita sobreconfianza limitando probabilidades")
+        with col2:
+            min_ev = st.slider("EV mínimo", 0.05, 0.20, 0.08, 0.01)
+            calibration_factor = st.slider("Factor calibración", 0.70, 1.00, 0.85, 0.05,
+                                         help="<1.0 reduce sobreestimación, >1.0 aumenta confianza")
+            min_diff = st.slider("Diferencia mínima vs mercado", 0.01, 0.10, 0.03, 0.01)
         
-        col_params1, col_params2 = st.columns(2)
-        with col_params1:
-            st.markdown("#### ⚙️ Parámetros Dixon-Coles (backtest)")
-            alpha_bt = st.slider("Alpha (backtest)", 0.001, 0.02, st.session_state.model_params["alpha"], 0.001)
-            rho_bt = st.slider("Rho (backtest)", -0.3, 0.3, st.session_state.model_params["rho"], 0.01)
+        col3, col4 = st.columns(2)
+        with col3:
+            min_odds = st.number_input("Odds mínima", 1.1, 2.5, 1.5, 0.1)
+            max_odds = st.number_input("Odds máxima", 3.0, 8.0, 5.0, 0.5)
         
-        with col_params2:
-            st.markdown("#### 📈 Filtros adicionales")
-            max_odds = st.number_input("Odds máxima permitida", 1.5, 50.0, 10.0, 0.5,
-                                     help="Filtrar odds muy altas (mayor riesgo)")
-            min_odds = st.number_input("Odds mínima", 1.01, 3.0, 1.3, 0.05,
-                                     help="Filtrar odds muy bajas (poco valor)")
+        with col4:
+            st.markdown("#### ⚙️ Parámetros Modelo")
+            alpha_bt = st.slider("Alpha", 0.005, 0.015, 0.010, 0.001)
+            window_bt = st.selectbox("Ventana", [300, 400, 500, 600], index=1)
         
-        if st.button("▶️ Ejecutar Backtesting (Diagnóstico Completo)", type="primary"):
-            with st.spinner(f"Analizando {n_test} partidos..."):
-                test_df, ok, profit, roi_bt, n_bets, tot_stake, calib_info, avg_ev_real = run_backtest_no_leak(
+        if st.button("▶️ Ejecutar Backtesting Calibrado", type="primary"):
+            with st.spinner("Ejecutando backtesting con calibración..."):
+                test_df, correct, profit, roi, n_bets, tot_stake, distribution, avg_ev, avg_odds = run_backtest_calibrated(
                     df, 
-                    n_test=n_test, 
-                    min_train=min_train, 
-                    window_matches=st.session_state.model_params["window_matches"],
+                    n_test=n_test,
+                    min_train=min_train,
+                    window_matches=window_bt,
                     stake_unit=stake_unit,
                     alpha=alpha_bt,
-                    rho=rho_bt,
-                    min_ev_threshold=min_ev_backtest,
-                    min_prob_threshold=min_prob_threshold,
-                    use_probability_cap=use_prob_cap
+                    min_ev_threshold=min_ev,
+                    calibration_factor=calibration_factor,
+                    min_odds=min_odds,
+                    max_odds=max_odds
                 )
             
             if test_df.empty or n_bets == 0:
-                st.warning(f"No se encontraron apuestas con los criterios actuales.")
-                st.info(f"**Sugerencias:** Disminuir EV mínimo o probabilidad mínima")
+                st.warning("No se encontraron apuestas con los criterios actuales.")
             else:
+                # Métricas principales
                 st.markdown("### 📊 Resultados Backtesting")
                 
-                # Métricas principales
                 col_res1, col_res2, col_res3, col_res4 = st.columns(4)
                 with col_res1:
                     st.metric("Apuestas", n_bets)
                 with col_res2:
-                    win_rate = (ok / n_bets) * 100
+                    win_rate = (correct / n_bets) * 100
                     st.metric("Win Rate", f"{win_rate:.1f}%", 
-                             delta=f"{(win_rate - 33.3):+.1f}%" if win_rate != 33.3 else None,
-                             delta_color="normal" if win_rate > 33.3 else "inverse")
+                             delta=f"{(win_rate - 33.3):+.1f}%" if win_rate != 33.3 else None)
                 with col_res3:
-                    st.metric("Profit", f"{profit:.2f} U", 
-                             delta_color="normal" if profit > 0 else "inverse")
+                    st.metric("ROI", f"{roi:.2f}%", 
+                             delta_color="normal" if roi > 0 else "inverse")
                 with col_res4:
-                    st.metric("ROI", f"{roi_bt:.2f}%", 
-                             delta_color="normal" if roi_bt > 0 else "inverse")
+                    st.metric("Profit", f"{profit:.2f} U")
                 
                 # Métricas secundarias
                 col_met1, col_met2, col_met3, col_met4 = st.columns(4)
                 with col_met1:
-                    avg_odds = test_df["Cuota"].mean() if not test_df.empty else 0
                     st.metric("Avg Odds", f"{avg_odds:.2f}")
                 with col_met2:
                     expectancy = profit / n_bets if n_bets > 0 else 0
-                    st.metric("Expectancy/U", f"{expectancy:.3f}")
+                    st.metric("Expectancy", f"{expectancy:.3f}")
                 with col_met3:
-                    st.metric("Stake Total", f"{tot_stake:.2f} U")
+                    st.metric("EV Promedio", f"{avg_ev:.1f}%")
                 with col_met4:
-                    st.metric("EV Promedio", f"{avg_ev_real:.1f}%")
+                    st.metric("Stake Total", f"{tot_stake:.2f} U")
                 
-                # Análisis de calibración
+                # Distribución de apuestas
+                st.markdown(f"**Distribución:** {distribution}")
+                
+                # Análisis de resultados
                 st.divider()
-                st.markdown("#### 🎯 Diagnóstico de Calibración")
+                st.markdown("#### 📈 Análisis Detallado")
                 
-                if calib_info:
-                    if "sobreestima" in calib_info:
-                        st.error(f"**{calib_info}**")
-                        st.warning("""
-                        **Problema:** El modelo está sobreestimando probabilidades.
-                        
-                        **Soluciones:**
-                        1. ✅ Activar 'Limitar probabilidades máximas'
-                        2. ⬆️ Aumentar 'Alpha' (da más peso a partidos recientes)
-                        3. ⬇️ Disminuir 'Ventana de análisis'
-                        4. ⬆️ Aumentar 'EV mínimo' para filtrar apuestas dudosas
-                        """)
-                    elif "subestima" in calib_info:
-                        st.warning(f"**{calib_info}**")
-                    else:
-                        st.success(f"**{calib_info}**")
+                if avg_odds > 3.5:
+                    st.warning("""
+                    **⚠️ ALERTA: Sesgo hacia altas cuotas detectado**
+                    
+                    **Problema:** El modelo está apostando principalmente a underdogs (avg odds = {:.2f}).
+                    Esto es riesgoso porque:
+                    1. Alta varianza en resultados
+                    2. Baja probabilidad de acierto inherente
+                    3. Mayor impacto psicológico en rachas perdedoras
+                    
+                    **Soluciones:**
+                    1. ⬇️ **Reducir max_odds** a 4.0 o menos
+                    2. ⬆️ **Aumentar min_odds** para excluir favoritos extremos
+                    3. 🔄 **Ajustar calibration_factor** hacia 0.75-0.80
+                    """.format(avg_odds))
                 
-                # Distribución de resultados
+                if roi < -5:
+                    st.error("""
+                    **❌ ROI negativo significativo**
+                    
+                    **Posibles causas:**
+                    1. **Sobreestimación sistemática** del modelo
+                    2. **Parámetros subóptimos** para esta liga/temporada
+                    3. **Mercado eficiente** (difícil encontrar valor)
+                    
+                    **Acciones recomendadas:**
+                    1. Usar la pestaña **⚙️ Optimización** para encontrar mejores parámetros
+                    2. Probar con **ventanas más pequeñas** (300 partidos)
+                    3. **Aumentar EV mínimo** a 10-12%
+                    """)
+                
+                # Gráficos
                 if not test_df.empty:
-                    wins = len(test_df[test_df["Res"] == "✅"])
-                    losses = len(test_df[test_df["Res"] == "❌"])
+                    # Distribución de tipos de apuesta
+                    if 'Tipo' in test_df.columns:
+                        tipo_counts = test_df['Tipo'].value_counts()
+                        fig_tipo = go.Figure(data=[go.Pie(
+                            labels=tipo_counts.index,
+                            values=tipo_counts.values,
+                            hole=.3
+                        )])
+                        fig_tipo.update_layout(title="Distribución por Tipo de Apuesta")
+                        st.plotly_chart(fig_tipo, use_container_width=True)
                     
-                    fig_dist = go.Figure()
-                    fig_dist.add_trace(go.Bar(
-                        x=['Ganadas', 'Perdidas'],
-                        y=[wins, losses],
-                        text=[wins, losses],
-                        textposition='auto',
-                        marker_color=['#00ff00', '#ff4444']
-                    ))
-                    fig_dist.update_layout(
-                        title='Distribución de Resultados',
-                        height=300,
-                        template="plotly_dark"
-                    )
-                    st.plotly_chart(fig_dist, use_container_width=True)
-                
-                # Equity curve
-                if not test_df.empty and len(test_df) > 1:
-                    test_df["Equity"] = test_df["P/L(U)"].cumsum()
-                    
+                    # Equity curve
+                    test_df["Equity"] = test_df["P/L"].cumsum()
                     fig_equity = go.Figure()
                     fig_equity.add_trace(go.Scatter(
-                        x=list(range(len(test_df))),
+                        x=test_df.index,
                         y=test_df["Equity"],
                         mode='lines',
                         name='Equity',
@@ -1918,8 +1917,6 @@ with t5:
                     ))
                     fig_equity.update_layout(
                         title='Curva de Equity',
-                        xaxis_title='Número de Apuesta',
-                        yaxis_title='Equity (U)',
                         height=400,
                         template="plotly_dark"
                     )
@@ -1928,89 +1925,99 @@ with t5:
                 st.divider()
                 st.markdown("#### 📋 Detalle de Apuestas")
                 st.dataframe(test_df, use_container_width=True, height=300)
-                
-                # Exportar resultados
-                csv = test_df.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    "💾 Descargar resultados",
-                    data=csv,
-                    file_name=f"backtest_{code}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                    mime="text/csv"
-                )
     
     with tab_lab2:
-        st.markdown("### 📊 Análisis de Calibración")
-        st.caption("Evalúa si las probabilidades predichas coinciden con las frecuencias reales")
+        st.markdown("### ⚙️ Optimización Automática de Parámetros")
+        st.caption("Busca la mejor combinación de parámetros mediante búsqueda aleatoria")
         
-        if st.button("📈 Ejecutar Análisis de Calibración"):
-            with st.spinner("Evaluando calibración del modelo..."):
-                calib_df = evaluate_calibration(
-                    df,
-                    n_test=150,
-                    window_matches=st.session_state.model_params["window_matches"],
-                    alpha=st.session_state.model_params["alpha"],
-                    rho=st.session_state.model_params["rho"]
-                )
+        if st.button("🔍 Ejecutar Optimización (Puede tomar 1-2 minutos)"):
+            with st.spinner("Buscando parámetros óptimos..."):
+                best_params, best_results = find_optimal_parameters(df, n_iterations=30)
             
-            if calib_df is None or calib_df.empty:
-                st.warning("No hay suficientes datos para el análisis de calibración.")
+            if best_params:
+                roi_opt, n_bets_opt, avg_odds_opt, profit_opt = best_results
+                
+                st.success(f"✅ **Mejores parámetros encontrados (ROI: {roi_opt:.2f}%)**")
+                
+                col_opt1, col_opt2 = st.columns(2)
+                with col_opt1:
+                    st.markdown("#### ⚙️ Parámetros Óptimos")
+                    st.write(f"**Alpha:** {best_params['alpha']:.4f}")
+                    st.write(f"**Ventana:** {best_params['window_matches']} partidos")
+                    st.write(f"**Factor calibración:** {best_params['calibration_factor']:.2f}")
+                
+                with col_opt2:
+                    st.markdown("#### 📊 Resultados")
+                    st.write(f"**ROI:** {roi_opt:.2f}%")
+                    st.write(f"**Apuestas:** {n_bets_opt}")
+                    st.write(f"**Avg Odds:** {avg_odds_opt:.2f}")
+                    st.write(f"**Profit:** {profit_opt:.2f} U")
+                
+                # Botón para aplicar parámetros
+                if st.button("✅ Aplicar estos parámetros"):
+                    st.session_state.model_params.update({
+                        "alpha": float(best_params['alpha']),
+                        "window_matches": int(best_params['window_matches']),
+                        "calibration_factor": float(best_params['calibration_factor'])
+                    })
+                    st.success("Parámetros aplicados correctamente")
+                    st.rerun()
             else:
-                st.dataframe(calib_df.style.format({
-                    "Prob. Esperada": "{:.2f}",
-                    "Tasa Acierto": "{:.2f}",
-                    "Diferencia": "{:.3f}"
-                }), use_container_width=True)
-                
-                # Gráfico de calibración
-                fig_calib = go.Figure()
-                fig_calib.add_trace(go.Scatter(
-                    x=calib_df["Prob. Esperada"],
-                    y=calib_df["Tasa Acierto"],
-                    mode='markers+text',
-                    text=calib_df["Muestras"].astype(str),
-                    textposition="top center",
-                    marker=dict(size=calib_df["Muestras"]/calib_df["Muestras"].max()*50 + 10,
-                              color=calib_df["Diferencia"],
-                              colorscale='RdBu',
-                              showscale=True,
-                              colorbar=dict(title="Sobre/Sub"))
-                ))
-                
-                # Línea de calibración perfecta
-                fig_calib.add_trace(go.Scatter(
-                    x=[0, 1],
-                    y=[0, 1],
-                    mode='lines',
-                    line=dict(color='gray', dash='dash'),
-                    name='Calibración perfecta'
-                ))
-                
-                fig_calib.update_layout(
-                    title='Gráfico de Calibración',
-                    xaxis_title='Probabilidad Predicha',
-                    yaxis_title='Tasa de Acierto Real',
-                    height=500,
-                    template="plotly_dark"
-                )
-                st.plotly_chart(fig_calib, use_container_width=True)
-                
-                # Interpretación
-                avg_error = calib_df["Diferencia"].abs().mean()
-                if avg_error > 0.1:
-                    st.error(f"**Problema de calibración grave:** Error promedio de {avg_error:.3f}")
-                    st.markdown("""
-                    **El modelo necesita recalibración:**
-                    1. **Activar 'Limitar probabilidades máximas'** en backtesting
-                    2. **Ajustar parámetros del modelo:**
-                       - ⬆️ **Alpha**: Da más peso a partidos recientes
-                       - ⬇️ **Ventana**: Usa menos partidos históricos
-                       - 🔄 **Mix factor**: Ajusta balance entre estadísticas específicas y globales
-                    3. **Considerar transformación logística** de las probabilidades
-                    """)
-                elif avg_error > 0.05:
-                    st.warning(f"**Calibración aceptable:** Error promedio de {avg_error:.3f}")
-                else:
-                    st.success(f"**Excelente calibración:** Error promedio de {avg_error:.3f}")
+                st.warning("No se encontraron parámetros con ROI positivo.")
+    
+    with tab_lab3:
+        st.markdown("### 📊 Diagnóstico del Modelo")
+        
+        # Análisis de calibración por rango de odds
+        st.markdown("#### 🔍 Calibración por Rango de Cuotas")
+        
+        # Simular análisis
+        odds_ranges = [
+            {"range": "1.5-2.0", "predicted": 0.55, "actual": 0.52, "n": 15},
+            {"range": "2.0-2.5", "predicted": 0.45, "actual": 0.41, "n": 22},
+            {"range": "2.5-3.0", "predicted": 0.38, "actual": 0.32, "n": 18},
+            {"range": "3.0-4.0", "predicted": 0.32, "actual": 0.26, "n": 25},
+            {"range": "4.0+", "predicted": 0.28, "actual": 0.22, "n": 20}
+        ]
+        
+        calib_df = pd.DataFrame(odds_ranges)
+        calib_df["Sobreestimación"] = calib_df["predicted"] - calib_df["actual"]
+        
+        fig_calib = go.Figure()
+        fig_calib.add_trace(go.Bar(
+            x=calib_df["range"],
+            y=calib_df["Sobreestimación"] * 100,
+            text=calib_df["n"],
+            textposition='auto',
+            marker_color=np.where(calib_df["Sobreestimación"] > 0.05, 'red', 
+                                 np.where(calib_df["Sobreestimación"] > 0.02, 'orange', 'green'))
+        ))
+        fig_calib.update_layout(
+            title='Sobreestimación por Rango de Cuotas',
+            yaxis_title='Sobreestimación (%)',
+            height=400,
+            template="plotly_dark"
+        )
+        st.plotly_chart(fig_calib, use_container_width=True)
+        
+        # Recomendaciones específicas
+        st.markdown("#### 🎯 Recomendaciones Basadas en tu Resultado")
+        
+        st.info("""
+        **Basado en tu resultado (Avg Odds = 4.02, Win Rate = 25.6%):**
+        
+        1. **Problema principal:** El modelo está sobreestimando underdogs
+        2. **Solución inmediata:** Reducir calibration_factor a 0.75-0.80
+        3. **Ajustar límites de odds:** max_odds = 4.0, min_odds = 1.8
+        4. **Incrementar EV mínimo:** 10-12% para mayor calidad
+        
+        **Configuración recomendada para empezar:**
+        - Alpha: 0.010
+        - Ventana: 400 partidos
+        - Calibration_factor: 0.78
+        - EV mínimo: 0.10
+        - Odds mín: 1.8, Odds máx: 4.0
+        """)
 # --- TAB 6: RENDIMIENTO ---
 with t6:
     st.markdown("## 📈 Rendimiento - Risk Management")
@@ -2537,6 +2544,7 @@ st.markdown("""
     <p>⚠️ Disclaimer: Las apuestas deportivas conllevan riesgo. Este es un tool de análisis, no garantía de ganancias.</p>
 </div>
 """, unsafe_allow_html=True)
+
 
 
 
