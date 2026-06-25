@@ -717,7 +717,7 @@ with st.sidebar:
             st.session_state.ticket = []
             st.rerun()
 
-st.title(f"🛡️ Dixon-Coles: {leagues[code]}")
+st.title(f"Analisis predictivo de resultados para partidos de futbol: {leagues[code]}")
 
 # --- SELECTOR ---
 c1, c2 = st.columns(2)
