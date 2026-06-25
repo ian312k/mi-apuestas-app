@@ -24,7 +24,7 @@ from sklearn.metrics import log_loss
 # ======================================================
 # 1. CONFIGURACIÓN Y ESTILOS CSS (DARK MODE) 🎨
 # ======================================================
-st.set_page_config(page_title="Dixon-Coles Pro v5.5 (Gestión Total)", layout="wide", page_icon="🛡️")
+st.set_page_config(page_title="Analisis predictorio de resultados de 5 ligas de futbol", layout="wide", page_icon="🛡️")
 CSV_FILE = "mis_apuestas_pro.csv"
 N_SEASONS = 3
 
