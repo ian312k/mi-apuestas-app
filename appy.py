@@ -8,6 +8,7 @@ import os
 import requests
 from difflib import get_close_matches
 from datetime import datetime
+from collections import Counter
 
 # =========================
 # ML imports (XGB opcional + fallback)
@@ -74,7 +75,6 @@ if "api_key" not in st.session_state: st.session_state.api_key = ""
 if "api_usage" not in st.session_state: st.session_state.api_usage = {"used": 0, "remaining": 500}
 if "market_storage" not in st.session_state: st.session_state.market_storage = {}
 if "odds_inputs" not in st.session_state:
-    # Agregamos o_o25 y o_btts al estado por defecto
     st.session_state.odds_inputs = {"oh": 2.0, "od": 3.2, "oa": 3.5, "o_o25": 1.90, "o_btts": 1.90}
 
 st.markdown("""
@@ -249,13 +249,110 @@ def predict_match_dixon_coles(home, away, team_stats, avg_h, avg_a, rho=-0.13, m
     return h_exp, a_exp, p_home, p_draw, p_away, p_o15, p_o25, p_btts, top_scores, probs
 
 # ======================================================
-# 4. APUESTAS / HISTORIAL
+# 4. APUESTAS / HISTORIAL / RIESGO
 # ======================================================
-def calculate_kelly(prob, odd):
-    if prob <= 0 or odd <= 1: return 0.0
-    b = odd - 1
-    f = (b * prob - (1 - prob)) / b
-    return max(0.0, f * 0.5) * 100
+def calculate_kelly(prob, odd, fraction=0.5):
+    if prob <= 0 or odd <= 1.0:
+        return 0.0
+    b = odd - 1.0
+    q = 1.0 - prob
+    f_star = (b * prob - q) / b
+    if f_star <= 0:
+        return 0.0
+    return float(np.clip(f_star * fraction * 100.0, 0.0, 100.0))
+
+def simulate_monte_carlo_bankroll(bets_df: pd.DataFrame, initial_bank: float = 1000.0, n_simulations: int = 2000, horizon_bets: int = 200):
+    if bets_df.empty or len(bets_df) < 5:
+        return None
+
+    odds = bets_df["Cuota"].astype(float).values
+    probs = bets_df["Prob"].astype(float).values
+    stakes = bets_df["Stake"].astype(float).values
+    stakes_pct = stakes / initial_bank
+
+    sample_indices = np.random.choice(len(odds), size=(n_simulations, horizon_bets), replace=True)
+    sim_odds = odds[sample_indices]
+    sim_probs = probs[sample_indices]
+    sim_stakes = stakes_pct[sample_indices]
+
+    random_uniforms = np.random.uniform(0.0, 1.0, size=(n_simulations, horizon_bets))
+    wins = (random_uniforms < sim_probs).astype(float)
+    returns = np.where(wins == 1.0, (sim_odds - 1.0) * sim_stakes, -sim_stakes)
+
+    bank_trajectories = np.zeros((n_simulations, horizon_bets + 1))
+    bank_trajectories[:, 0] = initial_bank
+
+    for step in range(horizon_bets):
+        next_val = bank_trajectories[:, step] * (1.0 + returns[:, step])
+        bank_trajectories[:, step + 1] = np.maximum(0.0, next_val)
+
+    peaks = np.maximum.accumulate(bank_trajectories, axis=1)
+    drawdowns = np.where(peaks > 0, (peaks - bank_trajectories) / peaks, 0.0)
+    max_drawdowns_pct = np.max(drawdowns, axis=1) * 100.0
+
+    steps = np.arange(horizon_bets + 1)
+    p5 = np.percentile(bank_trajectories, 5, axis=0)
+    p25 = np.percentile(bank_trajectories, 25, axis=0)
+    p50 = np.percentile(bank_trajectories, 50, axis=0)
+    p75 = np.percentile(bank_trajectories, 75, axis=0)
+    p95 = np.percentile(bank_trajectories, 95, axis=0)
+
+    ruin_rate = np.mean(np.min(bank_trajectories, axis=1) <= (initial_bank * 0.20)) * 100.0
+
+    return {
+        "p5": p5, "p25": p25, "p50": p50, "p75": p75, "p95": p95,
+        "steps": steps,
+        "mdd_p50": float(np.percentile(max_drawdowns_pct, 50)),
+        "mdd_p95": float(np.percentile(max_drawdowns_pct, 95)),
+        "ruin_rate": float(ruin_rate)
+    }
+
+def analyze_ticket_risk(ticket_list: list, bankroll: float, max_exposure_pct: float = 15.0):
+    if not ticket_list:
+        return {"total_stake": 0.0, "exposure_pct": 0.0, "alerts": []}
+
+    alerts = []
+    total_stake = sum(float(item.get("stake", 0.0)) for item in ticket_list)
+    exposure_pct = (total_stake / bankroll) * 100.0 if bankroll > 0 else 0.0
+
+    if exposure_pct > max_exposure_pct:
+        alerts.append({
+            "type": "danger",
+            "msg": f"⚠️ **Límite de Exposición Superado**: Estás arriesgando un **{exposure_pct:.1f}%** de tu banca (límite configurado: {max_exposure_pct:.1f}%). Considera reducir tus stakes."
+        })
+
+    matches = [item.get("match") for item in ticket_list]
+    match_counts = Counter(matches)
+    for match, count in match_counts.items():
+        if count > 1:
+            alerts.append({
+                "type": "warning",
+                "msg": f"🔗 **Dependencia Directa**: Tienes {count} picks en el mismo partido (*{match}*). Los eventos no son independientes entre sí."
+            })
+
+    picks_types = []
+    for item in ticket_list:
+        p = item.get("pick", "")
+        if "Over" in p:
+            picks_types.append("Over Goles")
+        elif "BTTS" in p:
+            picks_types.append("BTTS")
+        elif "Gana" in p or "Empate" in p:
+            picks_types.append("1X2")
+
+    type_counts = Counter(picks_types)
+    for p_type, count in type_counts.items():
+        if count >= 3 and p_type in ["Over Goles", "BTTS"]:
+            alerts.append({
+                "type": "warning",
+                "msg": f"⚡ **Correlación de Entorno ({p_type})**: Hay {count} apuestas acumuladas en mercados de alta dependencia a ritmo de juego general. Si la jornada resulta atípicamente defensiva, todas fallarán simultáneamente."
+            })
+
+    return {
+        "total_stake": total_stake,
+        "exposure_pct": exposure_pct,
+        "alerts": alerts
+    }
 
 def manage_bets(mode, data=None, id_bet=None, status=None):
     if os.path.exists(CSV_FILE):
@@ -271,24 +368,21 @@ def manage_bets(mode, data=None, id_bet=None, status=None):
         df.to_csv(CSV_FILE, index=False)
 
     elif mode == "update":
-        # Corregido: convertir ID a string para evitar errores de tipo
         idx = df[df["ID"].astype(str) == str(id_bet)].index
         if not idx.empty:
             i = idx[0]
             df.at[i, "Estado"] = status
-            # Cálculo de ganancia
             if status == "Ganada":
                 profit = (float(df.at[i, "Stake"]) * float(df.at[i, "Cuota"])) - float(df.at[i, "Stake"])
             elif status == "Perdida":
                 profit = -float(df.at[i, "Stake"])
-            else: # Push o Cancelada
+            else:
                 profit = 0.0
             
             df.at[i, "Ganancia"] = profit
             df.to_csv(CSV_FILE, index=False)
 
     elif mode == "delete":
-        # Corregido: convertir ID a string
         df = df[df["ID"].astype(str) != str(id_bet)]
         df.to_csv(CSV_FILE, index=False)
 
@@ -518,8 +612,7 @@ def fast_eval_ml(df, n_test=200, min_train=500, window_matches=1200):
     br = brier_multiclass(P, y)
     return {"mode": "rápido", "n": int(len(y)), "logloss": ll, "brier": br}
 
-def strict_walkforward_eval_ml_blocks(df, n_test=200, min_train=500, window_matches=1200,
-                                      retrain_every=10, train_step=2):
+def strict_walkforward_eval_ml_blocks(df, n_test=200, min_train=500, window_matches=1200, retrain_every=10, train_step=2):
     df_sorted = df.dropna(subset=["date","home","away","home_goals","away_goals"]).sort_values("date").reset_index(drop=True)
     test_block = df_sorted.tail(n_test).copy()
 
@@ -666,7 +759,6 @@ def predict_ml_for_match(home_team, away_team, oh, od, oa, model, team_stats, av
 with st.sidebar:
     st.header("⚙️ Configuración")
     
-    # CORRECCIÓN AQUÍ: Se agrega key única para evitar DuplicateElementId
     if st.button("🔄 Actualizar Datos", key="update_btn"):
         st.cache_data.clear()
         st.rerun()
@@ -831,7 +923,20 @@ with t2:
             "o_o25": float(odd_o25), "o_btts": float(odd_btts)
         }
 
-        st.markdown("#### 🧠 Kelly (1X2)")
+        st.markdown("#### 🧠 Kelly Fraccionado Ajustable")
+        kelly_fraction = st.select_slider(
+            "Fracción de Kelly:",
+            options=[0.125, 0.25, 0.33, 0.50, 1.0],
+            value=0.25,
+            format_func=lambda x: {
+                0.125: "1/8 Kelly (Ultra Conservador)",
+                0.25: "1/4 Kelly (Recomendado)",
+                0.33: "1/3 Kelly (Moderado)",
+                0.50: "1/2 Kelly (Agresivo)",
+                1.0: "Full Kelly (Peligro Volatilidad)"
+            }[x]
+        )
+
         k_ev_h = (ph * oh) - 1
         k_ev_d = (pd_prob * od) - 1
         k_ev_a = (pa * oa) - 1
@@ -842,38 +947,38 @@ with t2:
             elif k_max_ev == k_ev_d: k_sel, k_p, k_o = "Empate", pd_prob, od
             else: k_sel, k_p, k_o = f"Gana {away}", pa, oa
 
-            k_pct = calculate_kelly(k_p, k_o)
+            k_pct = calculate_kelly(k_p, k_o, fraction=kelly_fraction)
             k_stake = (k_pct / 100) * bank
-            st.success(f"💎 **Recomendación Kelly:** {k_sel} | Stake: ${k_stake:.2f} ({k_pct:.2f}%)")
+            st.success(f"💎 **Recomendación ({kelly_fraction} Kelly):** {k_sel} | Stake: ${k_stake:.2f} ({k_pct:.2f}%)")
         else:
             st.warning("📉 Kelly sugiere: **No apostar** (Sin valor esperado positivo)")
 
         st.divider()
         st.markdown("### ➕ Agregar al Ticket")
         with st.form("add_to_ticket"):
-            # AHORA EL SELECTOR INCLUYE LOS NUEVOS MERCADOS
             sel_pick_options = [
                 f"Gana {home}", 
                 "Empate", 
-                f"Gana {away}",
-                "Over 2.5 Goles",
+                f"Gana {away}", 
+                "Over 2.5 Goles", 
                 "BTTS (Ambos Anotan)"
             ]
             sel_pick = st.selectbox("Selección", sel_pick_options)
             
-            # Lógica para asignar cuota y probabilidad según selección
             if f"Gana {home}" in sel_pick: 
                 sel_odd, sel_prob = oh, ph
             elif "Empate" in sel_pick: 
                 sel_odd, sel_prob = od, pd_prob
             elif f"Gana {away}" in sel_pick: 
                 sel_odd, sel_prob = oa, pa
-            elif "Over 2.5" in sel_pick:
+            elif "Over 2.5" in sel_pick: 
                 sel_odd, sel_prob = odd_o25, po25
-            elif "BTTS" in sel_pick:
+            elif "BTTS" in sel_pick: 
                 sel_odd, sel_prob = odd_btts, pbtts
-            else:
+            else: 
                 sel_odd, sel_prob = 1.0, 0.0
+
+            stake_item_input = st.number_input("Stake individual asignado ($)", min_value=1.0, max_value=5000.0, value=50.0, step=5.0)
 
             if st.form_submit_button("Añadir selección"):
                 st.session_state.ticket.append({
@@ -881,6 +986,7 @@ with t2:
                     "pick": sel_pick,
                     "odd": sel_odd,
                     "prob": sel_prob,
+                    "stake": float(stake_item_input),
                     "league": leagues[code],
                 })
                 st.success("Añadido")
@@ -894,7 +1000,7 @@ with t2:
             total_odd, total_prob = 1.0, 1.0
             for idx, item in enumerate(st.session_state.ticket):
                 st.markdown(
-                    f"<div class='ticket-box'><small>{item['league']}</small><br><strong>{item['match']}</strong><br>{item['pick']} @ {item['odd']}</div>",
+                    f"<div class='ticket-box'><small>{item['league']}</small><br><strong>{item['match']}</strong><br>{item['pick']} @ {item['odd']} (Stake: ${item.get('stake', 50.0):.2f})</div>",
                     unsafe_allow_html=True
                 )
                 if st.button("❌", key=f"del_{idx}"):
@@ -904,14 +1010,28 @@ with t2:
                 total_prob *= item["prob"]
 
             st.divider()
-            st.metric("Cuota Total", f"{total_odd:.2f}")
-            stake_parlay = st.number_input("Stake ($)", 1.0, 5000.0, 50.0)
+            st.markdown("#### 🛡️ Análisis de Riesgo del Ticket")
+            max_exp_slider = st.slider("Límite de Exposición (% Banco):", min_value=5.0, max_value=50.0, value=15.0, step=1.0)
+            risk_report = analyze_ticket_risk(st.session_state.ticket, bankroll=bank, max_exposure_pct=max_exp_slider)
+
+            for alert in risk_report["alerts"]:
+                if alert["type"] == "danger":
+                    st.error(alert["msg"])
+                elif alert["type"] == "warning":
+                    st.warning(alert["msg"])
+
+            st.metric("Exposición Total Acumulada", f"${risk_report['total_stake']:.2f}", f"{risk_report['exposure_pct']:.1f}% de la Banca")
+
+            st.divider()
+            st.metric("Cuota Total Parlay", f"{total_odd:.2f}")
+            stake_parlay = st.number_input("Stake Parlay ($)", 1.0, 5000.0, 50.0)
             st.success(f"Ganancia: ${(stake_parlay * total_odd) - stake_parlay:.2f}")
 
             if st.button("💾 Guardar"):
                 tipo_str = "Simple" if len(st.session_state.ticket) == 1 else "Parlay"
                 match_str = st.session_state.ticket[0]["match"] if len(st.session_state.ticket) == 1 else f"Combinada ({len(st.session_state.ticket)})"
                 pick_str = " + ".join([i["pick"] for i in st.session_state.ticket])
+                final_stake = st.session_state.ticket[0]["stake"] if len(st.session_state.ticket) == 1 else stake_parlay
 
                 manage_bets("save", {
                     "ID": pd.Timestamp.now().strftime("%Y%m%d%H%M%S"),
@@ -920,7 +1040,7 @@ with t2:
                     "Partido": match_str,
                     "Pick": pick_str,
                     "Cuota": round(total_odd, 2),
-                    "Stake": stake_parlay,
+                    "Stake": final_stake,
                     "Prob": round(total_prob, 4),
                     "Estado": "Pendiente",
                     "Ganancia": 0.0
@@ -935,24 +1055,18 @@ with t3:
     db = manage_bets("load")
     
     if not db.empty:
-        # Mostramos la tabla general
         st.dataframe(db.sort_values(by="Fecha", ascending=False), use_container_width=True)
         
         st.divider()
         st.markdown("### 🛠️ Administrar Apuestas")
         
-        # Crear lista de opciones legibles para el selector
-        # Formato: ID | Fecha | Partido | Pick
         db["Display"] = db.apply(lambda x: f"{x['ID']} | {x['Fecha']} | {x['Partido']} | {x['Pick']}", axis=1)
         
         opciones_apuestas = db["Display"].tolist()
         seleccion_str = st.selectbox("Selecciona la apuesta a editar/borrar:", ["-- Seleccionar --"] + opciones_apuestas)
         
         if seleccion_str != "-- Seleccionar --":
-            # Extraer el ID (está al principio de la cadena)
             bet_id = seleccion_str.split(" | ")[0]
-            
-            # Buscar la fila correspondiente
             fila = db[db["ID"].astype(str) == bet_id].iloc[0]
             
             st.info(f"**Seleccionado:** {fila['Partido']} - {fila['Pick']} (Cuota: {fila['Cuota']})")
@@ -1118,7 +1232,7 @@ with t4:
                                 continue
 
                             p, (ev_h, ev_d, ev_a), pick = predict_ml_for_match(h, a, float(oh2), float(od2), float(oa2),
-                                                                        model, team_stats2, avg_h2, avg_a2)
+                                                                                model, team_stats2, avg_h2, avg_a2)
                             best_ev = np.nanmax([ev_h, ev_d, ev_a])
                             if only_positive_ev and (np.isnan(best_ev) or best_ev <= 0):
                                 continue
@@ -1192,9 +1306,72 @@ with t6:
             a,b,c,d = st.columns(4)
             a.metric("Beneficio Neto", f"${tot_prof:,.2f}")
             b.metric("ROI", f"{roi:.2f}%")
-            c.metric("Max Drawdown", f"{max_dd:.2f} U")
+            c.metric("Max Drawdown Histórico", f"{max_dd:.2f} U")
             d.metric("Apuestas", len(df_finished))
             st.dataframe(df_finished, use_container_width=True)
+
+        st.divider()
+        st.markdown("### 🎲 Simulador de Monte Carlo de Bankroll")
+        st.caption("Simulación estocástica de trayectorias futuras con distribución empírica de probabilidades y cuotas registradas.")
+
+        c_mc1, c_mc2, c_mc3 = st.columns(3)
+        n_sims = c_mc1.slider("Número de Simulaciones", 500, 5000, 2000, step=500)
+        horizon = c_mc2.slider("Horizonte (apuestas futuras)", 50, 500, 200, step=50)
+        bank_mc = c_mc3.number_input("Capital Inicial de Simulación ($)", value=float(bank), step=100.0)
+
+        if st.button("🚀 Ejecutar Simulación Monte Carlo"):
+            with st.spinner("Proyectando caminos estocásticos..."):
+                valid_history = df_hist.dropna(subset=["Cuota", "Prob", "Stake"]).copy()
+                mc_res = simulate_monte_carlo_bankroll(valid_history, initial_bank=bank_mc, n_simulations=n_sims, horizon_bets=horizon)
+
+            if mc_res is None:
+                st.warning("Se requieren al menos 5 apuestas en el historial con Cuota, Prob y Stake válidos para simular.")
+            else:
+                m_mc1, m_mc2, m_mc3 = st.columns(3)
+                m_mc1.metric("Drawdown Mediano Esperado (P50)", f"{mc_res['mdd_p50']:.1f}%")
+                m_mc2.metric("Drawdown Extremo (P95)", f"{mc_res['mdd_p95']:.1f}%", help="El 5% de las veces ocurrirá una caída mayor o igual a este valor.")
+                m_mc3.metric("Riesgo de Ruina (<20% Capital)", f"{mc_res['ruin_rate']:.1f}%")
+
+                fig_mc = go.Figure()
+
+                fig_mc.add_trace(go.Scatter(
+                    x=list(mc_res["steps"]) + list(mc_res["steps"][::-1]),
+                    y=list(mc_res["p95"]) + list(mc_res["p5"][::-1]),
+                    fill='toself',
+                    fillcolor='rgba(0, 150, 255, 0.15)',
+                    line=dict(color='rgba(255,255,255,0)'),
+                    hoverinfo="skip",
+                    showlegend=True,
+                    name="Intervalo 90% (P5 - P95)"
+                ))
+
+                fig_mc.add_trace(go.Scatter(
+                    x=list(mc_res["steps"]) + list(mc_res["steps"][::-1]),
+                    y=list(mc_res["p75"]) + list(mc_res["p25"][::-1]),
+                    fill='toself',
+                    fillcolor='rgba(0, 150, 255, 0.3)',
+                    line=dict(color='rgba(255,255,255,0)'),
+                    hoverinfo="skip",
+                    showlegend=True,
+                    name="Intervalo Intercuartil (P25 - P75)"
+                ))
+
+                fig_mc.add_trace(go.Scatter(
+                    x=mc_res["steps"],
+                    y=mc_res["p50"],
+                    line=dict(color='#00d4ff', width=2.5),
+                    name="Mediana (P50)"
+                ))
+
+                fig_mc.update_layout(
+                    title=f"Distribución Proyectada de Banca ({n_sims} trayectorias a {horizon} picks)",
+                    xaxis_title="Apuestas Futuras",
+                    yaxis_title="Bankroll ($)",
+                    template="plotly_dark",
+                    height=450,
+                    margin=dict(l=20, r=20, t=40, b=20)
+                )
+                st.plotly_chart(fig_mc, use_container_width=True)
     else:
         st.info("Aún no hay historial.")
 
@@ -1285,13 +1462,11 @@ with t7:
                 })
                 st.dataframe(comp.style.format({"H":"{:.3f}","D":"{:.3f}","A":"{:.3f}"}), use_container_width=True)
                 
-                # --- NUEVA SECCIÓN FEATURE IMPORTANCE ---
                 if hasattr(model, "feature_importances_"):
                     st.divider()
                     st.markdown("### 🔍 Importancia de Variables (Feature Importance)")
                     st.caption("¿Qué está mirando el modelo? (Mkt = Mercado, DC = Dixon-Coles, xG = Expectativa Goles)")
                     
-                    # Nombres alineados con build_features_for_match
                     feature_names = [
                         "Mkt H", "Mkt D", "Mkt A",
                         "DC H", "DC D", "DC A",
@@ -1300,7 +1475,6 @@ with t7:
                         "SOT Home", "SOT Away"
                     ]
                     
-                    # Verificar dimensión por si acaso
                     if len(model.feature_importances_) == len(feature_names):
                         imp_df = pd.DataFrame({
                             "Feature": feature_names,
@@ -1330,7 +1504,6 @@ with t8:
     if st.button("🚀 Ejecutar Análisis Masivo (7 Ligas)"):
         master_results = []
         
-        # Barra de progreso general
         prog_bar = st.progress(0)
         status_text = st.empty()
         
@@ -1343,17 +1516,14 @@ with t8:
             prog_bar.progress(prog)
             status_text.text(f"Analizando {l_name} ({l_code})...")
 
-            # 1. Verificar si hay datos de mercado (Odds) en memoria
             if l_code not in st.session_state.market_storage:
-                continue # Saltamos si no hay datos descargados para esta liga
+                continue
             
             stored = st.session_state.market_storage[l_code]
             data_api = stored.get("data", [])
             if not data_api:
                 continue
 
-            # 2. Cargar histórico y Entrenar Modelo específico para esta liga
-            # Nota: Usamos fetch_live_soccer_data con el código de la liga del loop, no la seleccionada en sidebar
             df_loop = fetch_live_soccer_data(l_code, n_seasons=N_SEASONS)
             
             if df_loop.empty or len(df_loop) < 200:
@@ -1366,7 +1536,6 @@ with t8:
 
             model_loop, stats_loop, avgh_loop, avga_loop = snap_loop
             
-            # 3. Predecir partidos
             now_utc = pd.Timestamp.now(tz="UTC")
             league_rows = []
 
@@ -1374,14 +1543,12 @@ with t8:
                 match_date = pd.to_datetime(item.get("commence_time"), utc=True, errors="coerce")
                 if pd.isna(match_date): continue
                 
-                # Filtro de tiempo (próxima semana)
                 diff_hours = (match_date - now_utc).total_seconds()/3600
                 if diff_hours > 168 or diff_hours < -5: continue
 
                 h_api = normalize_name(item.get("home_team",""))
                 a_api = normalize_name(item.get("away_team",""))
                 
-                # Obtener lista de equipos del DF de ESTA liga
                 teams_loop = sorted(list(set(df_loop["home"].unique()) | set(df_loop["away"].unique())))
 
                 m_h = get_close_matches(h_api, teams_loop, n=1, cutoff=0.8)
@@ -1395,10 +1562,8 @@ with t8:
                 oh2, od2, oa2 = match_odds_from_scanner_item(item)
                 if np.isnan(oh2) or np.isnan(od2) or np.isnan(oa2) or oh2<=1.01: continue
 
-                # A) Predicción Dixon-Coles (para mostrar en columna)
                 _, _, dc_h, dc_d, dc_a, *_ = predict_match_dixon_coles(h_team, a_team, stats_loop, avgh_loop, avga_loop)
 
-                # B) Predicción ML (para el cálculo de EV y Pick)
                 p, (ev_h, ev_d, ev_a), pick = predict_ml_for_match(
                     h_team, a_team, float(oh2), float(od2), float(oa2),
                     model_loop, stats_loop, avgh_loop, avga_loop
@@ -1412,19 +1577,17 @@ with t8:
                     "Fecha": match_date.strftime("%d/%m %H:%M"),
                     "Partido": f"{h_team} vs {a_team}",
                     "Cuotas": f"{oh2:.2f}|{od2:.2f}|{oa2:.2f}",
-                    "DC Prob": f"{dc_h:.2f}|{dc_d:.2f}|{dc_a:.2f}",   # <--- NUEVA COLUMNA AGREGADA
+                    "DC Prob": f"{dc_h:.2f}|{dc_d:.2f}|{dc_a:.2f}",
                     "ML Prob": f"{p[0]:.2f}|{p[1]:.2f}|{p[2]:.2f}",
                     "EV": best_ev,
                     "Pick": pick
                 })
 
             if league_rows:
-                # Guardar resultados y mostrar Expander
                 df_res_league = pd.DataFrame(league_rows).sort_values("EV", ascending=False)
                 master_results.extend(league_rows)
                 
                 with st.expander(f"⚽ {l_name} ({len(league_rows)} picks)", expanded=True):
-                    # Formato visual para las columnas nuevas
                     st.dataframe(
                         df_res_league.style.format({"EV": "{:.3f}"}), 
                         use_container_width=True, 
@@ -1449,4 +1612,3 @@ with t8:
             )
     else:
         st.info("Presiona el botón para iniciar el escaneo de todas las ligas configuradas.")
-
