@@ -42,7 +42,7 @@ TEAM_MAP = {
     "Tottenham Hotspur": "Tottenham",
     "Leicester City": "Leicester",
     "Sheffield United": "Sheffield United",
-
+    
     # 🇪🇸 LA LIGA
     "Athletic Club": "Ath Bilbao",
     "Atlético Madrid": "Ath Madrid",
@@ -55,7 +55,7 @@ TEAM_MAP = {
     "Rayo Vallecano": "Vallecano",
     "Deportivo Alavés": "Alaves",
     "Alavés": "Alaves",
-
+    
     # 🇮🇹 SERIE A
     "Internazionale": "Inter",
     "Inter Milan": "Inter",
@@ -104,7 +104,7 @@ def fetch_live_soccer_data(league_code="SP1", n_seasons=3):
         url = f"https://www.football-data.co.uk/mmz4281/{s}/{league_code}.csv"
         try:
             tmp = pd.read_csv(url, encoding="latin1")
-
+            
             cols = ["Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG", "B365H", "B365D", "B365A", "HST", "AST"]
             actual_cols = [c for c in cols if c in tmp.columns]
             tmp = tmp[actual_cols].copy()
@@ -249,17 +249,13 @@ def predict_match_dixon_coles(home, away, team_stats, avg_h, avg_a, rho=-0.13, m
     return h_exp, a_exp, p_home, p_draw, p_away, p_o15, p_o25, p_btts, top_scores, probs
 
 # ======================================================
-# 4. APUESTAS / HISTORIAL / BANKROLL & RIESGO
+# 4. APUESTAS / HISTORIAL
 # ======================================================
-def calculate_kelly(prob, odd, fraction=0.5):
-    """
-    fraction: fracción de Kelly a usar (0.25 = conservador, 0.5 = medio Kelly, 1.0 = Kelly completo).
-    Ajustable desde el sidebar con el slider "Fracción de Kelly".
-    """
+def calculate_kelly(prob, odd):
     if prob <= 0 or odd <= 1: return 0.0
     b = odd - 1
     f = (b * prob - (1 - prob)) / b
-    return max(0.0, f * fraction) * 100
+    return max(0.0, f * 0.5) * 100
 
 def manage_bets(mode, data=None, id_bet=None, status=None):
     if os.path.exists(CSV_FILE):
@@ -287,7 +283,7 @@ def manage_bets(mode, data=None, id_bet=None, status=None):
                 profit = -float(df.at[i, "Stake"])
             else: # Push o Cancelada
                 profit = 0.0
-
+            
             df.at[i, "Ganancia"] = profit
             df.to_csv(CSV_FILE, index=False)
 
@@ -297,55 +293,6 @@ def manage_bets(mode, data=None, id_bet=None, status=None):
         df.to_csv(CSV_FILE, index=False)
 
     return df
-
-def get_exposure(df_hist, days=1):
-    """
-    Suma el stake de apuestas 'Pendientes' registradas en los últimos N días
-    (por fecha de registro en el CSV). Se usa para el límite de exposición diaria.
-    """
-    if df_hist.empty:
-        return 0.0
-    cutoff = pd.Timestamp.now() - pd.Timedelta(days=days)
-    df_hist = df_hist.copy()
-    df_hist["Fecha"] = pd.to_datetime(df_hist["Fecha"], errors="coerce")
-    reciente = df_hist[(df_hist["Fecha"] >= cutoff) & (df_hist["Estado"] == "Pendiente")]
-    return float(reciente["Stake"].sum())
-
-def monte_carlo_bankroll(df_finished, bank_inicial, n_bets_futuras=100, n_sims=2000, seed=42):
-    """
-    Bootstrap de tus resultados históricos (P/L por unidad de stake) para simular
-    trayectorias futuras de banca. Devuelve percentiles de banca final y de máximo drawdown.
-    """
-    rng = np.random.default_rng(seed)
-
-    # P/L por unidad de stake apostada (normaliza apuestas de distinto tamaño)
-    pl_por_unidad = (df_finished["Ganancia"] / df_finished["Stake"]).replace([np.inf, -np.inf], np.nan).dropna().values
-
-    if len(pl_por_unidad) < 10:
-        return None  # historial insuficiente para un bootstrap confiable
-
-    stake_promedio = float(df_finished["Stake"].mean())
-
-    trayectorias = np.zeros((n_sims, n_bets_futuras))
-    for s in range(n_sims):
-        muestra = rng.choice(pl_por_unidad, size=n_bets_futuras, replace=True)
-        pnl_acumulado = np.cumsum(muestra * stake_promedio)
-        trayectorias[s] = bank_inicial + pnl_acumulado
-
-    banca_final = trayectorias[:, -1]
-    peak = np.maximum.accumulate(trayectorias, axis=1)
-    drawdown = trayectorias - peak
-    max_drawdown_por_sim = drawdown.min(axis=1)
-
-    return {
-        "trayectorias": trayectorias,
-        "banca_final_p10": np.percentile(banca_final, 10),
-        "banca_final_p50": np.percentile(banca_final, 50),
-        "banca_final_p90": np.percentile(banca_final, 90),
-        "prob_ruina": float(np.mean(banca_final <= bank_inicial * 0.5)),  # % de sims que pierden 50%+ del banco
-        "max_dd_p50": np.percentile(max_drawdown_por_sim, 50),
-        "max_dd_p10": np.percentile(max_drawdown_por_sim, 10),  # peor 10% de casos
-    }
 
 def run_backtest_no_leak(df, n_test=50, min_train=200, window_matches=800, stake_unit=1.0):
     df_sorted = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
@@ -436,21 +383,21 @@ def get_last_5(df, team):
     team = str(team).strip()
     mask = (df["home"] == team) | (df["away"] == team)
     l5 = df[mask].sort_values(by="date", ascending=False).head(5).copy()
-
+    
     if l5.empty:
         return pd.DataFrame(columns=["Sede", "Rival", "Score", "Tiros"])
 
     l5["Rival"] = np.where(l5["home"] == team, l5["away"], l5["home"])
     l5["Score"] = (
-        l5["home_goals"].astype(float).astype(int).astype(str) +
-        "-" +
+        l5["home_goals"].astype(float).astype(int).astype(str) + 
+        "-" + 
         l5["away_goals"].astype(float).astype(int).astype(str)
     )
-
+    
     sot_h = l5.get("sot_h", 0).replace("", 0).astype(float).fillna(0).astype(int)
     sot_a = l5.get("sot_a", 0).replace("", 0).astype(float).fillna(0).astype(int)
     l5["Tiros"] = np.where(l5["home"] == team, sot_h, sot_a)
-
+    
     l5["Sede"] = np.where(l5["home"] == team, "🏠", "✈️")
     return l5[["Sede", "Rival", "Score", "Tiros"]]
 
@@ -718,7 +665,7 @@ def predict_ml_for_match(home_team, away_team, oh, od, oa, model, team_stats, av
 # ======================================================
 with st.sidebar:
     st.header("⚙️ Configuración")
-
+    
     # CORRECCIÓN AQUÍ: Se agrega key única para evitar DuplicateElementId
     if st.button("🔄 Actualizar Datos", key="update_btn"):
         st.cache_data.clear()
@@ -745,7 +692,7 @@ with st.sidebar:
     if not df.empty:
         stats, ah, aa, teams = calculate_strengths(df, ref_date=df["date"].max(), window_matches=1200)
         st.success(f"✅ {len(df)} partidos cargados")
-
+        
         st.divider()
         st.markdown("### 🗓️ Estado de la Liga")
         last_date = df["date"].max()
@@ -762,17 +709,6 @@ with st.sidebar:
 
     st.divider()
     bank = st.number_input("💰 Tu Banco ($)", 1000.0, step=50.0)
-
-    # --- NUEVO: Gestión de Bankroll y Riesgo ---
-    st.markdown("### 🛡️ Bankroll y Riesgo")
-    kelly_fraction = st.slider(
-        "🎯 Fracción de Kelly", 0.10, 1.00, 0.50, step=0.05,
-        help="0.25 = Kelly conservador, 0.50 = medio Kelly (recomendado), 1.00 = Kelly completo (más agresivo/volátil)"
-    )
-    max_exposure_pct = st.slider(
-        "🚧 Límite de exposición diaria (% del banco)", 5, 100, 20, step=5,
-        help="Si el total apostado (pendiente) en las últimas 24h supera este % de tu banco, se mostrará una alerta antes de guardar una nueva apuesta."
-    )
 
     if st.session_state.ticket:
         st.divider()
@@ -858,7 +794,7 @@ with t2:
 
         def_oh, def_od, def_oa = st.session_state.odds_inputs["oh"], st.session_state.odds_inputs["od"], st.session_state.odds_inputs["oa"]
         def_o25, def_btts = st.session_state.odds_inputs["o_o25"], st.session_state.odds_inputs["o_btts"]
-
+        
         league_data = st.session_state.market_storage.get(code, {})
         found_in_storage = False
 
@@ -866,10 +802,10 @@ with t2:
             for item in league_data["data"]:
                 h_team_api = normalize_name(item.get("home_team", ""))
                 a_team_api = normalize_name(item.get("away_team", ""))
-
+                
                 m_h = get_close_matches(h_team_api, [home], n=1, cutoff=0.8)
                 m_a = get_close_matches(a_team_api, [away], n=1, cutoff=0.8)
-
+                
                 if m_h and m_a and item.get("bookmakers"):
                     oh2, od2, oa2 = match_odds_from_scanner_item(item)
                     if not np.isnan(oh2) and not np.isnan(od2) and not np.isnan(oa2):
@@ -906,9 +842,9 @@ with t2:
             elif k_max_ev == k_ev_d: k_sel, k_p, k_o = "Empate", pd_prob, od
             else: k_sel, k_p, k_o = f"Gana {away}", pa, oa
 
-            k_pct = calculate_kelly(k_p, k_o, fraction=kelly_fraction)
+            k_pct = calculate_kelly(k_p, k_o)
             k_stake = (k_pct / 100) * bank
-            st.success(f"💎 **Recomendación Kelly ({kelly_fraction:.2f}x):** {k_sel} | Stake: ${k_stake:.2f} ({k_pct:.2f}%)")
+            st.success(f"💎 **Recomendación Kelly:** {k_sel} | Stake: ${k_stake:.2f} ({k_pct:.2f}%)")
         else:
             st.warning("📉 Kelly sugiere: **No apostar** (Sin valor esperado positivo)")
 
@@ -917,20 +853,20 @@ with t2:
         with st.form("add_to_ticket"):
             # AHORA EL SELECTOR INCLUYE LOS NUEVOS MERCADOS
             sel_pick_options = [
-                f"Gana {home}",
-                "Empate",
+                f"Gana {home}", 
+                "Empate", 
                 f"Gana {away}",
                 "Over 2.5 Goles",
                 "BTTS (Ambos Anotan)"
             ]
             sel_pick = st.selectbox("Selección", sel_pick_options)
-
+            
             # Lógica para asignar cuota y probabilidad según selección
-            if f"Gana {home}" in sel_pick:
+            if f"Gana {home}" in sel_pick: 
                 sel_odd, sel_prob = oh, ph
-            elif "Empate" in sel_pick:
+            elif "Empate" in sel_pick: 
                 sel_odd, sel_prob = od, pd_prob
-            elif f"Gana {away}" in sel_pick:
+            elif f"Gana {away}" in sel_pick: 
                 sel_odd, sel_prob = oa, pa
             elif "Over 2.5" in sel_pick:
                 sel_odd, sel_prob = odd_o25, po25
@@ -955,17 +891,6 @@ with t2:
         if not st.session_state.ticket:
             st.info("Vacío")
         else:
-            # --- NUEVO: aviso de correlación entre selecciones del mismo partido ---
-            matches_en_ticket = [item["match"] for item in st.session_state.ticket]
-            partidos_repetidos = {m for m in matches_en_ticket if matches_en_ticket.count(m) > 1}
-            if partidos_repetidos:
-                st.warning(
-                    f"⚠️ Tienes más de una selección del mismo partido "
-                    f"({', '.join(partidos_repetidos)}). Estas selecciones NO son "
-                    f"independientes: el riesgo real de la combinada es mayor al "
-                    f"que muestra la cuota total multiplicada."
-                )
-
             total_odd, total_prob = 1.0, 1.0
             for idx, item in enumerate(st.session_state.ticket):
                 st.markdown(
@@ -983,24 +908,7 @@ with t2:
             stake_parlay = st.number_input("Stake ($)", 1.0, 5000.0, 50.0)
             st.success(f"Ganancia: ${(stake_parlay * total_odd) - stake_parlay:.2f}")
 
-            # --- NUEVO: chequeo de límite de exposición diaria antes de guardar ---
-            db_actual = manage_bets("load")
-            exposicion_actual = get_exposure(db_actual, days=1)
-            exposicion_con_nueva = exposicion_actual + stake_parlay
-            limite_monto = bank * (max_exposure_pct / 100)
-
-            if exposicion_con_nueva > limite_monto:
-                st.error(
-                    f"⚠️ Esta apuesta llevaría tu exposición de las últimas 24h a "
-                    f"${exposicion_con_nueva:,.2f}, por encima de tu límite de "
-                    f"${limite_monto:,.2f} ({max_exposure_pct}% del banco: ${bank:,.2f})."
-                )
-                confirmar_igual = st.checkbox("Entiendo el riesgo, guardar de todas formas")
-            else:
-                confirmar_igual = True
-                st.caption(f"Exposición 24h: ${exposicion_con_nueva:,.2f} / ${limite_monto:,.2f} límite")
-
-            if st.button("💾 Guardar") and confirmar_igual:
+            if st.button("💾 Guardar"):
                 tipo_str = "Simple" if len(st.session_state.ticket) == 1 else "Parlay"
                 match_str = st.session_state.ticket[0]["match"] if len(st.session_state.ticket) == 1 else f"Combinada ({len(st.session_state.ticket)})"
                 pick_str = " + ".join([i["pick"] for i in st.session_state.ticket])
@@ -1025,39 +933,39 @@ with t2:
 with t3:
     st.markdown("### 📜 Historial de Apuestas")
     db = manage_bets("load")
-
+    
     if not db.empty:
         # Mostramos la tabla general
         st.dataframe(db.sort_values(by="Fecha", ascending=False), use_container_width=True)
-
+        
         st.divider()
         st.markdown("### 🛠️ Administrar Apuestas")
-
+        
         # Crear lista de opciones legibles para el selector
         # Formato: ID | Fecha | Partido | Pick
         db["Display"] = db.apply(lambda x: f"{x['ID']} | {x['Fecha']} | {x['Partido']} | {x['Pick']}", axis=1)
-
+        
         opciones_apuestas = db["Display"].tolist()
         seleccion_str = st.selectbox("Selecciona la apuesta a editar/borrar:", ["-- Seleccionar --"] + opciones_apuestas)
-
+        
         if seleccion_str != "-- Seleccionar --":
             # Extraer el ID (está al principio de la cadena)
             bet_id = seleccion_str.split(" | ")[0]
-
+            
             # Buscar la fila correspondiente
             fila = db[db["ID"].astype(str) == bet_id].iloc[0]
-
+            
             st.info(f"**Seleccionado:** {fila['Partido']} - {fila['Pick']} (Cuota: {fila['Cuota']})")
-
+            
             c_edit1, c_edit2 = st.columns(2)
-
+            
             with c_edit1:
                 nuevo_estado = st.selectbox("Actualizar Estado:", ["Pendiente", "Ganada", "Perdida", "Push"], index=["Pendiente", "Ganada", "Perdida", "Push"].index(fila["Estado"]) if fila["Estado"] in ["Pendiente", "Ganada", "Perdida", "Push"] else 0)
                 if st.button("💾 Actualizar Estado"):
                     manage_bets("update", id_bet=bet_id, status=nuevo_estado)
                     st.success(f"Apuesta {bet_id} actualizada a {nuevo_estado}.")
                     st.rerun()
-
+            
             with c_edit2:
                 st.write("Zona de peligro")
                 if st.button("🗑️ Eliminar Apuesta definitivamente", type="primary"):
@@ -1122,7 +1030,7 @@ with t4:
 
                 h_api = normalize_name(item.get("home_team",""))
                 a_api = normalize_name(item.get("away_team",""))
-
+                
                 m_h = get_close_matches(h_api, teams, n=1, cutoff=0.8)
                 m_a = get_close_matches(a_api, teams, n=1, cutoff=0.8)
 
@@ -1198,7 +1106,7 @@ with t4:
 
                             m_h = get_close_matches(h_api, teams, n=1, cutoff=0.8)
                             m_a = get_close_matches(a_api, teams, n=1, cutoff=0.8)
-
+                            
                             if not m_h or not m_a:
                                 continue
                             h = m_h[0]; a = m_a[0]
@@ -1287,58 +1195,6 @@ with t6:
             c.metric("Max Drawdown", f"{max_dd:.2f} U")
             d.metric("Apuestas", len(df_finished))
             st.dataframe(df_finished, use_container_width=True)
-
-            # --- NUEVO: Simulador de Montecarlo de la banca ---
-            st.divider()
-            st.markdown("### 🎲 Simulador de Montecarlo (proyección futura)")
-            st.caption(
-                "Usa tus resultados históricos (bootstrap) para simular miles de "
-                "trayectorias posibles de tu banca en las próximas apuestas, "
-                "asumiendo que tu rendimiento futuro se parece al pasado."
-            )
-
-            cmc1, cmc2 = st.columns(2)
-            n_bets_sim = cmc1.slider("Nº de apuestas futuras a simular", 20, 500, 100, step=10)
-            n_sims = cmc2.slider("Nº de simulaciones", 500, 5000, 2000, step=500)
-
-            if st.button("▶️ Simular"):
-                sim = monte_carlo_bankroll(df_finished, bank_inicial=bank, n_bets_futuras=n_bets_sim, n_sims=n_sims)
-
-                if sim is None:
-                    st.warning("Necesitas al menos 10 apuestas finalizadas para un bootstrap confiable.")
-                else:
-                    sa, sb, sc, sd = st.columns(4)
-                    sa.metric("Banca final (mediana)", f"${sim['banca_final_p50']:,.0f}")
-                    sb.metric("Banca final (peor 10%)", f"${sim['banca_final_p10']:,.0f}")
-                    sc.metric("Banca final (mejor 10%)", f"${sim['banca_final_p90']:,.0f}")
-                    sd.metric("Prob. de perder 50%+ del banco", f"{sim['prob_ruina']*100:.1f}%")
-
-                    st.write(
-                        f"**Máximo drawdown esperado:** mediana ${sim['max_dd_p50']:,.0f}, "
-                        f"peor 10% de escenarios: ${sim['max_dd_p10']:,.0f}"
-                    )
-
-                    # Graficar trayectorias de muestra
-                    fig_mc = go.Figure()
-                    muestra_idx = np.random.choice(sim["trayectorias"].shape[0], size=min(50, n_sims), replace=False)
-                    for i in muestra_idx:
-                        fig_mc.add_trace(go.Scatter(
-                            y=sim["trayectorias"][i], mode="lines",
-                            line=dict(width=1, color="rgba(100,150,255,0.15)"),
-                            showlegend=False
-                        ))
-                    mediana_trayectoria = np.median(sim["trayectorias"], axis=0)
-                    fig_mc.add_trace(go.Scatter(
-                        y=mediana_trayectoria, mode="lines",
-                        line=dict(width=3, color="#ffd700"), name="Mediana"
-                    ))
-                    fig_mc.update_layout(
-                        title="Trayectorias simuladas de banca",
-                        xaxis_title="Nº de apuestas futuras",
-                        yaxis_title="Banca ($)",
-                        height=450, template="plotly_dark"
-                    )
-                    st.plotly_chart(fig_mc, use_container_width=True)
     else:
         st.info("Aún no hay historial.")
 
@@ -1428,29 +1284,29 @@ with t7:
                     "A": [mk_a, pa, p[2]],
                 })
                 st.dataframe(comp.style.format({"H":"{:.3f}","D":"{:.3f}","A":"{:.3f}"}), use_container_width=True)
-
+                
                 # --- NUEVA SECCIÓN FEATURE IMPORTANCE ---
                 if hasattr(model, "feature_importances_"):
                     st.divider()
                     st.markdown("### 🔍 Importancia de Variables (Feature Importance)")
                     st.caption("¿Qué está mirando el modelo? (Mkt = Mercado, DC = Dixon-Coles, xG = Expectativa Goles)")
-
+                    
                     # Nombres alineados con build_features_for_match
                     feature_names = [
                         "Mkt H", "Mkt D", "Mkt A",
                         "DC H", "DC D", "DC A",
-                        "xG Home", "xG Away",
+                        "xG Home", "xG Away", 
                         "Diff xG",
                         "SOT Home", "SOT Away"
                     ]
-
+                    
                     # Verificar dimensión por si acaso
                     if len(model.feature_importances_) == len(feature_names):
                         imp_df = pd.DataFrame({
                             "Feature": feature_names,
                             "Importance": model.feature_importances_
                         }).sort_values("Importance", ascending=True)
-
+                        
                         fig_imp = go.Figure(go.Bar(
                             x=imp_df["Importance"],
                             y=imp_df["Feature"],
@@ -1473,11 +1329,11 @@ with t8:
 
     if st.button("🚀 Ejecutar Análisis Masivo (7 Ligas)"):
         master_results = []
-
+        
         # Barra de progreso general
         prog_bar = st.progress(0)
         status_text = st.empty()
-
+        
         total_leagues = len(leagues)
         idx_league = 0
 
@@ -1490,7 +1346,7 @@ with t8:
             # 1. Verificar si hay datos de mercado (Odds) en memoria
             if l_code not in st.session_state.market_storage:
                 continue # Saltamos si no hay datos descargados para esta liga
-
+            
             stored = st.session_state.market_storage[l_code]
             data_api = stored.get("data", [])
             if not data_api:
@@ -1499,17 +1355,17 @@ with t8:
             # 2. Cargar histórico y Entrenar Modelo específico para esta liga
             # Nota: Usamos fetch_live_soccer_data con el código de la liga del loop, no la seleccionada en sidebar
             df_loop = fetch_live_soccer_data(l_code, n_seasons=N_SEASONS)
-
+            
             if df_loop.empty or len(df_loop) < 200:
                 continue
 
             snap_loop = train_snapshot_cached(df_loop, window_matches=win_multi, seed=42)
-
+            
             if snap_loop is None:
                 continue
 
             model_loop, stats_loop, avgh_loop, avga_loop = snap_loop
-
+            
             # 3. Predecir partidos
             now_utc = pd.Timestamp.now(tz="UTC")
             league_rows = []
@@ -1517,14 +1373,14 @@ with t8:
             for item in data_api:
                 match_date = pd.to_datetime(item.get("commence_time"), utc=True, errors="coerce")
                 if pd.isna(match_date): continue
-
+                
                 # Filtro de tiempo (próxima semana)
                 diff_hours = (match_date - now_utc).total_seconds()/3600
                 if diff_hours > 168 or diff_hours < -5: continue
 
                 h_api = normalize_name(item.get("home_team",""))
                 a_api = normalize_name(item.get("away_team",""))
-
+                
                 # Obtener lista de equipos del DF de ESTA liga
                 teams_loop = sorted(list(set(df_loop["home"].unique()) | set(df_loop["away"].unique())))
 
@@ -1566,12 +1422,12 @@ with t8:
                 # Guardar resultados y mostrar Expander
                 df_res_league = pd.DataFrame(league_rows).sort_values("EV", ascending=False)
                 master_results.extend(league_rows)
-
+                
                 with st.expander(f"⚽ {l_name} ({len(league_rows)} picks)", expanded=True):
                     # Formato visual para las columnas nuevas
                     st.dataframe(
-                        df_res_league.style.format({"EV": "{:.3f}"}),
-                        use_container_width=True,
+                        df_res_league.style.format({"EV": "{:.3f}"}), 
+                        use_container_width=True, 
                         hide_index=True
                     )
             else:
@@ -1593,3 +1449,4 @@ with t8:
             )
     else:
         st.info("Presiona el botón para iniciar el escaneo de todas las ligas configuradas.")
+
