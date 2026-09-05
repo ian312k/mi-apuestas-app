@@ -5,6 +5,7 @@ import numpy as np
 from scipy.stats import poisson
 import plotly.graph_objects as go
 import os
+import io
 import requests
 from difflib import get_close_matches
 from datetime import datetime
@@ -74,7 +75,6 @@ if "api_key" not in st.session_state: st.session_state.api_key = ""
 if "api_usage" not in st.session_state: st.session_state.api_usage = {"used": 0, "remaining": 500}
 if "market_storage" not in st.session_state: st.session_state.market_storage = {}
 if "odds_inputs" not in st.session_state:
-    # Agregamos o_o25 y o_btts al estado por defecto
     st.session_state.odds_inputs = {"oh": 2.0, "od": 3.2, "oa": 3.5, "o_o25": 1.90, "o_btts": 1.90}
 
 st.markdown("""
@@ -86,7 +86,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ======================================================
-# 2. DATA + API
+# 2. DATA + API (DESCARGA ROBUSTA CON HEADERS)
 # ======================================================
 @st.cache_data(ttl=3600)
 def fetch_live_soccer_data(league_code="SP1", n_seasons=3):
@@ -99,15 +99,19 @@ def fetch_live_soccer_data(league_code="SP1", n_seasons=3):
     current_start_year = today.year if today.month >= 7 else (today.year - 1)
     seasons = [season_code(current_start_year - i) for i in range(n_seasons)]
 
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+
     frames = []
     for s in seasons:
         url = f"https://www.football-data.co.uk/mmz4281/{s}/{league_code}.csv"
         try:
-            tmp = pd.read_csv(url, encoding="latin1")
-            
-            cols = ["Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG", "B365H", "B365D", "B365A", "HST", "AST"]
-            actual_cols = [c for c in cols if c in tmp.columns]
-            tmp = tmp[actual_cols].copy()
+            res = requests.get(url, headers=headers, timeout=12)
+            if res.status_code != 200:
+                continue
+
+            tmp = pd.read_csv(io.StringIO(res.content.decode("latin1", errors="ignore")))
 
             rename_map = {
                 "Date": "date", "HomeTeam": "home", "AwayTeam": "away",
@@ -115,21 +119,29 @@ def fetch_live_soccer_data(league_code="SP1", n_seasons=3):
                 "B365H": "odd_h", "B365D": "odd_d", "B365A": "odd_a",
                 "HST": "sot_h", "AST": "sot_a"
             }
-            tmp = tmp.rename(columns=rename_map)
-
-            tmp["home"] = tmp["home"].astype(str).str.strip()
-            tmp["away"] = tmp["away"].astype(str).str.strip()
+            present_cols = {k: v for k, v in rename_map.items() if k in tmp.columns}
+            tmp = tmp[list(present_cols.keys())].rename(columns=present_cols).copy()
 
             for c in ["odd_h", "odd_d", "odd_a"]:
-                if c not in tmp.columns: tmp[c] = 1.0
+                if c not in tmp.columns:
+                    tmp[c] = 1.0
             for c in ["sot_h", "sot_a"]:
-                if c not in tmp.columns: tmp[c] = 0
+                if c not in tmp.columns:
+                    tmp[c] = 0
 
             tmp = tmp.dropna(subset=["home", "away", "home_goals", "away_goals"])
+            tmp["home"] = tmp["home"].astype(str).str.strip()
+            tmp["away"] = tmp["away"].astype(str).str.strip()
+            tmp["home_goals"] = pd.to_numeric(tmp["home_goals"], errors="coerce")
+            tmp["away_goals"] = pd.to_numeric(tmp["away_goals"], errors="coerce")
+            tmp = tmp.dropna(subset=["home_goals", "away_goals"])
+
             tmp["date"] = pd.to_datetime(tmp["date"], dayfirst=True, errors="coerce")
-            tmp = tmp.dropna(subset=["date"]).fillna(0)
+            tmp = tmp.dropna(subset=["date"])
             tmp["season"] = s
-            frames.append(tmp)
+
+            if not tmp.empty:
+                frames.append(tmp)
         except Exception:
             continue
 
@@ -213,7 +225,7 @@ def calculate_strengths(df, ref_date=None, alpha=0.004, mix_factor=0.7, window_m
 
 def predict_match_dixon_coles(home, away, team_stats, avg_h, avg_a, rho=-0.13, max_goals=10):
     if home not in team_stats or away not in team_stats:
-        return 0,0,0,0,0,0,0,0,[],np.zeros((1,1))
+        return 0, 0, 0, 0, 0, 0, 0, 0, [], np.zeros((1, 1))
 
     h_exp = team_stats[home]["att_h"] * team_stats[away]["def_a"] * avg_h
     a_exp = team_stats[away]["att_a"] * team_stats[home]["def_h"] * avg_a
@@ -271,24 +283,21 @@ def manage_bets(mode, data=None, id_bet=None, status=None):
         df.to_csv(CSV_FILE, index=False)
 
     elif mode == "update":
-        # Corregido: convertir ID a string para evitar errores de tipo
         idx = df[df["ID"].astype(str) == str(id_bet)].index
         if not idx.empty:
             i = idx[0]
             df.at[i, "Estado"] = status
-            # Cálculo de ganancia
             if status == "Ganada":
                 profit = (float(df.at[i, "Stake"]) * float(df.at[i, "Cuota"])) - float(df.at[i, "Stake"])
             elif status == "Perdida":
                 profit = -float(df.at[i, "Stake"])
-            else: # Push o Cancelada
+            else:
                 profit = 0.0
             
             df.at[i, "Ganancia"] = profit
             df.to_csv(CSV_FILE, index=False)
 
     elif mode == "delete":
-        # Corregido: convertir ID a string
         df = df[df["ID"].astype(str) != str(id_bet)]
         df.to_csv(CSV_FILE, index=False)
 
@@ -518,8 +527,7 @@ def fast_eval_ml(df, n_test=200, min_train=500, window_matches=1200):
     br = brier_multiclass(P, y)
     return {"mode": "rápido", "n": int(len(y)), "logloss": ll, "brier": br}
 
-def strict_walkforward_eval_ml_blocks(df, n_test=200, min_train=500, window_matches=1200,
-                                      retrain_every=10, train_step=2):
+def strict_walkforward_eval_ml_blocks(df, n_test=200, min_train=500, window_matches=1200, retrain_every=10, train_step=2):
     df_sorted = df.dropna(subset=["date","home","away","home_goals","away_goals"]).sort_values("date").reset_index(drop=True)
     test_block = df_sorted.tail(n_test).copy()
 
@@ -666,7 +674,6 @@ def predict_ml_for_match(home_team, away_team, oh, od, oa, model, team_stats, av
 with st.sidebar:
     st.header("⚙️ Configuración")
     
-    # CORRECCIÓN AQUÍ: Se agrega key única para evitar DuplicateElementId
     if st.button("🔄 Actualizar Datos", key="update_btn"):
         st.cache_data.clear()
         st.rerun()
@@ -851,7 +858,6 @@ with t2:
         st.divider()
         st.markdown("### ➕ Agregar al Ticket")
         with st.form("add_to_ticket"):
-            # AHORA EL SELECTOR INCLUYE LOS NUEVOS MERCADOS
             sel_pick_options = [
                 f"Gana {home}", 
                 "Empate", 
@@ -861,7 +867,6 @@ with t2:
             ]
             sel_pick = st.selectbox("Selección", sel_pick_options)
             
-            # Lógica para asignar cuota y probabilidad según selección
             if f"Gana {home}" in sel_pick: 
                 sel_odd, sel_prob = oh, ph
             elif "Empate" in sel_pick: 
@@ -929,36 +934,27 @@ with t2:
                 st.balloons()
                 st.rerun()
 
-# --- TAB 3: HISTORIAL (MEJORADO) ---
+# --- TAB 3: HISTORIAL ---
 with t3:
     st.markdown("### 📜 Historial de Apuestas")
     db = manage_bets("load")
     
     if not db.empty:
-        # Mostramos la tabla general
         st.dataframe(db.sort_values(by="Fecha", ascending=False), use_container_width=True)
         
         st.divider()
         st.markdown("### 🛠️ Administrar Apuestas")
         
-        # Crear lista de opciones legibles para el selector
-        # Formato: ID | Fecha | Partido | Pick
         db["Display"] = db.apply(lambda x: f"{x['ID']} | {x['Fecha']} | {x['Partido']} | {x['Pick']}", axis=1)
-        
         opciones_apuestas = db["Display"].tolist()
         seleccion_str = st.selectbox("Selecciona la apuesta a editar/borrar:", ["-- Seleccionar --"] + opciones_apuestas)
         
         if seleccion_str != "-- Seleccionar --":
-            # Extraer el ID (está al principio de la cadena)
             bet_id = seleccion_str.split(" | ")[0]
-            
-            # Buscar la fila correspondiente
             fila = db[db["ID"].astype(str) == bet_id].iloc[0]
-            
             st.info(f"**Seleccionado:** {fila['Partido']} - {fila['Pick']} (Cuota: {fila['Cuota']})")
             
             c_edit1, c_edit2 = st.columns(2)
-            
             with c_edit1:
                 nuevo_estado = st.selectbox("Actualizar Estado:", ["Pendiente", "Ganada", "Perdida", "Push"], index=["Pendiente", "Ganada", "Perdida", "Push"].index(fila["Estado"]) if fila["Estado"] in ["Pendiente", "Ganada", "Perdida", "Push"] else 0)
                 if st.button("💾 Actualizar Estado"):
@@ -972,7 +968,6 @@ with t3:
                     manage_bets("delete", id_bet=bet_id)
                     st.warning(f"Apuesta {bet_id} eliminada.")
                     st.rerun()
-
     else:
         st.warning("Aún no hay historial.")
 
@@ -1118,7 +1113,7 @@ with t4:
                                 continue
 
                             p, (ev_h, ev_d, ev_a), pick = predict_ml_for_match(h, a, float(oh2), float(od2), float(oa2),
-                                                                        model, team_stats2, avg_h2, avg_a2)
+                                                                                model, team_stats2, avg_h2, avg_a2)
                             best_ev = np.nanmax([ev_h, ev_d, ev_a])
                             if only_positive_ev and (np.isnan(best_ev) or best_ev <= 0):
                                 continue
@@ -1285,13 +1280,11 @@ with t7:
                 })
                 st.dataframe(comp.style.format({"H":"{:.3f}","D":"{:.3f}","A":"{:.3f}"}), use_container_width=True)
                 
-                # --- NUEVA SECCIÓN FEATURE IMPORTANCE ---
                 if hasattr(model, "feature_importances_"):
                     st.divider()
                     st.markdown("### 🔍 Importancia de Variables (Feature Importance)")
                     st.caption("¿Qué está mirando el modelo? (Mkt = Mercado, DC = Dixon-Coles, xG = Expectativa Goles)")
                     
-                    # Nombres alineados con build_features_for_match
                     feature_names = [
                         "Mkt H", "Mkt D", "Mkt A",
                         "DC H", "DC D", "DC A",
@@ -1300,7 +1293,6 @@ with t7:
                         "SOT Home", "SOT Away"
                     ]
                     
-                    # Verificar dimensión por si acaso
                     if len(model.feature_importances_) == len(feature_names):
                         imp_df = pd.DataFrame({
                             "Feature": feature_names,
@@ -1330,7 +1322,6 @@ with t8:
     if st.button("🚀 Ejecutar Análisis Masivo (7 Ligas)"):
         master_results = []
         
-        # Barra de progreso general
         prog_bar = st.progress(0)
         status_text = st.empty()
         
@@ -1343,30 +1334,25 @@ with t8:
             prog_bar.progress(prog)
             status_text.text(f"Analizando {l_name} ({l_code})...")
 
-            # 1. Verificar si hay datos de mercado (Odds) en memoria
             if l_code not in st.session_state.market_storage:
-                continue # Saltamos si no hay datos descargados para esta liga
+                continue
             
             stored = st.session_state.market_storage[l_code]
             data_api = stored.get("data", [])
             if not data_api:
                 continue
 
-            # 2. Cargar histórico y Entrenar Modelo específico para esta liga
-            # Nota: Usamos fetch_live_soccer_data con el código de la liga del loop, no la seleccionada en sidebar
             df_loop = fetch_live_soccer_data(l_code, n_seasons=N_SEASONS)
             
             if df_loop.empty or len(df_loop) < 200:
                 continue
 
             snap_loop = train_snapshot_cached(df_loop, window_matches=win_multi, seed=42)
-            
             if snap_loop is None:
                 continue
 
             model_loop, stats_loop, avgh_loop, avga_loop = snap_loop
             
-            # 3. Predecir partidos
             now_utc = pd.Timestamp.now(tz="UTC")
             league_rows = []
 
@@ -1374,14 +1360,12 @@ with t8:
                 match_date = pd.to_datetime(item.get("commence_time"), utc=True, errors="coerce")
                 if pd.isna(match_date): continue
                 
-                # Filtro de tiempo (próxima semana)
                 diff_hours = (match_date - now_utc).total_seconds()/3600
                 if diff_hours > 168 or diff_hours < -5: continue
 
                 h_api = normalize_name(item.get("home_team",""))
                 a_api = normalize_name(item.get("away_team",""))
                 
-                # Obtener lista de equipos del DF de ESTA liga
                 teams_loop = sorted(list(set(df_loop["home"].unique()) | set(df_loop["away"].unique())))
 
                 m_h = get_close_matches(h_api, teams_loop, n=1, cutoff=0.8)
@@ -1395,10 +1379,7 @@ with t8:
                 oh2, od2, oa2 = match_odds_from_scanner_item(item)
                 if np.isnan(oh2) or np.isnan(od2) or np.isnan(oa2) or oh2<=1.01: continue
 
-                # A) Predicción Dixon-Coles (para mostrar en columna)
                 _, _, dc_h, dc_d, dc_a, *_ = predict_match_dixon_coles(h_team, a_team, stats_loop, avgh_loop, avga_loop)
-
-                # B) Predicción ML (para el cálculo de EV y Pick)
                 p, (ev_h, ev_d, ev_a), pick = predict_ml_for_match(
                     h_team, a_team, float(oh2), float(od2), float(oa2),
                     model_loop, stats_loop, avgh_loop, avga_loop
@@ -1412,19 +1393,17 @@ with t8:
                     "Fecha": match_date.strftime("%d/%m %H:%M"),
                     "Partido": f"{h_team} vs {a_team}",
                     "Cuotas": f"{oh2:.2f}|{od2:.2f}|{oa2:.2f}",
-                    "DC Prob": f"{dc_h:.2f}|{dc_d:.2f}|{dc_a:.2f}",   # <--- NUEVA COLUMNA AGREGADA
+                    "DC Prob": f"{dc_h:.2f}|{dc_d:.2f}|{dc_a:.2f}",
                     "ML Prob": f"{p[0]:.2f}|{p[1]:.2f}|{p[2]:.2f}",
                     "EV": best_ev,
                     "Pick": pick
                 })
 
             if league_rows:
-                # Guardar resultados y mostrar Expander
                 df_res_league = pd.DataFrame(league_rows).sort_values("EV", ascending=False)
                 master_results.extend(league_rows)
                 
                 with st.expander(f"⚽ {l_name} ({len(league_rows)} picks)", expanded=True):
-                    # Formato visual para las columnas nuevas
                     st.dataframe(
                         df_res_league.style.format({"EV": "{:.3f}"}), 
                         use_container_width=True, 
@@ -1449,4 +1428,3 @@ with t8:
             )
     else:
         st.info("Presiona el botón para iniciar el escaneo de todas las ligas configuradas.")
-
