@@ -86,32 +86,32 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ======================================================
-# 2. DATA + API (DESCARGA ROBUSTA CON HEADERS)
+# 2. DATA + API (DESCARGA ROBUSTA Y CANDIDATOS VÁLIDOS)
 # ======================================================
 @st.cache_data(ttl=3600)
 def fetch_live_soccer_data(league_code="SP1", n_seasons=3):
-    def season_code(start_year: int) -> str:
-        yy = start_year % 100
-        yy2 = (start_year + 1) % 100
-        return f"{yy:02d}{yy2:02d}"
-
-    today = datetime.now()
-    current_start_year = today.year if today.month >= 7 else (today.year - 1)
-    seasons = [season_code(current_start_year - i) for i in range(n_seasons)]
-
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
 
+    # Códigos de temporada reales de Football-Data.co.uk ordenados de más reciente a más antiguo
+    candidate_seasons = ["2627", "2526", "2425", "2324", "2223", "2122"]
+
     frames = []
-    for s in seasons:
+    seasons_loaded = 0
+
+    for s in candidate_seasons:
+        if seasons_loaded >= n_seasons:
+            break
+
         url = f"https://www.football-data.co.uk/mmz4281/{s}/{league_code}.csv"
         try:
-            res = requests.get(url, headers=headers, timeout=12)
-            if res.status_code != 200:
+            res = requests.get(url, headers=headers, timeout=10)
+            if res.status_code != 200 or len(res.content) < 300:
                 continue
 
-            tmp = pd.read_csv(io.StringIO(res.content.decode("latin1", errors="ignore")))
+            content = res.content.decode("latin1", errors="ignore")
+            tmp = pd.read_csv(io.StringIO(content))
 
             rename_map = {
                 "Date": "date", "HomeTeam": "home", "AwayTeam": "away",
@@ -119,7 +119,11 @@ def fetch_live_soccer_data(league_code="SP1", n_seasons=3):
                 "B365H": "odd_h", "B365D": "odd_d", "B365A": "odd_a",
                 "HST": "sot_h", "AST": "sot_a"
             }
+
             present_cols = {k: v for k, v in rename_map.items() if k in tmp.columns}
+            if "Date" not in present_cols or "HomeTeam" not in present_cols or "AwayTeam" not in present_cols:
+                continue
+
             tmp = tmp[list(present_cols.keys())].rename(columns=present_cols).copy()
 
             for c in ["odd_h", "odd_d", "odd_a"]:
@@ -140,8 +144,10 @@ def fetch_live_soccer_data(league_code="SP1", n_seasons=3):
             tmp = tmp.dropna(subset=["date"])
             tmp["season"] = s
 
-            if not tmp.empty:
+            if len(tmp) >= 10:
                 frames.append(tmp)
+                seasons_loaded += 1
+
         except Exception:
             continue
 
@@ -689,8 +695,6 @@ with st.sidebar:
         "I1": "🇮🇹 Serie A",
         "D1": "🇩🇪 Bundesliga",
         "F1": "🇫🇷 Ligue 1",
-        "N1": "🇳🇱 Eredivisie",
-        "P1": "🇵🇹 Primeira Liga",
     }
 
     code = st.selectbox("Liga", list(leagues.keys()), format_func=lambda x: leagues[x])
@@ -981,8 +985,6 @@ with t4:
         "I1": "soccer_italy_serie_a",
         "D1": "soccer_germany_bundesliga",
         "F1": "soccer_france_ligue_one",
-        "N1": "soccer_netherlands_eredivisie",
-        "P1": "soccer_portugal_primeira_liga",
     }
 
     api_key_input = st.text_input("🔑 API Key:", value=st.session_state.api_key, type="password")
@@ -1313,13 +1315,13 @@ with t7:
 # --- TAB 8: MULTI-LIGA SUPER ESCANER ---
 with t8:
     st.markdown("## 🌎 Super Escáner: Todas las Ligas")
-    st.caption("Analiza las 7 ligas configuradas de una sola vez. Requiere que hayas descargado datos del escáner previamente para cada liga o uses los datos en memoria.")
+    st.caption("Analiza las ligas configuradas de una sola vez. Requiere que hayas descargado datos del escáner previamente para cada liga o uses los datos en memoria.")
 
     col_multi_1, col_multi_2 = st.columns(2)
     win_multi = col_multi_1.slider("Ventana entrenamiento (Multi)", 300, 3000, 1200, step=100)
     min_ev_multi = col_multi_2.slider("EV mínimo (Multi)", 0.0, 0.20, 0.00, step=0.01)
 
-    if st.button("🚀 Ejecutar Análisis Masivo (7 Ligas)"):
+    if st.button("🚀 Ejecutar Análisis Masivo"):
         master_results = []
         
         prog_bar = st.progress(0)
