@@ -91,11 +91,13 @@ st.markdown("""
 @st.cache_data(ttl=3600)
 def fetch_live_soccer_data(league_code="SP1", n_seasons=3):
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,es;q=0.8"
     }
 
-    # Códigos de temporada reales de Football-Data.co.uk ordenados de más reciente a más antiguo
-    candidate_seasons = ["2627", "2526", "2425", "2324", "2223", "2122"]
+    # Temporadas ordenadas de más recientes a más antiguas
+    candidate_seasons = ["2526", "2425", "2324", "2223", "2122", "2021"]
 
     frames = []
     seasons_loaded = 0
@@ -106,12 +108,15 @@ def fetch_live_soccer_data(league_code="SP1", n_seasons=3):
 
         url = f"https://www.football-data.co.uk/mmz4281/{s}/{league_code}.csv"
         try:
-            res = requests.get(url, headers=headers, timeout=10)
+            res = requests.get(url, headers=headers, timeout=12)
             if res.status_code != 200 or len(res.content) < 300:
                 continue
 
             content = res.content.decode("latin1", errors="ignore")
             tmp = pd.read_csv(io.StringIO(content))
+            
+            # Limpiar espacios en blanco residuales en los nombres de columnas
+            tmp.columns = tmp.columns.astype(str).str.strip()
 
             rename_map = {
                 "Date": "date", "HomeTeam": "home", "AwayTeam": "away",
@@ -121,7 +126,7 @@ def fetch_live_soccer_data(league_code="SP1", n_seasons=3):
             }
 
             present_cols = {k: v for k, v in rename_map.items() if k in tmp.columns}
-            if "Date" not in present_cols or "HomeTeam" not in present_cols or "AwayTeam" not in present_cols:
+            if not all(k in present_cols for k in ["Date", "HomeTeam", "AwayTeam"]):
                 continue
 
             tmp = tmp[list(present_cols.keys())].rename(columns=present_cols).copy()
@@ -140,7 +145,17 @@ def fetch_live_soccer_data(league_code="SP1", n_seasons=3):
             tmp["away_goals"] = pd.to_numeric(tmp["away_goals"], errors="coerce")
             tmp = tmp.dropna(subset=["home_goals", "away_goals"])
 
-            tmp["date"] = pd.to_datetime(tmp["date"], dayfirst=True, errors="coerce")
+            # Conversión de fecha tolerante a múltiples formatos
+            tmp["date"] = pd.to_datetime(tmp["date"], format="%d/%m/%Y", errors="coerce")
+            null_mask = tmp["date"].isna()
+            if null_mask.any():
+                tmp.loc[null_mask, "date"] = pd.to_datetime(tmp.loc[null_mask, "date"], format="%d/%m/%y", errors="coerce")
+            
+            # Fallback genérico para cualquier fila restante
+            null_mask2 = tmp["date"].isna()
+            if null_mask2.any():
+                tmp.loc[null_mask2, "date"] = pd.to_datetime(tmp.loc[null_mask2, "date"], dayfirst=True, errors="coerce")
+
             tmp = tmp.dropna(subset=["date"])
             tmp["season"] = s
 
@@ -865,8 +880,8 @@ with t2:
             sel_pick_options = [
                 f"Gana {home}", 
                 "Empate", 
-                f"Gana {away}",
-                "Over 2.5 Goles",
+                f"Gana {away}", 
+                "Over 2.5 Goles", 
                 "BTTS (Ambos Anotan)"
             ]
             sel_pick = st.selectbox("Selección", sel_pick_options)
@@ -877,11 +892,11 @@ with t2:
                 sel_odd, sel_prob = od, pd_prob
             elif f"Gana {away}" in sel_pick: 
                 sel_odd, sel_prob = oa, pa
-            elif "Over 2.5" in sel_pick:
+            elif "Over 2.5" in sel_pick: 
                 sel_odd, sel_prob = odd_o25, po25
-            elif "BTTS" in sel_pick:
+            elif "BTTS" in sel_pick: 
                 sel_odd, sel_prob = odd_btts, pbtts
-            else:
+            else: 
                 sel_odd, sel_prob = 1.0, 0.0
 
             if st.form_submit_button("Añadir selección"):
@@ -1142,9 +1157,9 @@ with t4:
                             st.dataframe(out_df.style.format({"EV_H":"{:.3f}","EV_D":"{:.3f}","EV_A":"{:.3f}","Mejor EV":"{:.3f}"}),
                                          use_container_width=True)
                             st.download_button("📥 Descargar jornada (CSV)",
-                                                data=out_df.to_csv(index=False).encode("utf-8"),
-                                                file_name=f"jornada_ml_{code}.csv",
-                                                mime="text/csv")
+                                               data=out_df.to_csv(index=False).encode("utf-8"),
+                                               file_name=f"jornada_ml_{code}.csv",
+                                               mime="text/csv")
     else:
         st.info("Pon tu API key para usar el escáner y jornada.")
 
