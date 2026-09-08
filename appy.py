@@ -89,80 +89,86 @@ st.markdown("""
 # 2. DATA + API (DESCARGA ROBUSTA Y CANDIDATOS VÁLIDOS)
 # ======================================================
 @st.cache_data(ttl=3600)
+# ======================================================
+# Reemplaza tu función fetch_live_soccer_data en app.py por esta versión.
+# Lee primero de /data (archivos cacheados por el GitHub Action) y, si no
+# encuentra el archivo local, intenta la descarga en vivo como respaldo.
+# ======================================================
+
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+
+@st.cache_data(ttl=3600)
 def fetch_live_soccer_data(league_code="SP1", n_seasons=3):
+    def season_code(start_year: int) -> str:
+        yy = start_year % 100
+        yy2 = (start_year + 1) % 100
+        return f"{yy:02d}{yy2:02d}"
+
+    today = datetime.now()
+    current_start_year = today.year if today.month >= 7 else (today.year - 1)
+    seasons = [season_code(current_start_year - i) for i in range(n_seasons)]
+
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9,es;q=0.8"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
 
-    # Temporadas ordenadas de más recientes a más antiguas
-    candidate_seasons = ["2526", "2425", "2324", "2223", "2122", "2021"]
+    rename_map = {
+        "Date": "date", "HomeTeam": "home", "AwayTeam": "away",
+        "FTHG": "home_goals", "FTAG": "away_goals",
+        "B365H": "odd_h", "B365D": "odd_d", "B365A": "odd_a",
+        "HST": "sot_h", "AST": "sot_a"
+    }
+
+    def parse_csv_bytes(raw_bytes, season_label):
+        tmp = pd.read_csv(io.StringIO(raw_bytes.decode("latin1", errors="ignore")))
+        present_cols = {k: v for k, v in rename_map.items() if k in tmp.columns}
+        tmp = tmp[list(present_cols.keys())].rename(columns=present_cols).copy()
+
+        for c in ["odd_h", "odd_d", "odd_a"]:
+            if c not in tmp.columns:
+                tmp[c] = 1.0
+        for c in ["sot_h", "sot_a"]:
+            if c not in tmp.columns:
+                tmp[c] = 0
+
+        tmp = tmp.dropna(subset=["home", "away", "home_goals", "away_goals"])
+        tmp["home"] = tmp["home"].astype(str).str.strip()
+        tmp["away"] = tmp["away"].astype(str).str.strip()
+        tmp["home_goals"] = pd.to_numeric(tmp["home_goals"], errors="coerce")
+        tmp["away_goals"] = pd.to_numeric(tmp["away_goals"], errors="coerce")
+        tmp = tmp.dropna(subset=["home_goals", "away_goals"])
+
+        tmp["date"] = pd.to_datetime(tmp["date"], dayfirst=True, errors="coerce")
+        tmp = tmp.dropna(subset=["date"])
+        tmp["season"] = season_label
+        return tmp
 
     frames = []
-    seasons_loaded = 0
+    for s in seasons:
+        local_path = os.path.join(DATA_DIR, f"{league_code}_{s}.csv")
 
-    for s in candidate_seasons:
-        if seasons_loaded >= n_seasons:
-            break
+        # 1) Intentar leer del archivo local cacheado por el GitHub Action
+        if os.path.exists(local_path):
+            try:
+                with open(local_path, "rb") as f:
+                    raw = f.read()
+                tmp = parse_csv_bytes(raw, s)
+                if not tmp.empty:
+                    frames.append(tmp)
+                    continue
+            except Exception:
+                pass  # si falla el archivo local, caemos al intento en vivo
 
+        # 2) Respaldo: descarga en vivo (puede fallar en Streamlit Cloud
+        #    si football-data.co.uk bloquea la IP del hosting)
         url = f"https://www.football-data.co.uk/mmz4281/{s}/{league_code}.csv"
         try:
             res = requests.get(url, headers=headers, timeout=12)
-            if res.status_code != 200 or len(res.content) < 300:
+            if res.status_code != 200:
                 continue
-
-            content = res.content.decode("latin1", errors="ignore")
-            tmp = pd.read_csv(io.StringIO(content))
-            
-            # Limpiar espacios en blanco residuales en los nombres de columnas
-            tmp.columns = tmp.columns.astype(str).str.strip()
-
-            rename_map = {
-                "Date": "date", "HomeTeam": "home", "AwayTeam": "away",
-                "FTHG": "home_goals", "FTAG": "away_goals",
-                "B365H": "odd_h", "B365D": "odd_d", "B365A": "odd_a",
-                "HST": "sot_h", "AST": "sot_a"
-            }
-
-            present_cols = {k: v for k, v in rename_map.items() if k in tmp.columns}
-            if not all(k in present_cols for k in ["Date", "HomeTeam", "AwayTeam"]):
-                continue
-
-            tmp = tmp[list(present_cols.keys())].rename(columns=present_cols).copy()
-
-            for c in ["odd_h", "odd_d", "odd_a"]:
-                if c not in tmp.columns:
-                    tmp[c] = 1.0
-            for c in ["sot_h", "sot_a"]:
-                if c not in tmp.columns:
-                    tmp[c] = 0
-
-            tmp = tmp.dropna(subset=["home", "away", "home_goals", "away_goals"])
-            tmp["home"] = tmp["home"].astype(str).str.strip()
-            tmp["away"] = tmp["away"].astype(str).str.strip()
-            tmp["home_goals"] = pd.to_numeric(tmp["home_goals"], errors="coerce")
-            tmp["away_goals"] = pd.to_numeric(tmp["away_goals"], errors="coerce")
-            tmp = tmp.dropna(subset=["home_goals", "away_goals"])
-
-            # Conversión de fecha tolerante a múltiples formatos
-            tmp["date"] = pd.to_datetime(tmp["date"], format="%d/%m/%Y", errors="coerce")
-            null_mask = tmp["date"].isna()
-            if null_mask.any():
-                tmp.loc[null_mask, "date"] = pd.to_datetime(tmp.loc[null_mask, "date"], format="%d/%m/%y", errors="coerce")
-            
-            # Fallback genérico para cualquier fila restante
-            null_mask2 = tmp["date"].isna()
-            if null_mask2.any():
-                tmp.loc[null_mask2, "date"] = pd.to_datetime(tmp.loc[null_mask2, "date"], dayfirst=True, errors="coerce")
-
-            tmp = tmp.dropna(subset=["date"])
-            tmp["season"] = s
-
-            if len(tmp) >= 10:
+            tmp = parse_csv_bytes(res.content, s)
+            if not tmp.empty:
                 frames.append(tmp)
-                seasons_loaded += 1
-
         except Exception:
             continue
 
