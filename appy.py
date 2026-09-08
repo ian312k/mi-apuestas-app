@@ -26,7 +26,6 @@ from sklearn.metrics import log_loss
 # ======================================================
 st.set_page_config(page_title="Analisis predictivo de futbol (football-data.org)", layout="wide", page_icon="🛡️")
 CSV_FILE = "mis_apuestas_pro.csv"
-
 DEFAULT_API_KEY = "67fbbbfe88854afcba6116b35df04daa"
 
 # Códigos oficiales de competiciones en football-data.org
@@ -40,7 +39,7 @@ COMPETITION_MAP = {
     "PPL": "🇵🇹 Primeira Liga",
 }
 
-# Normalizador de nombres oficiales a formato común
+# Normalizador de nombres oficiales a formato legible
 TEAM_MAP = {
     "Manchester City FC": "Man City",
     "Manchester United FC": "Man United",
@@ -54,6 +53,15 @@ TEAM_MAP = {
     "Chelsea FC": "Chelsea",
     "Liverpool FC": "Liverpool",
     "Aston Villa FC": "Aston Villa",
+    "Everton FC": "Everton",
+    "Fulham FC": "Fulham",
+    "Brentford FC": "Brentford",
+    "Crystal Palace FC": "Crystal Palace",
+    "AFC Bournemouth": "Bournemouth",
+    "Leicester City FC": "Leicester",
+    "Ipswich Town FC": "Ipswich",
+    "Southampton FC": "Southampton",
+    
     "Athletic Club": "Ath Bilbao",
     "Club Atlético de Madrid": "Ath Madrid",
     "Real Betis Balompié": "Betis",
@@ -64,10 +72,29 @@ TEAM_MAP = {
     "Deportivo Alavés": "Alaves",
     "FC Barcelona": "Barcelona",
     "Real Madrid CF": "Real Madrid",
+    "Sevilla FC": "Sevilla",
+    "Valencia CF": "Valencia",
+    "Villarreal CF": "Villarreal",
+    "Girona FC": "Girona",
+    "Getafe CF": "Getafe",
+    "CA Osasuna": "Osasuna",
+    "RCD Mallorca": "Mallorca",
+    "UD Las Palmas": "Las Palmas",
+    "CD Leganés": "Leganes",
+    "Real Valladolid CF": "Valladolid",
+    
     "FC Internazionale Milano": "Inter",
     "AC Milan": "Milan",
     "AS Roma": "Roma",
     "Juventus FC": "Juventus",
+    "SSC Napoli": "Napoli",
+    "SS Lazio": "Lazio",
+    "ACF Fiorentina": "Fiorentina",
+    "Atalanta BC": "Atalanta",
+    "Bologna FC 1909": "Bologna",
+    "Torino FC": "Torino",
+    "Hellas Verona FC": "Verona",
+    "Parma Calcio 1913": "Parma",
 }
 
 def normalize_name(name):
@@ -89,72 +116,67 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ======================================================
-# 2. DATA VIA FOOTBALL-DATA.ORG (HISTÓRICO Y FIXTURES)
+# 2. DATA VIA FOOTBALL-DATA.ORG (MULTITEMPORADA)
 # ======================================================
-@st.cache_data(ttl=3600, show_spinner="Descargando datos desde football-data.org...")
-def fetch_competition_data(comp_code, api_key):
-    """
-    Descarga los partidos de la temporada en curso directamente desde api.football-data.org
-    """
-    url = f"https://api.football-data.org/v4/competitions/{comp_code}/matches"
+@st.cache_data(ttl=3600, show_spinner="Descargando histórico de varias temporadas desde football-data.org...")
+def fetch_competition_data(comp_code, api_key, n_seasons=3):
+    today = datetime.now()
+    current_season_year = today.year if today.month >= 7 else (today.year - 1)
+    target_years = [current_season_year - i for i in range(n_seasons)]
+
     headers = {"X-Auth-Token": api_key.strip()}
-    
-    try:
-        res = requests.get(url, headers=headers, timeout=12)
-        if res.status_code == 403:
-            return pd.DataFrame(), [], "Error 403: Token inválido o sin permisos para esta liga."
-        elif res.status_code == 429:
-            return pd.DataFrame(), [], "Error 429: Límite de peticiones alcanzado (10 req/min). Espera un minuto."
-        elif res.status_code != 200:
-            return pd.DataFrame(), [], f"Error API {res.status_code}: {res.text}"
+    finished_rows = []
+    upcoming_matches = []
 
-        payload = res.json()
-        raw_matches = payload.get("matches", [])
-        
-        finished_rows = []
-        upcoming_matches = []
+    for year in target_years:
+        url = f"https://api.football-data.org/v4/competitions/{comp_code}/matches?season={year}"
+        try:
+            res = requests.get(url, headers=headers, timeout=12)
+            if res.status_code == 429:
+                return pd.DataFrame(), [], "Error 429: Límite de peticiones alcanzado (10 req/min). Espera un minuto."
+            if res.status_code != 200:
+                continue
 
-        for m in raw_matches:
-            status = m.get("status")
-            h_name = normalize_name(m.get("homeTeam", {}).get("name", ""))
-            a_name = normalize_name(m.get("awayTeam", {}).get("name", ""))
-            utc_date = m.get("utcDate", "")
+            payload = res.json()
+            for m in payload.get("matches", []):
+                status = m.get("status")
+                h_name = normalize_name(m.get("homeTeam", {}).get("name", ""))
+                a_name = normalize_name(m.get("awayTeam", {}).get("name", ""))
+                utc_date = m.get("utcDate", "")
 
-            if status == "FINISHED":
-                score = m.get("score", {}).get("fullTime", {})
-                hg = score.get("home")
-                ag = score.get("away")
-                if hg is not None and ag is not None:
-                    finished_rows.append({
-                        "date": pd.to_datetime(utc_date),
-                        "home": h_name,
-                        "away": a_name,
-                        "home_goals": float(hg),
-                        "away_goals": float(ag),
-                        # football-data.org no incluye cuotas; usamos base neutral 2.5
-                        "odd_h": 2.5,
-                        "odd_d": 3.2,
-                        "odd_a": 3.0,
-                        "sot_h": 0.0,
-                        "sot_a": 0.0,
-                        "season": str(payload.get("season", {}).get("startDate", "2026")[:4])
+                if status == "FINISHED":
+                    score = m.get("score", {}).get("fullTime", {})
+                    hg = score.get("home")
+                    ag = score.get("away")
+                    if hg is not None and ag is not None:
+                        finished_rows.append({
+                            "date": pd.to_datetime(utc_date),
+                            "home": h_name,
+                            "away": a_name,
+                            "home_goals": float(hg),
+                            "away_goals": float(ag),
+                            "odd_h": 2.5,
+                            "odd_d": 3.2,
+                            "odd_a": 3.0,
+                            "sot_h": 0.0,
+                            "sot_a": 0.0,
+                            "season": str(year)
+                        })
+                elif status in ["SCHEDULED", "TIMED"] and year == current_season_year:
+                    upcoming_matches.append({
+                        "home_team": h_name,
+                        "away_team": a_name,
+                        "commence_time": utc_date,
+                        "matchday": m.get("matchday", 0)
                     })
-            elif status in ["SCHEDULED", "TIMED"]:
-                upcoming_matches.append({
-                    "home_team": h_name,
-                    "away_team": a_name,
-                    "commence_time": utc_date,
-                    "matchday": m.get("matchday", 0)
-                })
+        except Exception:
+            continue
 
-        df_hist = pd.DataFrame(finished_rows)
-        if not df_hist.empty:
-            df_hist = df_hist.sort_values("date").reset_index(drop=True)
+    df_hist = pd.DataFrame(finished_rows)
+    if not df_hist.empty:
+        df_hist = df_hist.drop_duplicates(subset=["date", "home", "away"]).sort_values("date").reset_index(drop=True)
 
-        return df_hist, upcoming_matches, None
-
-    except Exception as e:
-        return pd.DataFrame(), [], f"Excepción de conexión: {str(e)}"
+    return df_hist, upcoming_matches, None
 
 # ======================================================
 # 3. DIXON-COLES
@@ -387,23 +409,24 @@ with st.sidebar:
         st.rerun()
 
     code = st.selectbox("Liga", list(COMPETITION_MAP.keys()), format_func=lambda x: COMPETITION_MAP[x])
+    n_seasons_load = st.slider("Temporadas históricas a cargar", min_value=1, max_value=4, value=3, step=1)
 
     if st.button("🔄 Recargar Datos"):
         st.cache_data.clear()
         st.rerun()
 
-    df, upcoming_matches, error_msg = fetch_competition_data(code, st.session_state.api_key)
+    df, upcoming_matches, error_msg = fetch_competition_data(code, st.session_state.api_key, n_seasons=n_seasons_load)
 
     if error_msg:
         st.error(error_msg)
         st.stop()
 
     if not df.empty:
-        stats, ah, aa, teams = calculate_strengths(df, ref_date=df["date"].max(), window_matches=600)
+        stats, ah, aa, teams = calculate_strengths(df, ref_date=df["date"].max(), window_matches=800)
         st.success(f"✅ {len(df)} partidos terminados cargados")
         st.info(f"📅 {len(upcoming_matches)} próximos partidos")
     else:
-        st.warning("No hay partidos terminados aún para esta liga en la temporada.")
+        st.warning("No hay partidos terminados para esta liga en las temporadas consultadas.")
         st.stop()
 
     st.divider()
@@ -466,7 +489,7 @@ with t2:
         co1, co2, co3 = st.columns(3)
         oh = co1.number_input("Cuota Local", 1.01, 100.0, float(st.session_state.odds_inputs["oh"]))
         od = co2.number_input("Cuota Empate", 1.01, 100.0, float(st.session_state.odds_inputs["od"]))
-        oa = co3.number_input("Cuota Visita", 1.01, 100.0, float(st.session_state.odds_inputs["oa"]))
+        oa = co3.number_input("Cuota Visitante", 1.01, 100.0, float(st.session_state.odds_inputs["oa"]))
 
         cx1, cx2 = st.columns(2)
         odd_o25 = cx1.number_input("Cuota Over 2.5", 1.01, 100.0, float(st.session_state.odds_inputs["o_o25"]))
@@ -542,8 +565,7 @@ with t3:
         for match in upcoming_matches:
             h_name = match["home_team"]
             a_name = match["away_team"]
-            
-            # Buscar coincidencia difusa en la lista de equipos entrenados
+
             m_h = get_close_matches(h_name, teams, n=1, cutoff=0.6)
             m_a = get_close_matches(a_name, teams, n=1, cutoff=0.6)
 
@@ -567,8 +589,8 @@ with t3:
 with t4:
     st.markdown("### 🤖 Predicción con Ensamble Machine Learning")
     if st.button("🧠 Entrenar y Predecir Partido Actual"):
-        with st.spinner("Entrenando modelo..."):
-            snap = train_snapshot_cached(df, window_matches=400)
+        with st.spinner("Entrenando modelo sobre histórico..."):
+            snap = train_snapshot_cached(df, window_matches=800)
         if snap is None:
             st.warning("Datos históricos insuficientes para entrenar el modelo ML.")
         else:
