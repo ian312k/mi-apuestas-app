@@ -5,7 +5,6 @@ import numpy as np
 from scipy.stats import poisson
 import plotly.graph_objects as go
 import os
-import io
 import requests
 from difflib import get_close_matches
 from datetime import datetime
@@ -25,45 +24,98 @@ from sklearn.metrics import log_loss
 # ======================================================
 # 1. CONFIGURACIÓN Y ESTILOS CSS (DARK MODE) 🎨
 # ======================================================
-st.set_page_config(page_title="Analisis predictorio de resultados de 5 ligas de futbol", layout="wide", page_icon="🛡️")
+st.set_page_config(page_title="Análisis predictivo de resultados de futbol", layout="wide", page_icon="🛡️")
 CSV_FILE = "mis_apuestas_pro.csv"
 N_SEASONS = 3
+
+# API Key configurada por defecto (football-data.org)
+DEFAULT_API_KEY = "67fbbbfe88854afcba6116b35df04daa"
+
+# Mapeo: Código CSV (football-data.co.uk) -> Código API (football-data.org)
+FOOTBALL_DATA_ORG_MAP = {
+    "SP1": "PD",   # La Liga (Primera Division)
+    "E0": "PL",    # Premier League
+    "I1": "SA",    # Serie A
+    "D1": "BL1",   # Bundesliga
+    "F1": "FL1",   # Ligue 1
+    "N1": "DED",   # Eredivisie
+    "P1": "PPL",   # Primeira Liga
+}
 
 # --- TRADUCTOR DE EQUIPOS (API -> CSV HISTÓRICO) ---
 TEAM_MAP = {
     # 🇬🇧 PREMIER LEAGUE
+    "Manchester City FC": "Man City",
     "Manchester City": "Man City",
+    "Manchester United FC": "Man United",
     "Manchester United": "Man United",
+    "Nottingham Forest FC": "Nott'm Forest",
     "Nottingham Forest": "Nott'm Forest",
+    "Wolverhampton Wanderers FC": "Wolves",
     "Wolverhampton Wanderers": "Wolves",
+    "Brighton & Hove Albion FC": "Brighton",
     "Brighton & Hove Albion": "Brighton",
-    "Leeds United": "Leeds",
-    "West Ham United": "West Ham",
-    "Newcastle United": "Newcastle",
+    "Leeds United FC": "Leeds",
+    "West Ham United FC": "West Ham",
+    "Newcastle United FC": "Newcastle",
+    "Tottenham Hotspur FC": "Tottenham",
     "Tottenham Hotspur": "Tottenham",
-    "Leicester City": "Leicester",
-    "Sheffield United": "Sheffield United",
+    "Leicester City FC": "Leicester",
+    "Sheffield United FC": "Sheffield United",
+    "Arsenal FC": "Arsenal",
+    "Chelsea FC": "Chelsea",
+    "Liverpool FC": "Liverpool",
+    "Aston Villa FC": "Aston Villa",
+    "Everton FC": "Everton",
+    "Fulham FC": "Fulham",
+    "Brentford FC": "Brentford",
+    "Crystal Palace FC": "Crystal Palace",
+    "AFC Bournemouth": "Bournemouth",
     
     # 🇪🇸 LA LIGA
     "Athletic Club": "Ath Bilbao",
+    "Club Atlético de Madrid": "Ath Madrid",
     "Atlético Madrid": "Ath Madrid",
     "Atletico Madrid": "Ath Madrid",
+    "Real Betis Balompié": "Betis",
     "Real Betis": "Betis",
+    "RC Celta de Vigo": "Celta",
     "Celta Vigo": "Celta",
+    "RCD Espanyol de Barcelona": "Espanol",
     "RCD Espanyol": "Espanol",
     "Espanyol": "Espanol",
+    "Real Sociedad de Fútbol": "Sociedad",
     "Real Sociedad": "Sociedad",
+    "Rayo Vallecano de Madrid": "Vallecano",
     "Rayo Vallecano": "Vallecano",
     "Deportivo Alavés": "Alaves",
     "Alavés": "Alaves",
+    "FC Barcelona": "Barcelona",
+    "Real Madrid CF": "Real Madrid",
+    "Sevilla FC": "Sevilla",
+    "Valencia CF": "Valencia",
+    "Villarreal CF": "Villarreal",
+    "Girona FC": "Girona",
+    "Getafe CF": "Getafe",
+    "CA Osasuna": "Osasuna",
+    "RCD Mallorca": "Mallorca",
+    "UD Las Palmas": "Las Palmas",
     
     # 🇮🇹 SERIE A
+    "FC Internazionale Milano": "Inter",
     "Internazionale": "Inter",
     "Inter Milan": "Inter",
     "AC Milan": "Milan",
     "AS Roma": "Roma",
+    "Hellas Verona FC": "Verona",
     "Hellas Verona": "Verona",
     "Parma Calcio 1913": "Parma",
+    "Juventus FC": "Juventus",
+    "SSC Napoli": "Napoli",
+    "SS Lazio": "Lazio",
+    "ACF Fiorentina": "Fiorentina",
+    "Atalanta BC": "Atalanta",
+    "Bologna FC 1909": "Bologna"
 }
 
 def normalize_name(name):
@@ -71,8 +123,8 @@ def normalize_name(name):
 
 # --- SESSION STATE ---
 if "ticket" not in st.session_state: st.session_state.ticket = []
-if "api_key" not in st.session_state: st.session_state.api_key = ""
-if "api_usage" not in st.session_state: st.session_state.api_usage = {"used": 0, "remaining": 500}
+if "api_key" not in st.session_state: st.session_state.api_key = DEFAULT_API_KEY
+if "api_usage" not in st.session_state: st.session_state.api_usage = {"used": 0, "remaining": 10}
 if "market_storage" not in st.session_state: st.session_state.market_storage = {}
 if "odds_inputs" not in st.session_state:
     st.session_state.odds_inputs = {"oh": 2.0, "od": 3.2, "oa": 3.5, "o_o25": 1.90, "o_btts": 1.90}
@@ -86,17 +138,8 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ======================================================
-# 2. DATA + API (DESCARGA ROBUSTA Y CANDIDATOS VÁLIDOS)
+# 2. DATA + API (FOOTBALL-DATA.ORG)
 # ======================================================
-@st.cache_data(ttl=3600)
-# ======================================================
-# Reemplaza tu función fetch_live_soccer_data en app.py por esta versión.
-# Lee primero de /data (archivos cacheados por el GitHub Action) y, si no
-# encuentra el archivo local, intenta la descarga en vivo como respaldo.
-# ======================================================
-
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
-
 @st.cache_data(ttl=3600)
 def fetch_live_soccer_data(league_code="SP1", n_seasons=3):
     def season_code(start_year: int) -> str:
@@ -108,67 +151,37 @@ def fetch_live_soccer_data(league_code="SP1", n_seasons=3):
     current_start_year = today.year if today.month >= 7 else (today.year - 1)
     seasons = [season_code(current_start_year - i) for i in range(n_seasons)]
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-
-    rename_map = {
-        "Date": "date", "HomeTeam": "home", "AwayTeam": "away",
-        "FTHG": "home_goals", "FTAG": "away_goals",
-        "B365H": "odd_h", "B365D": "odd_d", "B365A": "odd_a",
-        "HST": "sot_h", "AST": "sot_a"
-    }
-
-    def parse_csv_bytes(raw_bytes, season_label):
-        tmp = pd.read_csv(io.StringIO(raw_bytes.decode("latin1", errors="ignore")))
-        present_cols = {k: v for k, v in rename_map.items() if k in tmp.columns}
-        tmp = tmp[list(present_cols.keys())].rename(columns=present_cols).copy()
-
-        for c in ["odd_h", "odd_d", "odd_a"]:
-            if c not in tmp.columns:
-                tmp[c] = 1.0
-        for c in ["sot_h", "sot_a"]:
-            if c not in tmp.columns:
-                tmp[c] = 0
-
-        tmp = tmp.dropna(subset=["home", "away", "home_goals", "away_goals"])
-        tmp["home"] = tmp["home"].astype(str).str.strip()
-        tmp["away"] = tmp["away"].astype(str).str.strip()
-        tmp["home_goals"] = pd.to_numeric(tmp["home_goals"], errors="coerce")
-        tmp["away_goals"] = pd.to_numeric(tmp["away_goals"], errors="coerce")
-        tmp = tmp.dropna(subset=["home_goals", "away_goals"])
-
-        tmp["date"] = pd.to_datetime(tmp["date"], dayfirst=True, errors="coerce")
-        tmp = tmp.dropna(subset=["date"])
-        tmp["season"] = season_label
-        return tmp
-
     frames = []
     for s in seasons:
-        local_path = os.path.join(DATA_DIR, f"{league_code}_{s}.csv")
-
-        # 1) Intentar leer del archivo local cacheado por el GitHub Action
-        if os.path.exists(local_path):
-            try:
-                with open(local_path, "rb") as f:
-                    raw = f.read()
-                tmp = parse_csv_bytes(raw, s)
-                if not tmp.empty:
-                    frames.append(tmp)
-                    continue
-            except Exception:
-                pass  # si falla el archivo local, caemos al intento en vivo
-
-        # 2) Respaldo: descarga en vivo (puede fallar en Streamlit Cloud
-        #    si football-data.co.uk bloquea la IP del hosting)
         url = f"https://www.football-data.co.uk/mmz4281/{s}/{league_code}.csv"
         try:
-            res = requests.get(url, headers=headers, timeout=12)
-            if res.status_code != 200:
-                continue
-            tmp = parse_csv_bytes(res.content, s)
-            if not tmp.empty:
-                frames.append(tmp)
+            tmp = pd.read_csv(url, encoding="latin1")
+            
+            cols = ["Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG", "B365H", "B365D", "B365A", "HST", "AST"]
+            actual_cols = [c for c in cols if c in tmp.columns]
+            tmp = tmp[actual_cols].copy()
+
+            rename_map = {
+                "Date": "date", "HomeTeam": "home", "AwayTeam": "away",
+                "FTHG": "home_goals", "FTAG": "away_goals",
+                "B365H": "odd_h", "B365D": "odd_d", "B365A": "odd_a",
+                "HST": "sot_h", "AST": "sot_a"
+            }
+            tmp = tmp.rename(columns=rename_map)
+
+            tmp["home"] = tmp["home"].astype(str).str.strip()
+            tmp["away"] = tmp["away"].astype(str).str.strip()
+
+            for c in ["odd_h", "odd_d", "odd_a"]:
+                if c not in tmp.columns: tmp[c] = 1.0
+            for c in ["sot_h", "sot_a"]:
+                if c not in tmp.columns: tmp[c] = 0
+
+            tmp = tmp.dropna(subset=["home", "away", "home_goals", "away_goals"])
+            tmp["date"] = pd.to_datetime(tmp["date"], dayfirst=True, errors="coerce")
+            tmp = tmp.dropna(subset=["date"]).fillna(0)
+            tmp["season"] = s
+            frames.append(tmp)
         except Exception:
             continue
 
@@ -179,14 +192,30 @@ def fetch_live_soccer_data(league_code="SP1", n_seasons=3):
     df = df.sort_values("date").reset_index(drop=True)
     return df
 
-def call_api_real(sport_key, api_key):
-    url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/?regions=eu&markets=h2h&oddsFormat=decimal&apiKey={api_key}"
+def call_football_data_org_api(competition_code, api_key):
+    """
+    Consume la API v4 de football-data.org para obtener los próximos partidos programados.
+    """
+    url = f"https://api.football-data.org/v4/competitions/{competition_code}/matches?status=SCHEDULED,TIMED"
+    headers = {"X-Auth-Token": api_key.strip()}
     try:
-        res = requests.get(url, timeout=20)
-        used = res.headers.get("x-requests-used", 0)
-        remaining = res.headers.get("x-requests-remaining", 500)
+        res = requests.get(url, headers=headers, timeout=20)
         if res.status_code == 200:
-            return {"success": True, "data": res.json(), "used": int(used), "remaining": int(remaining)}
+            payload = res.json()
+            matches_clean = []
+            for m in payload.get("matches", []):
+                matches_clean.append({
+                    "home_team": m.get("homeTeam", {}).get("name", ""),
+                    "away_team": m.get("awayTeam", {}).get("name", ""),
+                    "commence_time": m.get("utcDate", ""),
+                    "status": m.get("status", ""),
+                    "matchday": m.get("matchday", 0)
+                })
+            return {"success": True, "data": matches_clean, "total": len(matches_clean)}
+        elif res.status_code == 403:
+            return {"success": False, "error": "403 Forbidden", "message": "API Key inválida o sin acceso a esta competición."}
+        elif res.status_code == 429:
+            return {"success": False, "error": "429 Rate Limit", "message": "Límite de peticiones alcanzado (10 req/min en tier gratuito)."}
         return {"success": False, "error": f"Error {res.status_code}", "message": res.text}
     except Exception as e:
         return {"success": False, "error": "Excepción", "message": str(e)}
@@ -252,7 +281,7 @@ def calculate_strengths(df, ref_date=None, alpha=0.004, mix_factor=0.7, window_m
 
 def predict_match_dixon_coles(home, away, team_stats, avg_h, avg_a, rho=-0.13, max_goals=10):
     if home not in team_stats or away not in team_stats:
-        return 0, 0, 0, 0, 0, 0, 0, 0, [], np.zeros((1, 1))
+        return 0,0,0,0,0,0,0,0,[],np.zeros((1,1))
 
     h_exp = team_stats[home]["att_h"] * team_stats[away]["def_a"] * avg_h
     a_exp = team_stats[away]["att_a"] * team_stats[home]["def_h"] * avg_a
@@ -554,7 +583,8 @@ def fast_eval_ml(df, n_test=200, min_train=500, window_matches=1200):
     br = brier_multiclass(P, y)
     return {"mode": "rápido", "n": int(len(y)), "logloss": ll, "brier": br}
 
-def strict_walkforward_eval_ml_blocks(df, n_test=200, min_train=500, window_matches=1200, retrain_every=10, train_step=2):
+def strict_walkforward_eval_ml_blocks(df, n_test=200, min_train=500, window_matches=1200,
+                                      retrain_every=10, train_step=2):
     df_sorted = df.dropna(subset=["date","home","away","home_goals","away_goals"]).sort_values("date").reset_index(drop=True)
     test_block = df_sorted.tail(n_test).copy()
 
@@ -650,30 +680,6 @@ def train_snapshot_cached(df, window_matches=1200, seed=42):
     model = fit_ml_multiclass(X_train, y_train, seed=seed)
     return model, team_stats, avg_h, avg_a
 
-def match_odds_from_scanner_item(item):
-    odds_h, odds_d, odds_a = np.nan, np.nan, np.nan
-    if not item.get("bookmakers"):
-        return odds_h, odds_d, odds_a
-    book = item["bookmakers"][0]
-    if not book.get("markets"):
-        return odds_h, odds_d, odds_a
-    market = book["markets"][0]
-    if not market.get("outcomes"):
-        return odds_h, odds_d, odds_a
-
-    h_api = item.get("home_team")
-    a_api = item.get("away_team")
-    for o in market["outcomes"]:
-        name = o.get("name", "")
-        price = o.get("price", np.nan)
-        if name == h_api:
-            odds_h = price
-        elif name == a_api:
-            odds_a = price
-        else:
-            odds_d = price
-    return odds_h, odds_d, odds_a
-
 def predict_ml_for_match(home_team, away_team, oh, od, oa, model, team_stats, avg_h, avg_a):
     row_now = {"home": home_team, "away": away_team, "odd_h": oh, "odd_d": od, "odd_a": oa, "sot_h": 0.0, "sot_a": 0.0}
     x = build_features_for_match(row_now, team_stats, avg_h, avg_a).reshape(1, -1)
@@ -707,7 +713,7 @@ with st.sidebar:
 
     if st.button("🧹 Limpiar Cache API"):
         st.session_state.market_storage = {}
-        st.success("Memoria del escáner limpia.")
+        st.success("Memoria del fixture limpia.")
         st.rerun()
 
     leagues = {
@@ -716,6 +722,8 @@ with st.sidebar:
         "I1": "🇮🇹 Serie A",
         "D1": "🇩🇪 Bundesliga",
         "F1": "🇫🇷 Ligue 1",
+        "N1": "🇳🇱 Eredivisie",
+        "P1": "🇵🇹 Primeira Liga",
     }
 
     code = st.selectbox("Liga", list(leagues.keys()), format_func=lambda x: leagues[x])
@@ -749,7 +757,7 @@ with st.sidebar:
             st.session_state.ticket = []
             st.rerun()
 
-st.title(f"Analisis predictivo de resultados para partidos de futbol: {leagues[code]}")
+st.title(f"Análisis predictivo de resultados para partidos de fútbol: {leagues[code]}")
 
 # --- SELECTOR ---
 c1, c2 = st.columns(2)
@@ -762,7 +770,7 @@ h_exp, a_exp, ph, pd_prob, pa, po15, po25, pbtts, top_sc, probs = predict_match_
 # 9. TABS
 # ======================================================
 t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs(
-    ["📊 Análisis", "💰 Valor", "📜 Historial", "💎 Escáner Seguro", "🧪 Laboratorio", "📈 Rendimiento (Risk)", "🤖 ML 1X2 + Jornada", "🌎 Multi-Liga"]
+    ["📊 Análisis", "💰 Valor", "📜 Historial", "💎 Fixtures API", "🧪 Laboratorio", "📈 Rendimiento (Risk)", "🤖 ML 1X2 + Jornada", "🌎 Multi-Liga"]
 )
 
 # --- TAB 1: ANÁLISIS ---
@@ -826,27 +834,6 @@ with t2:
 
         def_oh, def_od, def_oa = st.session_state.odds_inputs["oh"], st.session_state.odds_inputs["od"], st.session_state.odds_inputs["oa"]
         def_o25, def_btts = st.session_state.odds_inputs["o_o25"], st.session_state.odds_inputs["o_btts"]
-        
-        league_data = st.session_state.market_storage.get(code, {})
-        found_in_storage = False
-
-        if "data" in league_data:
-            for item in league_data["data"]:
-                h_team_api = normalize_name(item.get("home_team", ""))
-                a_team_api = normalize_name(item.get("away_team", ""))
-                
-                m_h = get_close_matches(h_team_api, [home], n=1, cutoff=0.8)
-                m_a = get_close_matches(a_team_api, [away], n=1, cutoff=0.8)
-                
-                if m_h and m_a and item.get("bookmakers"):
-                    oh2, od2, oa2 = match_odds_from_scanner_item(item)
-                    if not np.isnan(oh2) and not np.isnan(od2) and not np.isnan(oa2):
-                        def_oh, def_od, def_oa = oh2, od2, oa2
-                        found_in_storage = True
-                        break
-
-        if found_in_storage: st.success("✅ Momios cargados automáticamente (Escáner 1X2).")
-        else: st.info("ℹ️ Momios por defecto (No encontrados en escáner).")
 
         co1, co2, co3 = st.columns(3)
         oh = co1.number_input("Cuota Local", 1.01, 100.0, float(def_oh))
@@ -886,8 +873,8 @@ with t2:
             sel_pick_options = [
                 f"Gana {home}", 
                 "Empate", 
-                f"Gana {away}", 
-                "Over 2.5 Goles", 
+                f"Gana {away}",
+                "Over 2.5 Goles",
                 "BTTS (Ambos Anotan)"
             ]
             sel_pick = st.selectbox("Selección", sel_pick_options)
@@ -898,11 +885,11 @@ with t2:
                 sel_odd, sel_prob = od, pd_prob
             elif f"Gana {away}" in sel_pick: 
                 sel_odd, sel_prob = oa, pa
-            elif "Over 2.5" in sel_pick: 
+            elif "Over 2.5" in sel_pick:
                 sel_odd, sel_prob = odd_o25, po25
-            elif "BTTS" in sel_pick: 
+            elif "BTTS" in sel_pick:
                 sel_odd, sel_prob = odd_btts, pbtts
-            else: 
+            else:
                 sel_odd, sel_prob = 1.0, 0.0
 
             if st.form_submit_button("Añadir selección"):
@@ -966,7 +953,6 @@ with t3:
     
     if not db.empty:
         st.dataframe(db.sort_values(by="Fecha", ascending=False), use_container_width=True)
-        
         st.divider()
         st.markdown("### 🛠️ Administrar Apuestas")
         
@@ -977,9 +963,10 @@ with t3:
         if seleccion_str != "-- Seleccionar --":
             bet_id = seleccion_str.split(" | ")[0]
             fila = db[db["ID"].astype(str) == bet_id].iloc[0]
-            st.info(f"**Seleccionado:** {fila['Partido']} - {fila['Pick']} (Cuota: {fila['Cuota']})")
             
+            st.info(f"**Seleccionado:** {fila['Partido']} - {fila['Pick']} (Cuota: {fila['Cuota']})")
             c_edit1, c_edit2 = st.columns(2)
+            
             with c_edit1:
                 nuevo_estado = st.selectbox("Actualizar Estado:", ["Pendiente", "Ganada", "Perdida", "Push"], index=["Pendiente", "Ganada", "Perdida", "Push"].index(fila["Estado"]) if fila["Estado"] in ["Pendiente", "Ganada", "Perdida", "Push"] else 0)
                 if st.button("💾 Actualizar Estado"):
@@ -996,178 +983,82 @@ with t3:
     else:
         st.warning("Aún no hay historial.")
 
-# --- TAB 4: ESCÁNER + JORNADA ML ---
+# --- TAB 4: FIXTURES API (FOOTBALL-DATA.ORG) ---
 with t4:
-    st.markdown("## 💎 Escáner Seguro")
+    st.markdown("## 💎 Fixtures Oficiales (Football-Data.org)")
+    st.caption("Obtiene los partidos programados directamente de football-data.org v4.")
 
-    api_league_map = {
-        "SP1": "soccer_spain_la_liga",
-        "E0": "soccer_epl",
-        "I1": "soccer_italy_serie_a",
-        "D1": "soccer_germany_bundesliga",
-        "F1": "soccer_france_ligue_one",
-    }
-
-    api_key_input = st.text_input("🔑 API Key:", value=st.session_state.api_key, type="password")
+    api_key_input = st.text_input("🔑 API Key (football-data.org):", value=st.session_state.api_key, type="password")
     if api_key_input != st.session_state.api_key:
         st.session_state.api_key = api_key_input
 
-    if st.session_state.api_key:
-        sport_key = api_league_map.get(code)
+    api_comp_code = FOOTBALL_DATA_ORG_MAP.get(code, "PD")
 
-        if code in st.session_state.market_storage:
-            stored = st.session_state.market_storage[code]
-            data_to_display = stored.get("data", [])
-            st.info(f"📂 Datos en memoria. Actualizado: {stored['timestamp'].strftime('%H:%M:%S')}")
-        else:
-            data_to_display = []
-            st.warning("⚠️ Sin datos descargados.")
-
-        if st.button("⬇️ Descargar/Actualizar Datos (1 llamada)"):
-            with st.spinner("Conectando..."):
-                resp = call_api_real(sport_key, st.session_state.api_key)
-                if resp["success"]:
-                    st.session_state.market_storage[code] = {"timestamp": datetime.now(), "data": resp["data"]}
-                    st.session_state.api_usage["used"] = resp["used"]
-                    st.session_state.api_usage["remaining"] = resp["remaining"]
-                    st.success("✅ Descargado.")
-                    st.rerun()
-                else:
-                    st.error(f"Error API: {resp['message']}")
-
-        if data_to_display:
-            now_utc = pd.Timestamp.now(tz="UTC")
-            live_rows = []
-            for item in data_to_display:
-                match_date = pd.to_datetime(item.get("commence_time"), utc=True, errors="coerce")
-                if pd.isna(match_date):
-                    continue
-                diff_hours = (match_date - now_utc).total_seconds()/3600
-                if diff_hours > 168 or diff_hours < -5:
-                    continue
-
-                h_api = normalize_name(item.get("home_team",""))
-                a_api = normalize_name(item.get("away_team",""))
-                
-                m_h = get_close_matches(h_api, teams, n=1, cutoff=0.8)
-                m_a = get_close_matches(a_api, teams, n=1, cutoff=0.8)
-
-                if not m_h or not m_a:
-                    continue
-                h = m_h[0]; a = m_a[0]
-                if h not in stats or a not in stats:
-                    continue
-
-                _, _, ph2, pd2, pa2, *_ = predict_match_dixon_coles(h, a, stats, ah, aa)
-                oh2, od2, oa2 = match_odds_from_scanner_item(item)
-                if np.isnan(oh2) or np.isnan(od2) or np.isnan(oa2):
-                    continue
-
-                ev_h = (ph2*oh2)-1
-                ev_d = (pd2*od2)-1
-                ev_a = (pa2*oa2)-1
-                best_ev = max(ev_h, ev_d, ev_a)
-                pick = "No Bet"
-                if best_ev > 0:
-                    pick = f"Gana {h}" if best_ev==ev_h else ("Empate" if best_ev==ev_d else f"Gana {a}")
-
-                live_rows.append({
-                    "Hora (UTC)": match_date.strftime("%d/%m %H:%M"),
-                    "Partido": f"{h} vs {a}",
-                    "Cuotas": f"H:{oh2:.2f} D:{od2:.2f} A:{oa2:.2f}",
-                    "DC Prob": f"H:{ph2:.3f} D:{pd2:.3f} A:{pa2:.3f}",
-                    "Mejor EV": best_ev,
-                    "Pick": pick
-                })
-            if live_rows:
-                st.markdown("### 🎯 Oportunidades (Dixon-Coles vs Cuotas)")
-                df_live = pd.DataFrame(live_rows).sort_values("Mejor EV", ascending=False)
-                st.dataframe(df_live, use_container_width=True)
-
-        st.divider()
-        st.markdown("## 😁 Jornada ML (desde Escáner)")
-        st.caption("Entrena 1 snapshot (cacheado) y predice TODOS los partidos de la semana (próx 7 días).")
-
-        window_ml_j = st.slider("Ventana train snapshot (matches)", 300, 3000, 1200, step=100, key="window_ml_j")
-        only_positive_ev = st.checkbox("Solo EV > 0", value=False)
-        min_ev = st.slider("EV mínimo", 0.0, 0.20, 0.00, step=0.01)
-
-        if st.button("📌 Generar pronósticos jornada (ML + Escáner)"):
-            if code not in st.session_state.market_storage:
-                st.warning("Primero descarga/actualiza datos en el escáner.")
-            else:
-                stored = st.session_state.market_storage[code]
-                data_to_display = stored.get("data", [])
-                if not data_to_display:
-                    st.warning("No hay partidos en el escáner.")
-                else:
-                    with st.spinner("Entrenando snapshot (cache) y prediciendo..."):
-                        snap = train_snapshot_cached(df, window_matches=window_ml_j, seed=42)
-
-                    if snap is None:
-                        st.warning("No se pudo entrenar snapshot (historial insuficiente).")
-                    else:
-                        model, team_stats2, avg_h2, avg_a2 = snap
-                        now_utc = pd.Timestamp.now(tz="UTC")
-                        rows = []
-
-                        for item in data_to_display:
-                            match_date = pd.to_datetime(item.get("commence_time"), utc=True, errors="coerce")
-                            if pd.isna(match_date):
-                                continue
-                            diff_hours = (match_date - now_utc).total_seconds()/3600
-                            if diff_hours > 168 or diff_hours < -5:
-                                continue
-
-                            h_api = normalize_name(item.get("home_team",""))
-                            a_api = normalize_name(item.get("away_team",""))
-
-                            m_h = get_close_matches(h_api, teams, n=1, cutoff=0.8)
-                            m_a = get_close_matches(a_api, teams, n=1, cutoff=0.8)
-                            
-                            if not m_h or not m_a:
-                                continue
-                            h = m_h[0]; a = m_a[0]
-                            if h not in team_stats2 or a not in team_stats2:
-                                continue
-
-                            oh2, od2, oa2 = match_odds_from_scanner_item(item)
-                            if np.isnan(oh2) or np.isnan(od2) or np.isnan(oa2) or oh2<=1.01 or od2<=1.01 or oa2<=1.01:
-                                continue
-
-                            p, (ev_h, ev_d, ev_a), pick = predict_ml_for_match(h, a, float(oh2), float(od2), float(oa2),
-                                                                                model, team_stats2, avg_h2, avg_a2)
-                            best_ev = np.nanmax([ev_h, ev_d, ev_a])
-                            if only_positive_ev and (np.isnan(best_ev) or best_ev <= 0):
-                                continue
-                            if best_ev < min_ev:
-                                continue
-
-                            rows.append({
-                                "Hora (UTC)": match_date.strftime("%d/%m %H:%M"),
-                                "Partido": f"{h} vs {a}",
-                                "Cuotas": f"H:{oh2:.2f} D:{od2:.2f} A:{oa2:.2f}",
-                                "ML Prob": f"H:{p[0]:.3f} D:{p[1]:.3f} A:{p[2]:.3f}",
-                                "EV_H": ev_h,
-                                "EV_D": ev_d,
-                                "EV_A": ev_a,
-                                "Mejor EV": best_ev,
-                                "Pick": pick,
-                            })
-
-                        if not rows:
-                            st.info("No se encontraron partidos válidos (nombres/odds/ventana).")
-                        else:
-                            out_df = pd.DataFrame(rows).sort_values("Mejor EV", ascending=False).reset_index(drop=True)
-                            st.success(f"✅ Jornada generada: {len(out_df)} partidos")
-                            st.dataframe(out_df.style.format({"EV_H":"{:.3f}","EV_D":"{:.3f}","EV_A":"{:.3f}","Mejor EV":"{:.3f}"}),
-                                         use_container_width=True)
-                            st.download_button("📥 Descargar jornada (CSV)",
-                                               data=out_df.to_csv(index=False).encode("utf-8"),
-                                               file_name=f"jornada_ml_{code}.csv",
-                                               mime="text/csv")
+    if code in st.session_state.market_storage:
+        stored = st.session_state.market_storage[code]
+        data_to_display = stored.get("data", [])
+        st.info(f"📂 Fixtures en memoria ({len(data_to_display)} partidos). Actualizado: {stored['timestamp'].strftime('%H:%M:%S')}")
     else:
-        st.info("Pon tu API key para usar el escáner y jornada.")
+        data_to_display = []
+        st.warning("⚠️ Sin partidos descargados.")
+
+    if st.button("⬇️ Descargar Próximos Partidos"):
+        with st.spinner("Conectando con football-data.org..."):
+            resp = call_football_data_org_api(api_comp_code, st.session_state.api_key)
+            if resp["success"]:
+                st.session_state.market_storage[code] = {"timestamp": datetime.now(), "data": resp["data"]}
+                st.success(f"✅ Se descargaron {resp['total']} partidos programados.")
+                st.rerun()
+            else:
+                st.error(f"Error API: {resp['message']}")
+
+    if data_to_display:
+        now_utc = pd.Timestamp.now(tz="UTC")
+        live_rows = []
+        
+        # Cuotas de referencia desde st.session_state para evaluar el valor
+        ref_oh = st.session_state.odds_inputs["oh"]
+        ref_od = st.session_state.odds_inputs["od"]
+        ref_oa = st.session_state.odds_inputs["oa"]
+
+        for item in data_to_display:
+            match_date = pd.to_datetime(item.get("commence_time"), utc=True, errors="coerce")
+            if pd.isna(match_date):
+                continue
+
+            h_api = normalize_name(item.get("home_team", ""))
+            a_api = normalize_name(item.get("away_team", ""))
+            
+            m_h = get_close_matches(h_api, teams, n=1, cutoff=0.7)
+            m_a = get_close_matches(a_api, teams, n=1, cutoff=0.7)
+
+            if not m_h or not m_a:
+                continue
+            h = m_h[0]; a = m_a[0]
+            if h not in stats or a not in stats:
+                continue
+
+            _, _, ph2, pd2, pa2, *_ = predict_match_dixon_coles(h, a, stats, ah, aa)
+
+            fo_h2, fo_d2, fo_a2 = safe_fair_odds(ph2), safe_fair_odds(pd2), safe_fair_odds(pa2)
+            ev_h = (ph2 * ref_oh) - 1
+            ev_d = (pd2 * ref_od) - 1
+            ev_a = (pa2 * ref_oa) - 1
+            best_ev = max(ev_h, ev_d, ev_a)
+            pick = f"Gana {h}" if best_ev == ev_h else ("Empate" if best_ev == ev_d else f"Gana {a}")
+
+            live_rows.append({
+                "Hora (UTC)": match_date.strftime("%d/%m %H:%M"),
+                "Partido": f"{h} vs {a}",
+                "DC Prob": f"H:{ph2:.3f} | D:{pd2:.3f} | A:{pa2:.3f}",
+                "Cuotas Justas": f"H:{fo_h2:.2f} | D:{fo_d2:.2f} | A:{fo_a2:.2f}",
+                "Mejor Pick (DC)": pick
+            })
+
+        if live_rows:
+            st.markdown("### 🎯 Fixture Oficial con Proyecciones Dixon-Coles")
+            df_live = pd.DataFrame(live_rows)
+            st.dataframe(df_live, use_container_width=True)
 
 # --- TAB 5: LABORATORIO (BACKTEST DC) ---
 with t5:
@@ -1306,8 +1197,6 @@ with t7:
                 if hasattr(model, "feature_importances_"):
                     st.divider()
                     st.markdown("### 🔍 Importancia de Variables (Feature Importance)")
-                    st.caption("¿Qué está mirando el modelo? (Mkt = Mercado, DC = Dixon-Coles, xG = Expectativa Goles)")
-                    
                     feature_names = [
                         "Mkt H", "Mkt D", "Mkt A",
                         "DC H", "DC D", "DC A",
@@ -1330,21 +1219,14 @@ with t7:
                         ))
                         fig_imp.update_layout(height=400, margin=dict(l=0, r=0, t=30, b=0), template="plotly_dark")
                         st.plotly_chart(fig_imp, use_container_width=True)
-                    else:
-                        st.write("Dimensiones de features no coinciden para graficar.")
 
-# --- TAB 8: MULTI-LIGA SUPER ESCANER ---
+# --- TAB 8: MULTI-LIGA FIXTURES ---
 with t8:
-    st.markdown("## 🌎 Super Escáner: Todas las Ligas")
-    st.caption("Analiza las ligas configuradas de una sola vez. Requiere que hayas descargado datos del escáner previamente para cada liga o uses los datos en memoria.")
+    st.markdown("## 🌎 Fixture Multi-Liga")
+    st.caption("Consulta los partidos programados para las ligas disponibles usando Football-Data.org.")
 
-    col_multi_1, col_multi_2 = st.columns(2)
-    win_multi = col_multi_1.slider("Ventana entrenamiento (Multi)", 300, 3000, 1200, step=100)
-    min_ev_multi = col_multi_2.slider("EV mínimo (Multi)", 0.0, 0.20, 0.00, step=0.01)
-
-    if st.button("🚀 Ejecutar Análisis Masivo"):
+    if st.button("🚀 Ejecutar Consulta Masiva (Todas las Ligas)"):
         master_results = []
-        
         prog_bar = st.progress(0)
         status_text = st.empty()
         
@@ -1355,99 +1237,71 @@ with t8:
             idx_league += 1
             prog = int((idx_league / total_leagues) * 100)
             prog_bar.progress(prog)
-            status_text.text(f"Analizando {l_name} ({l_code})...")
+            status_text.text(f"Consultando {l_name} ({l_code})...")
 
-            if l_code not in st.session_state.market_storage:
+            api_comp = FOOTBALL_DATA_ORG_MAP.get(l_code)
+            if not api_comp:
                 continue
-            
-            stored = st.session_state.market_storage[l_code]
-            data_api = stored.get("data", [])
-            if not data_api:
+
+            resp = call_football_data_org_api(api_comp, st.session_state.api_key)
+            if not resp["success"] or not resp["data"]:
                 continue
 
             df_loop = fetch_live_soccer_data(l_code, n_seasons=N_SEASONS)
-            
             if df_loop.empty or len(df_loop) < 200:
                 continue
 
-            snap_loop = train_snapshot_cached(df_loop, window_matches=win_multi, seed=42)
-            if snap_loop is None:
-                continue
-
-            model_loop, stats_loop, avgh_loop, avga_loop = snap_loop
-            
-            now_utc = pd.Timestamp.now(tz="UTC")
+            stats_loop, avgh_loop, avga_loop, teams_loop = calculate_strengths(df_loop, ref_date=df_loop["date"].max(), window_matches=1200)
             league_rows = []
 
-            for item in data_api:
+            for item in resp["data"]:
                 match_date = pd.to_datetime(item.get("commence_time"), utc=True, errors="coerce")
                 if pd.isna(match_date): continue
-                
-                diff_hours = (match_date - now_utc).total_seconds()/3600
-                if diff_hours > 168 or diff_hours < -5: continue
 
                 h_api = normalize_name(item.get("home_team",""))
                 a_api = normalize_name(item.get("away_team",""))
-                
-                teams_loop = sorted(list(set(df_loop["home"].unique()) | set(df_loop["away"].unique())))
 
-                m_h = get_close_matches(h_api, teams_loop, n=1, cutoff=0.8)
-                m_a = get_close_matches(a_api, teams_loop, n=1, cutoff=0.8)
+                m_h = get_close_matches(h_api, teams_loop, n=1, cutoff=0.7)
+                m_a = get_close_matches(a_api, teams_loop, n=1, cutoff=0.7)
 
                 if not m_h or not m_a: continue
                 h_team, a_team = m_h[0], m_a[0]
 
                 if h_team not in stats_loop or a_team not in stats_loop: continue
 
-                oh2, od2, oa2 = match_odds_from_scanner_item(item)
-                if np.isnan(oh2) or np.isnan(od2) or np.isnan(oa2) or oh2<=1.01: continue
-
                 _, _, dc_h, dc_d, dc_a, *_ = predict_match_dixon_coles(h_team, a_team, stats_loop, avgh_loop, avga_loop)
-                p, (ev_h, ev_d, ev_a), pick = predict_ml_for_match(
-                    h_team, a_team, float(oh2), float(od2), float(oa2),
-                    model_loop, stats_loop, avgh_loop, avga_loop
-                )
 
-                best_ev = np.nanmax([ev_h, ev_d, ev_a])
-                if best_ev < min_ev_multi: continue
+                fo_h, fo_d, fo_a = safe_fair_odds(dc_h), safe_fair_odds(dc_d), safe_fair_odds(dc_a)
+                best_p = max(dc_h, dc_d, dc_a)
+                pick = f"Gana {h_team}" if best_p == dc_h else ("Empate" if best_p == dc_d else f"Gana {a_team}")
 
                 league_rows.append({
                     "Liga": l_name,
-                    "Fecha": match_date.strftime("%d/%m %H:%M"),
+                    "Fecha (UTC)": match_date.strftime("%d/%m %H:%M"),
                     "Partido": f"{h_team} vs {a_team}",
-                    "Cuotas": f"{oh2:.2f}|{od2:.2f}|{oa2:.2f}",
-                    "DC Prob": f"{dc_h:.2f}|{dc_d:.2f}|{dc_a:.2f}",
-                    "ML Prob": f"{p[0]:.2f}|{p[1]:.2f}|{p[2]:.2f}",
-                    "EV": best_ev,
+                    "Prob DC": f"H:{dc_h:.2f} | D:{dc_d:.2f} | A:{dc_a:.2f}",
+                    "Cuotas Justas DC": f"H:{fo_h:.2f} | D:{fo_d:.2f} | A:{fo_a:.2f}",
                     "Pick": pick
                 })
 
             if league_rows:
-                df_res_league = pd.DataFrame(league_rows).sort_values("EV", ascending=False)
+                df_res_league = pd.DataFrame(league_rows)
                 master_results.extend(league_rows)
-                
-                with st.expander(f"⚽ {l_name} ({len(league_rows)} picks)", expanded=True):
-                    st.dataframe(
-                        df_res_league.style.format({"EV": "{:.3f}"}), 
-                        use_container_width=True, 
-                        hide_index=True
-                    )
+                with st.expander(f"⚽ {l_name} ({len(league_rows)} partidos)", expanded=True):
+                    st.dataframe(df_res_league, use_container_width=True, hide_index=True)
             else:
-                with st.expander(f"⚽ {l_name} (Sin oportunidades)", expanded=False):
-                    st.write("No se encontraron partidos con valor positivo o datos insuficientes.")
+                with st.expander(f"⚽ {l_name} (Sin partidos próximos)", expanded=False):
+                    st.write("No hay partidos programados o faltan datos históricos.")
 
-        status_text.text("✅ Análisis completo finalizado.")
+        status_text.text("✅ Consulta finalizada.")
         prog_bar.progress(100)
 
         if master_results:
             st.divider()
-            st.markdown("### 📥 Descargar Todo")
-            df_master = pd.DataFrame(master_results).sort_values("EV", ascending=False)
+            df_master = pd.DataFrame(master_results)
             st.download_button(
-                "Descargar CSV Combinado (Todas las Ligas)",
+                "📥 Descargar Fixtures y Picks (CSV)",
                 data=df_master.to_csv(index=False).encode("utf-8"),
-                file_name="super_jornada_ml.csv",
+                file_name="fixtures_proyecciones.csv",
                 mime="text/csv"
             )
-    else:
-        st.info("Presiona el botón para iniciar el escaneo de todas las ligas configuradas.")
