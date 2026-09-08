@@ -5,6 +5,8 @@ import numpy as np
 from scipy.stats import poisson
 import plotly.graph_objects as go
 import os
+import json
+import time
 import requests
 from difflib import get_close_matches
 from datetime import datetime
@@ -26,6 +28,9 @@ from sklearn.metrics import log_loss
 # ======================================================
 st.set_page_config(page_title="Analisis predictivo de futbol (football-data.org)", layout="wide", page_icon="🛡️")
 CSV_FILE = "mis_apuestas_pro.csv"
+CACHE_DIR = "data_cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
+
 DEFAULT_API_KEY = "67fbbbfe88854afcba6116b35df04daa"
 
 # Códigos oficiales de competiciones en football-data.org
@@ -39,7 +44,6 @@ COMPETITION_MAP = {
     "PPL": "🇵🇹 Primeira Liga",
 }
 
-# Normalizador de nombres oficiales a formato legible
 TEAM_MAP = {
     "Manchester City FC": "Man City",
     "Manchester United FC": "Man United",
@@ -116,10 +120,14 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ======================================================
-# 2. DATA VIA FOOTBALL-DATA.ORG (MULTITEMPORADA)
+# 2. DATA VIA FOOTBALL-DATA.ORG (CON PERSISTENCIA EN DISCO)
 # ======================================================
-@st.cache_data(ttl=3600, show_spinner="Descargando histórico de varias temporadas desde football-data.org...")
-def fetch_competition_data(comp_code, api_key, n_seasons=3):
+def fetch_competition_data(comp_code, api_key, n_seasons=4):
+    """
+    Descarga temporadas y las guarda en disco local (data_cache/).
+    - Temporadas pasadas: Se leen de disco si ya existen (0 peticiones a la API).
+    - Temporada actual: Se actualiza sólo si el archivo local tiene más de 6 horas de antigüedad.
+    """
     today = datetime.now()
     current_season_year = today.year if today.month >= 7 else (today.year - 1)
     target_years = [current_season_year - i for i in range(n_seasons)]
@@ -129,15 +137,58 @@ def fetch_competition_data(comp_code, api_key, n_seasons=3):
     upcoming_matches = []
 
     for year in target_years:
+        csv_path = os.path.join(CACHE_DIR, f"{comp_code}_{year}_finished.csv")
+        upcoming_path = os.path.join(CACHE_DIR, f"{comp_code}_{year}_upcoming.json")
+        is_current = (year == current_season_year)
+
+        # Decidir si usamos el archivo local guardado en disco
+        use_local = False
+        if os.path.exists(csv_path):
+            if not is_current:
+                # Temporada pasada: está concluida, jamás cambiará
+                use_local = True
+            else:
+                # Temporada en curso: usar local si tiene menos de 6 horas
+                file_age_hours = (time.time() - os.path.getmtime(csv_path)) / 3600
+                if file_age_hours < 6:
+                    use_local = True
+
+        if use_local:
+            try:
+                local_df = pd.read_csv(csv_path)
+                local_df["date"] = pd.to_datetime(local_df["date"])
+                finished_rows.extend(local_df.to_dict("records"))
+
+                if is_current and os.path.exists(upcoming_path):
+                    with open(upcoming_path, "r", encoding="utf-8") as f:
+                        upcoming_matches = json.load(f)
+                continue
+            except Exception:
+                pass  # Si el archivo está corrupto, lo re-descarga
+
+        # Si llegamos aquí, se debe consultar la API
         url = f"https://api.football-data.org/v4/competitions/{comp_code}/matches?season={year}"
+        
+        # Pausa preventiva entre llamadas para respetar el rate limit
+        time.sleep(1.2)
+
         try:
-            res = requests.get(url, headers=headers, timeout=12)
+            res = requests.get(url, headers=headers, timeout=15)
+            
             if res.status_code == 429:
-                return pd.DataFrame(), [], "Error 429: Límite de peticiones alcanzado (10 req/min). Espera un minuto."
+                # Si ya tenemos datos previos de otras temporadas, devolvemos lo acumulado
+                if finished_rows:
+                    st.warning("⚠️ Límite de 10 peticiones/min alcanzado. Mostrando datos guardados en disco.")
+                    break
+                return pd.DataFrame(), [], "Error 429: Límite de peticiones de la API excedido (máximo 10 por minuto). Espera 60 segundos antes de recargar."
+
             if res.status_code != 200:
                 continue
 
             payload = res.json()
+            season_finished = []
+            season_upcoming = []
+
             for m in payload.get("matches", []):
                 status = m.get("status")
                 h_name = normalize_name(m.get("homeTeam", {}).get("name", ""))
@@ -149,8 +200,8 @@ def fetch_competition_data(comp_code, api_key, n_seasons=3):
                     hg = score.get("home")
                     ag = score.get("away")
                     if hg is not None and ag is not None:
-                        finished_rows.append({
-                            "date": pd.to_datetime(utc_date),
+                        record = {
+                            "date": utc_date,
                             "home": h_name,
                             "away": a_name,
                             "home_goals": float(hg),
@@ -161,15 +212,29 @@ def fetch_competition_data(comp_code, api_key, n_seasons=3):
                             "sot_h": 0.0,
                             "sot_a": 0.0,
                             "season": str(year)
-                        })
-                elif status in ["SCHEDULED", "TIMED"] and year == current_season_year:
-                    upcoming_matches.append({
+                        }
+                        season_finished.append(record)
+                elif status in ["SCHEDULED", "TIMED"] and is_current:
+                    season_upcoming.append({
                         "home_team": h_name,
                         "away_team": a_name,
                         "commence_time": utc_date,
                         "matchday": m.get("matchday", 0)
                     })
-        except Exception:
+
+            # Guardar en disco local para no volver a pedirlo
+            if season_finished:
+                df_season = pd.DataFrame(season_finished)
+                df_season.to_csv(csv_path, index=False)
+                df_season["date"] = pd.to_datetime(df_season["date"])
+                finished_rows.extend(df_season.to_dict("records"))
+
+            if is_current and season_upcoming:
+                upcoming_matches = season_upcoming
+                with open(upcoming_path, "w", encoding="utf-8") as f:
+                    json.dump(season_upcoming, f, ensure_ascii=False, indent=2)
+
+        except Exception as e:
             continue
 
     df_hist = pd.DataFrame(finished_rows)
@@ -372,7 +437,7 @@ def build_features_for_match(row, team_stats, avg_h, avg_a):
     ], dtype=float)
 
 @st.cache_data(ttl=1800)
-def train_snapshot_cached(df, window_matches=600, seed=42):
+def train_snapshot_cached(df, window_matches=1200, seed=42):
     df_sorted = df.sort_values("date").copy()
     team_stats, avg_h, avg_a, _ = calculate_strengths(df_sorted, ref_date=df_sorted["date"].max(), window_matches=window_matches)
 
@@ -409,24 +474,34 @@ with st.sidebar:
         st.rerun()
 
     code = st.selectbox("Liga", list(COMPETITION_MAP.keys()), format_func=lambda x: COMPETITION_MAP[x])
-    n_seasons_load = st.slider("Temporadas históricas a cargar", min_value=1, max_value=4, value=3, step=1)
+    n_seasons_load = st.slider("Temporadas históricas a cargar", min_value=1, max_value=4, value=4, step=1)
 
-    if st.button("🔄 Recargar Datos"):
+    c_btn1, c_btn2 = st.columns(2)
+    if c_btn1.button("🔄 Recargar"):
         st.cache_data.clear()
         st.rerun()
 
-    df, upcoming_matches, error_msg = fetch_competition_data(code, st.session_state.api_key, n_seasons=n_seasons_load)
+    if c_btn2.button("🗑️ Vaciar Disco"):
+        for f in os.listdir(CACHE_DIR):
+            os.remove(os.path.join(CACHE_DIR, f))
+        st.cache_data.clear()
+        st.success("Disco limpio.")
+        st.rerun()
 
-    if error_msg:
+    with st.spinner("Cargando datos (desde disco local o API)..."):
+        df, upcoming_matches, error_msg = fetch_competition_data(code, st.session_state.api_key, n_seasons=n_seasons_load)
+
+    if error_msg and df.empty:
         st.error(error_msg)
         st.stop()
 
     if not df.empty:
-        stats, ah, aa, teams = calculate_strengths(df, ref_date=df["date"].max(), window_matches=800)
-        st.success(f"✅ {len(df)} partidos terminados cargados")
+        stats, ah, aa, teams = calculate_strengths(df, ref_date=df["date"].max(), window_matches=1200)
+        st.success(f"✅ {len(df)} partidos cargados")
+        st.caption(f"💾 Guardados en carpeta `{CACHE_DIR}/`")
         st.info(f"📅 {len(upcoming_matches)} próximos partidos")
     else:
-        st.warning("No hay partidos terminados para esta liga en las temporadas consultadas.")
+        st.warning("No hay datos disponibles.")
         st.stop()
 
     st.divider()
@@ -469,7 +544,7 @@ with t1:
     m3.metric(f"✈️ {away}", f"{pa*100:.1f}%")
 
     fo_h, fo_d, fo_a = safe_fair_odds(ph), safe_fair_odds(pd_prob), safe_fair_odds(pa)
-    st.info(f"💡 **Cuotas Justas del Modelo (Sin margen de la casa):** Local = {fo_h:.2f} | Empate = {fo_d:.2f} | Visitante = {fo_a:.2f}")
+    st.info(f"💡 **Cuotas Justas del Modelo (Sin margen):** Local = {fo_h:.2f} | Empate = {fo_d:.2f} | Visitante = {fo_a:.2f}")
 
     g1, g2, g3 = st.columns(3)
     g1.metric("Over 1.5", f"{po15*100:.1f}%")
@@ -484,7 +559,7 @@ with t2:
 
     with col_analisis:
         st.markdown("### 🏦 Comparador de Cuotas Reales vs Modelo")
-        st.caption("Ingresa los momios de tu casa de apuestas para verificar si existe Valor Esperado (+EV):")
+        st.caption("Ingresa los momios de tu casa de apuestas:")
 
         co1, co2, co3 = st.columns(3)
         oh = co1.number_input("Cuota Local", 1.01, 100.0, float(st.session_state.odds_inputs["oh"]))
@@ -508,7 +583,7 @@ with t2:
             else: sel, p_sel, o_sel = f"Gana {away}", pa, oa
 
             pct_k = calculate_kelly(p_sel, o_sel)
-            st.success(f"💎 **Apuesta de Valor encontrada:** {sel} (+{(k_max_ev*100):.1f}% EV) | Kelly Stake: ${(pct_k/100)*bank:.2f}")
+            st.success(f"💎 **Apuesta de Valor:** {sel} (+{(k_max_ev*100):.1f}% EV) | Kelly Stake: ${(pct_k/100)*bank:.2f}")
         else:
             st.warning("📉 Sin valor esperado positivo en el 1X2.")
 
@@ -524,7 +599,7 @@ with t2:
     with col_ticket:
         st.markdown("### 🎫 Ticket Activo")
         if not st.session_state.ticket:
-            st.info("Sin selecciones en el ticket.")
+            st.info("Sin selecciones.")
         else:
             tot_odd, tot_prob = 1.0, 1.0
             for idx, item in enumerate(st.session_state.ticket):
@@ -557,7 +632,7 @@ with t2:
 
 # --- TAB 3: PRÓXIMOS PARTIDOS ---
 with t3:
-    st.markdown("### 📅 Fixture Oficial de Próximos Partidos (football-data.org)")
+    st.markdown("### 📅 Fixture Oficial de Próximos Partidos")
     if not upcoming_matches:
         st.info("No hay partidos programados próximamente para esta liga.")
     else:
@@ -583,14 +658,14 @@ with t3:
         if fix_rows:
             st.dataframe(pd.DataFrame(fix_rows), use_container_width=True)
         else:
-            st.write("Equipos de la próxima jornada no coinciden aún con los nombres históricos cargados.")
+            st.write("Equipos de la próxima jornada no coinciden con los nombres del histórico.")
 
 # --- TAB 4: ML ENGINE ---
 with t4:
     st.markdown("### 🤖 Predicción con Ensamble Machine Learning")
     if st.button("🧠 Entrenar y Predecir Partido Actual"):
         with st.spinner("Entrenando modelo sobre histórico..."):
-            snap = train_snapshot_cached(df, window_matches=800)
+            snap = train_snapshot_cached(df, window_matches=1200)
         if snap is None:
             st.warning("Datos históricos insuficientes para entrenar el modelo ML.")
         else:
