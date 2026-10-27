@@ -1,8 +1,10 @@
-streamlit>=1.32.0
-pandas
-numpy
-scipy
-plotly
-requests
-scikit-learn
-xgboost
+streamlit>=1.37
+pandas>=2.0
+numpy>=1.24
+scipy>=1.10
+scikit-learn>=1.3
+plotly>=5.18
+requests>=2.31
+jinja2>=3.1
+# Opcional (si no está instalado, el modelo de árboles usa RandomForest):
+# xgboost>=2.0
