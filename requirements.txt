@@ -7,4 +7,4 @@ plotly>=5.18
 requests>=2.31
 jinja2>=3.1
 # Opcional (si no está instalado, el modelo de árboles usa RandomForest):
-# xgboost>=2.0
+xgboost>=2.0
