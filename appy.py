@@ -185,27 +185,36 @@ def blend_probs(p_model, p_market, w_model):
 
 
 def kelly_pct(prob, odd, fraction=0.25, cap_pct=3.0, min_edge=0.0):
-    """% del banco a apostar: Kelly fraccionado, con edge mínimo y tope por apuesta."""
+    """% del banco a apostar: Kelly fraccionado con tope por apuesta. 'min_edge' es la ventaja
+    mínima en puntos de probabilidad (prob - 1/cuota); con 0 equivale a exigir EV > 0."""
     if prob <= 0 or odd <= 1.0:
         return 0.0
-    if prob * odd - 1.0 <= min_edge:
+    if prob - 1.0 / odd <= min_edge:
         return 0.0
     b = odd - 1.0
     f = (b * prob - (1.0 - prob)) / b
     return float(min(max(0.0, f * fraction) * 100.0, cap_pct))
 
 
+def prob_edges(adj, odds):
+    """Ventaja en puntos de probabilidad: prob. ajustada - probabilidad implícita de la cuota (1/cuota)."""
+    return np.asarray(adj, float) - 1.0 / np.maximum(np.asarray(odds, float), 1.01)
+
+
 def pick_from_probs(adj, odds, P):
-    """Mejor selección 1X2 con EV >= mínimo y cuota <= máxima. Devuelve (k, ev, kelly%) o None."""
+    """Mejor selección 1X2. Se elige y se filtra por VENTAJA EN PROBABILIDAD (no por EV bruto): el EV crece
+    con la cuota, así que un umbral de EV favorece sistemáticamente empates y cuotas largas, donde el
+    ruido del modelo se amplifica. Devuelve (k, ev, kelly%) o None."""
     adj = np.asarray(adj, float)
     odds = np.asarray(odds, float)
-    ev = adj * odds - 1.0
-    ev_masked = np.where((odds <= P["odd_max"]) & (odds > 1.01), ev, -np.inf)
-    k = int(np.argmax(ev_masked))
-    best = float(ev_masked[k])
-    if not np.isfinite(best) or best <= 0 or best < P["ev_min"]:
+    edge = prob_edges(adj, odds)
+    ok = (odds <= P["odd_max"]) & (odds > 1.01) & np.isin(np.arange(3), P.get("allowed") or [0, 1, 2])
+    score = np.where(ok, edge, -np.inf)
+    k = int(np.argmax(score))
+    best = float(score[k])
+    if not np.isfinite(best) or best <= 0 or best < P["edge_min"]:
         return None
-    return k, best, kelly_pct(adj[k], odds[k], P["kelly_frac"], P["cap_pct"], P["ev_min"])
+    return k, float(adj[k] * odds[k] - 1.0), kelly_pct(adj[k], odds[k], P["kelly_frac"], P["cap_pct"], P["edge_min"])
 
 
 # ======================================================
@@ -528,20 +537,60 @@ def build_dataset(df_ctx, xi, reg, league="", min_hist=150, block_days=14, windo
     return pd.DataFrame(recs)
 
 
+Z_NAMES = ["DC vs mercado L", "DC vs mercado E", "DC vs mercado V", "Elo Δ", "Forma L−V", "Descanso L−V", "SOT L−V"]
+
+
 class MLModel:
-    """'logistic': regresión logística multinomial sobre log-probabilidades (bien calibrada por
-    construcción). 'trees': XGBoost/RandomForest poco profundo + calibración (regresión logística
-    sobre log-probs, ajustada en el 20% cronológicamente más reciente)."""
+    """kind='offset' (recomendado): multinomial cuyo punto de partida es el propio mercado (log de las
+    probabilidades sin margen) más una corrección con ridge sobre señales propias (Dixon-Coles vs mercado,
+    Elo, forma, descanso, tiros). Sin evidencia fuerte no se aparta del mercado, lo que evita probabilidades
+    'ruidosas' (sobre todo en el empate, que es casi impredecible).
+    kind='trees': XGBoost/RandomForest poco profundo + calibración (regresión logística sobre log-probs,
+    ajustada en el 20% cronológicamente más reciente)."""
 
-    def __init__(self, kind="logistic", seed=42):
-        self.kind, self.seed = kind, seed
-        self.pipe = self.base = self.cal = None
+    def __init__(self, kind="offset", seed=42, alpha=0.03):
+        self.kind, self.seed, self.alpha = kind, seed, alpha
+        self.base = self.cal = None
+        self.W = self.b = self.mu = self.sd = None
 
-    def _tx(self, X):
-        X = np.asarray(X, float).copy()
-        X[:, :6] = np.log(np.clip(X[:, :6], 1e-6, 1.0))
-        return X
+    # --- corrección sobre el mercado ---
+    @staticmethod
+    def _z(X):
+        X = np.asarray(X, float)
+        mk, dc = np.clip(X[:, 0:3], 1e-6, 1.0), np.clip(X[:, 3:6], 1e-6, 1.0)
+        return np.column_stack([np.log(dc / mk), X[:, 9], X[:, 10] - X[:, 11], X[:, 12] - X[:, 13], X[:, 14] - X[:, 15]])
 
+    def _fit_offset(self, X, y):
+        X = np.asarray(X, float)
+        Z = self._z(X)
+        self.mu, self.sd = Z.mean(axis=0), Z.std(axis=0) + 1e-9
+        Z = (Z - self.mu) / self.sd
+        base = np.log(np.clip(X[:, 0:3], 1e-6, 1.0))
+        n, d = Z.shape
+        Y = np.eye(3)[np.asarray(y, int)]
+        lam = self.alpha * n
+
+        def f(p):
+            W, b = p[:d * 3].reshape(d, 3), p[d * 3:]
+            L = base + b + Z @ W
+            L = L - L.max(axis=1, keepdims=True)
+            E = np.exp(L)
+            P = E / E.sum(axis=1, keepdims=True)
+            nll = -np.log(np.clip((P * Y).sum(axis=1), 1e-12, None)).sum() + 0.5 * lam * (W ** 2).sum()
+            G = P - Y
+            return nll, np.concatenate([(Z.T @ G + lam * W).ravel(), G.sum(axis=0)])
+
+        r = minimize(f, np.zeros(d * 3 + 3), jac=True, method="L-BFGS-B")
+        self.W, self.b = r.x[:d * 3].reshape(d, 3), r.x[d * 3:]
+
+    def _predict_offset(self, X):
+        X = np.asarray(X, float)
+        L = np.log(np.clip(X[:, 0:3], 1e-6, 1.0)) + self.b + ((self._z(X) - self.mu) / self.sd) @ self.W
+        L = L - L.max(axis=1, keepdims=True)
+        E = np.exp(L)
+        return E / E.sum(axis=1, keepdims=True)
+
+    # --- árboles calibrados ---
     def _make_tree(self):
         if HAS_XGB:
             return xgb.XGBClassifier(
@@ -553,12 +602,8 @@ class MLModel:
 
     def fit(self, X, y):
         X, y = np.asarray(X, float), np.asarray(y, int)
-        if self.kind == "logistic":
-            self.pipe = Pipeline([
-                ("sc", StandardScaler()),
-                ("clf", LogisticRegression(C=0.3, max_iter=3000)),
-            ])
-            self.pipe.fit(self._tx(X), y)
+        if self.kind == "offset":
+            self._fit_offset(X, y)
         else:
             split = int(len(X) * 0.8)
             self.base = self._make_tree()
@@ -570,17 +615,19 @@ class MLModel:
 
     def predict_proba(self, X):
         X = np.asarray(X, float)
-        if self.kind == "logistic":
-            return self.pipe.predict_proba(self._tx(X))
+        if self.kind == "offset":
+            return self._predict_offset(X)
         P = self.base.predict_proba(X)
         if self.cal is not None:
             P = self.cal.predict_proba(np.log(np.clip(P, 1e-6, 1.0)))
         return P
 
-    def importances(self):
-        if self.kind == "logistic":
-            return np.abs(self.pipe.named_steps["clf"].coef_).mean(axis=0)
-        return np.asarray(self.base.feature_importances_, float)
+    def explain(self, x):
+        """Tabla Feature / Importancia / Valor para un partido (x = vector de FEATURE_NAMES)."""
+        x = np.asarray(x, float).reshape(1, -1)
+        if self.kind == "offset":
+            return pd.DataFrame({"Feature": Z_NAMES, "Importancia": np.abs(self.W).mean(axis=1), "Valor": self._z(x)[0]})
+        return pd.DataFrame({"Feature": FEATURE_NAMES, "Importancia": np.asarray(self.base.feature_importances_, float), "Valor": x[0]})
 
 # ======================================================
 # 7. EVALUACIÓN WALK-FORWARD, ESTRATEGIA Y AFINACIÓN
@@ -594,7 +641,7 @@ def _ll(P, y):
     return float(log_loss(y, np.clip(P, 1e-12, 1.0), labels=[0, 1, 2]))
 
 
-def evaluate_walkforward(ds, kind="logistic", n_test=400, min_train=500, retrain_every=30, seed=42):
+def evaluate_walkforward(ds, kind="offset", n_test=400, min_train=500, retrain_every=30, seed=42):
     """Evalúa ML vs Dixon-Coles vs Mercado sobre los últimos 'n_test' partidos del dataset.
     Las features ya son pre-partido; el ML se reentrena cada 'retrain_every' partidos usando solo
     filas con fecha estrictamente anterior."""
@@ -633,18 +680,21 @@ def evaluate_walkforward(ds, kind="logistic", n_test=400, min_train=500, retrain
     }
 
 
-def simulate_strategy(meta, P_model, P_mk, y, w_model, ev_min, odd_max, kelly_frac, cap_pct, bank0=100.0, seed=0):
-    """Simula apostar al mejor EV (prob ajustada) cuando EV>=ev_min y cuota<=odd_max.
-    Devuelve apuestas, resumen con IC95% (bootstrap) y curvas de capital (stake plano y Kelly)."""
+def simulate_strategy(meta, P_model, P_mk, y, w_model, edge_min, odd_max, kelly_frac, cap_pct,
+                      allowed=(0, 1, 2), bank0=100.0, seed=0):
+    """Simula apostar a la selección con mayor VENTAJA EN PROBABILIDAD (prob. ajustada - 1/cuota) cuando la
+    ventaja >= edge_min, la cuota <= odd_max y el resultado está permitido. Devuelve apuestas, resumen con
+    IC95% (bootstrap), desglose por tipo de apuesta y curvas de capital (stake plano y Kelly)."""
     odds = meta[["odd_h", "odd_d", "odd_a"]].to_numpy(float)
     P_adj = w_model * np.asarray(P_model) + (1 - w_model) * np.asarray(P_mk)
     P_adj = P_adj / P_adj.sum(axis=1, keepdims=True)
-    ev = P_adj * odds - 1.0
-    ev_m = np.where(odds <= odd_max, ev, -np.inf)
-    k = ev_m.argmax(axis=1)
+    edge = P_adj - 1.0 / odds
+    ok = (odds <= odd_max) & np.isin(np.arange(3), list(allowed) or [0, 1, 2])[None, :]
+    score = np.where(ok, edge, -np.inf)
+    k = score.argmax(axis=1)
     rows = np.arange(len(k))
-    best = ev_m[rows, k]
-    sel = np.isfinite(best) & (best > 0) & (best >= ev_min)
+    best = score[rows, k]
+    sel = np.isfinite(best) & (best > 0) & (best >= edge_min)
     if not sel.any():
         return {"bets": pd.DataFrame(), "n_bets": 0}
     ids = rows[sel]
@@ -653,11 +703,17 @@ def simulate_strategy(meta, P_model, P_mk, y, w_model, ev_min, odd_max, kelly_fr
     won = (y[ids] == k[ids])
     profit = np.where(won, odd - 1.0, -1.0)
     bets = pd.DataFrame({
-        "Fecha": meta["date"].to_numpy()[ids], "Partido": (meta["home"] + " vs " + meta["away"]).to_numpy()[ids],
+        "Fecha": meta["date"].dt.strftime("%Y-%m-%d").to_numpy()[ids],
+        "Partido": (meta["home"] + " vs " + meta["away"]).to_numpy()[ids],
         "Pick": np.array(["Local", "Empate", "Visita"])[k[ids]], "Cuota": odd, "P ajust.": p,
-        "EV": best[sel], "Acierto": won, "P/L (U)": profit,
+        "Ventaja (pp)": best[sel] * 100, "EV": p * odd - 1.0, "Acierto": won, "P/L (U)": profit,
     })
     n_b = len(bets)
+    by_pick = bets.groupby("Pick").agg(Apuestas=("Cuota", "size"), Esperados=("P ajust.", "sum"),
+                                       Reales=("Acierto", "sum"), Profit=("P/L (U)", "sum"))
+    by_pick = by_pick.reindex(["Local", "Empate", "Visita"]).dropna(how="all")
+    by_pick["% apuestas"] = by_pick["Apuestas"] / n_b * 100
+    by_pick["Yield %"] = by_pick["Profit"] / by_pick["Apuestas"] * 100
     rng = np.random.default_rng(seed)
     boots = profit[rng.integers(0, n_b, size=(2000, n_b))].mean(axis=1) * 100
     equity = np.cumsum(profit)
@@ -668,7 +724,7 @@ def simulate_strategy(meta, P_model, P_mk, y, w_model, ev_min, odd_max, kelly_fr
         bank += stake * (oi - 1.0) if wi else -stake
         kelly_curve.append(bank)
     return {
-        "bets": bets, "n_bets": n_b, "hit": float(won.mean()), "profit": float(profit.sum()),
+        "bets": bets, "n_bets": n_b, "hit": float(won.mean()), "profit": float(profit.sum()), "by_pick": by_pick.reset_index(),
         "yield": float(profit.mean() * 100), "ci": (float(np.percentile(boots, 2.5)), float(np.percentile(boots, 97.5))),
         "max_dd": float((equity - peak).min()), "equity": equity, "kelly_curve": np.array(kelly_curve), "bank0": bank0,
     }
@@ -1058,13 +1114,14 @@ def decorate_scan(raw, P, bank):
         adj = [r["adj_h"], r["adj_d"], r["adj_a"]]
         odds = [r["odd_h"], r["odd_d"], r["odd_a"]]
         pk = pick_from_probs(adj, odds, P)
+        edges = prob_edges(adj, odds)
         if pk:
             k, best_ev, kp = pk
             pick = [f"Gana {r['home']}", "Empate", f"Gana {r['away']}"][k]
-            odd, book, stake = odds[k], r[f"book_{'hda'[k]}"], bank * kp / 100.0
+            odd, book, stake, edge_pp = odds[k], r[f"book_{'hda'[k]}"], bank * kp / 100.0, float(edges[k] * 100)
         else:
             best_ev = float(np.max(np.array(adj) * np.array(odds) - 1.0))
-            pick, odd, book, kp, stake = "No Bet", np.nan, "", 0.0, 0.0
+            pick, odd, book, kp, stake, edge_pp = "No Bet", np.nan, "", 0.0, 0.0, float(np.max(edges) * 100)
         out.append({
             "Liga": r["league"], "Hora (UTC)": r["hora"], "Partido": r["partido"],
             "Mejores cuotas": f"H:{odds[0]:.2f} D:{odds[1]:.2f} A:{odds[2]:.2f}",
@@ -1072,19 +1129,19 @@ def decorate_scan(raw, P, bank):
             "DC": f"{r['dc_h']:.2f}|{r['dc_d']:.2f}|{r['dc_a']:.2f}",
             "ML": f"{r['ml_h']:.2f}|{r['ml_d']:.2f}|{r['ml_a']:.2f}",
             "Ajustada": f"{adj[0]:.2f}|{adj[1]:.2f}|{adj[2]:.2f}",
-            "Mejor EV": best_ev, "Pick": pick, "Cuota": odd, "Casa": book, "Kelly %": kp, "Stake $": stake, "Aviso": r["aviso"],
+            "Ventaja pp": edge_pp, "Mejor EV": best_ev, "Pick": pick, "Cuota": odd, "Casa": book, "Kelly %": kp, "Stake $": stake, "Aviso": r["aviso"],
         })
     return pd.DataFrame(out)
 
 
 def render_scan_table(raw, P, bank, key):
     dec = decorate_scan(raw, P, bank)
-    only = st.checkbox("Mostrar solo picks (EV ≥ mínimo y cuota ≤ máxima)", value=False, key=f"only_{key}")
+    only = st.checkbox("Mostrar solo picks (ventaja ≥ mínima y cuota ≤ máxima)", value=False, key=f"only_{key}")
     if only:
         dec = dec[dec["Pick"] != "No Bet"]
-    dec = dec.sort_values("Mejor EV", ascending=False).reset_index(drop=True)
+    dec = dec.sort_values("Ventaja pp", ascending=False).reset_index(drop=True)
     st.dataframe(
-        dec.style.format({"Mejor EV": "{:.3f}", "Cuota": "{:.2f}", "Kelly %": "{:.2f}", "Stake $": "{:.2f}"}, na_rep="—"),
+        dec.style.format({"Ventaja pp": "{:+.1f}", "Mejor EV": "{:.3f}", "Cuota": "{:.2f}", "Kelly %": "{:.2f}", "Stake $": "{:.2f}"}, na_rep="—"),
         use_container_width=True, hide_index=True,
     )
     return dec
@@ -1136,19 +1193,26 @@ with st.sidebar:
                        help="Mayor ξ = el modelo olvida más rápido los partidos antiguos. Afínalo en 🧪 Laboratorio.")
         reg = st.slider("Regularización (shrinkage)", 0.0, 12.0, 3.0, 0.5,
                         help="Encoge ataque/defensa hacia el equipo promedio; ayuda con equipos de pocos partidos.")
-        ml_kind = st.selectbox("Modelo ML", ["logistic", "trees"], index=0,
-                               format_func=lambda k: "Regresión logística (recomendada)" if k == "logistic" else TREE_LABEL)
+        ml_kind = st.selectbox("Modelo ML", ["offset", "trees"], index=0,
+                               format_func=lambda k: "Corrección regularizada sobre el mercado (recomendada)" if k == "offset" else TREE_LABEL,
+                               help="'Sobre el mercado' parte de las cuotas y solo se aparta con evidencia: menos ruido, sobre todo en el empate.")
         ml_scope = st.selectbox("Entrenamiento del ML", ["pooled", "league"], index=0,
                                 format_func=lambda k: "Las 7 ligas juntas (más datos)" if k == "pooled" else "Solo la liga seleccionada")
-        w_model = st.slider("Peso del modelo vs mercado (%)", 0, 100, 40, 5,
-                            help="Probabilidad ajustada = peso·modelo + (1-peso)·mercado. Más peso al mercado = apuestas más prudentes.") / 100
+        w_model = st.slider("Peso del modelo vs mercado (%)", 0, 100, 50, 5,
+                            help="Probabilidad ajustada = peso·modelo + (1-peso)·mercado. Más peso al mercado = apuestas más prudentes. "
+                                 "Si desactivas el ML y usas solo Dixon-Coles, conviene un peso bajo.") / 100
         kelly_frac = st.slider("Fracción de Kelly", 0.05, 1.0, 0.25, 0.05)
         cap_pct = st.slider("Tope por apuesta (% del banco)", 0.5, 10.0, 3.0, 0.5)
-        ev_min = st.slider("EV mínimo para apostar (%)", 0, 15, 3) / 100
+        edge_min = st.slider("Ventaja mínima (puntos de probabilidad)", 0.0, 6.0, 2.0, 0.5,
+                             help="Prob. ajustada − 1/cuota. Se usa en lugar de un EV mínimo porque el EV crece con la cuota y "
+                                  "favorecería empates y cuotas largas, donde el ruido del modelo pesa más.") / 100
+        allowed_lbl = st.multiselect("Resultados 1X2 permitidos", ["Local", "Empate", "Visita"], default=["Local", "Empate", "Visita"],
+                                     help="Quita el que quieras excluir de los picks (por ejemplo, el empate).")
+        allowed = [["Local", "Empate", "Visita"].index(a) for a in allowed_lbl] or [0, 1, 2]
         odd_max = st.slider("Cuota máxima", 2.0, 15.0, 8.0, 0.5, help="Evita cuotas largas, donde el error del modelo pesa más.")
 
     P = dict(xi=xi, reg=reg, ml_kind=ml_kind, ml_scope=ml_scope, w_model=w_model, kelly_frac=kelly_frac,
-             cap_pct=cap_pct, ev_min=ev_min, odd_max=odd_max, horizon_h=168)
+             cap_pct=cap_pct, edge_min=edge_min, allowed=allowed, odd_max=odd_max, horizon_h=168)
 
     with st.spinner("Cargando datos y ajustando Dixon-Coles..."):
         bundle = get_league_bundle(code, xi, reg)
@@ -1248,15 +1312,16 @@ def render_value_tab(code, home, away, bank, P):
         st.markdown("#### 🧠 Valor y Kelly (1X2)")
         tbl = pd.DataFrame({
             "Selección": [f"Gana {home}", "Empate", f"Gana {away}"], "Cuota": odds, "P. mercado": mk,
-            f"P. {src}": p_model, "P. ajustada": p_adj, "EV": p_adj * odds - 1.0, "EV (modelo puro)": p_model * odds - 1.0,
-            "Kelly %": [kelly_pct(p, o, P["kelly_frac"], P["cap_pct"], P["ev_min"]) for p, o in zip(p_adj, odds)],
+            f"P. {src}": p_model, "P. ajustada": p_adj, "Ventaja (pp)": prob_edges(p_adj, odds) * 100,
+            "EV": p_adj * odds - 1.0, "EV (modelo puro)": p_model * odds - 1.0,
+            "Kelly %": [kelly_pct(p, o, P["kelly_frac"], P["cap_pct"], P["edge_min"]) for p, o in zip(p_adj, odds)],
         })
         st.dataframe(tbl.style.format({
-            "Cuota": "{:.2f}", "P. mercado": "{:.3f}", f"P. {src}": "{:.3f}", "P. ajustada": "{:.3f}",
+            "Cuota": "{:.2f}", "P. mercado": "{:.3f}", f"P. {src}": "{:.3f}", "P. ajustada": "{:.3f}", "Ventaja (pp)": "{:+.1f}",
             "EV": "{:+.3f}", "EV (modelo puro)": "{:+.3f}", "Kelly %": "{:.2f}",
         }), hide_index=True, use_container_width=True)
         st.caption(f"P. ajustada = {P['w_model'] * 100:.0f}% modelo + {(1 - P['w_model']) * 100:.0f}% mercado. "
-                   f"Se apuesta solo con EV ≥ {P['ev_min'] * 100:.0f}% y cuota ≤ {P['odd_max']:.1f}.")
+                   f"Se apuesta solo con ventaja ≥ {P['edge_min'] * 100:.1f} pp (prob. ajustada − 1/cuota) y cuota ≤ {P['odd_max']:.1f}.")
         pk = pick_from_probs(p_adj, odds, P)
         if pk:
             k, ev_k, kp = pk
@@ -1264,7 +1329,7 @@ def render_value_tab(code, home, away, bank, P):
             st.success(f"💎 **Recomendación:** {sel_name} @ {odds[k]:.2f} | EV {ev_k * 100:+.1f}% | "
                        f"Stake: ${bank * kp / 100:.2f} ({kp:.2f}% del banco)")
         else:
-            st.warning("📉 Kelly sugiere: **No apostar** (sin EV suficiente tras ajustar por el mercado).")
+            st.warning("📉 Kelly sugiere: **No apostar** (sin ventaja suficiente tras ajustar por el mercado).")
 
         st.markdown("#### ⚽ Mercados de goles")
         w = P["w_model"]
@@ -1272,11 +1337,11 @@ def render_value_tab(code, home, away, bank, P):
         for lbl, key_, p_raw, o in (("Over 2.5 Goles", "O25", dcp["po25"], odd_o25), ("BTTS (Ambos anotan)", "BTTS", dcp["pbtts"], odd_btts)):
             p_a = w * p_raw + (1 - w) * (1.0 / o)
             goal_adj[lbl] = (key_, o, p_a)
-            rows.append({"Mercado": lbl, "Cuota": o, "P. modelo": p_raw, "P. ajustada": p_a, "EV": p_a * o - 1.0,
-                         "EV (modelo puro)": p_raw * o - 1.0,
-                         "Kelly %": kelly_pct(p_a, o, P["kelly_frac"], P["cap_pct"], P["ev_min"])})
+            rows.append({"Mercado": lbl, "Cuota": o, "P. modelo": p_raw, "P. ajustada": p_a, "Ventaja (pp)": (p_a - 1.0 / o) * 100,
+                         "EV": p_a * o - 1.0, "EV (modelo puro)": p_raw * o - 1.0,
+                         "Kelly %": kelly_pct(p_a, o, P["kelly_frac"], P["cap_pct"], P["edge_min"])})
         st.dataframe(pd.DataFrame(rows).style.format({
-            "Cuota": "{:.2f}", "P. modelo": "{:.3f}", "P. ajustada": "{:.3f}", "EV": "{:+.3f}",
+            "Cuota": "{:.2f}", "P. modelo": "{:.3f}", "P. ajustada": "{:.3f}", "Ventaja (pp)": "{:+.1f}", "EV": "{:+.3f}",
             "EV (modelo puro)": "{:+.3f}", "Kelly %": "{:.2f}"}), hide_index=True, use_container_width=True)
         st.caption("Sin probabilidad de mercado para estos mercados: se usa 1/cuota como referencia (incluye el margen).")
 
@@ -1560,8 +1625,9 @@ with t5:
 
     st.divider()
     st.markdown("### 📈 Backtest de la estrategia (EV con probabilidad ajustada)")
-    st.caption("Simula lo que recomienda la app: apostar al mejor EV cuando EV ≥ mínimo y cuota ≤ máxima, usando la cuota de "
-               "mercado promedio de cada partido. Los parámetros salen de la barra lateral y se recalculan al instante.")
+    st.caption("Simula lo que recomienda la app: apostar a la selección con mayor ventaja en probabilidad cuando ventaja ≥ mínima y "
+               "cuota ≤ máxima, usando la cuota de mercado promedio de cada partido. Los parámetros salen de la barra lateral y "
+               "se recalculan al instante.")
     bc1, bc2, bc3 = st.columns(3)
     n_bt = bc1.slider("Partidos de prueba", 200, 3000, 800, 100, key="bt_n")
     rt_bt = bc2.slider("Reentrenar ML cada (partidos)", 10, 100, 30, 10, key="bt_rt")
@@ -1577,11 +1643,11 @@ with t5:
     ev_bt = ss.results.get("lab_eval")
     if ev_bt is not None:
         P_model = ev_bt["P"]["ML"] if src_bt == "ML" else ev_bt["P"]["Dixon-Coles"]
-        sim = simulate_strategy(ev_bt["meta"], P_model, ev_bt["P"]["Mercado"], ev_bt["y"], w_model, ev_min, odd_max, kelly_frac, cap_pct)
+        sim = simulate_strategy(ev_bt["meta"], P_model, ev_bt["P"]["Mercado"], ev_bt["y"], w_model, edge_min, odd_max, kelly_frac, cap_pct, allowed)
         st.caption(f"Muestra: {ev_bt['n']} partidos"
                    f"{' de varias ligas' if ev_bt['meta']['league'].nunique() > 1 else ''} · modelo: {src_bt}.")
         if sim["n_bets"] == 0:
-            st.info("Con estos parámetros no habría habido apuestas (EV mínimo/peso del modelo muy exigentes). Prueba subir el peso del modelo.")
+            st.info("Con estos parámetros no habría habido apuestas (ventaja mínima o peso del modelo muy exigentes). Prueba bajar la ventaja mínima o subir el peso del modelo.")
         else:
             a1, a2, a3, a4 = st.columns(4)
             a1.metric("Apuestas", f"{sim['n_bets']}")
@@ -1597,6 +1663,15 @@ with t5:
                 st.error(f"IC 95% del yield: [{lo:+.1f}%, {hi:+.1f}%] — la estrategia pierde con estos parámetros.")
             st.caption(f"Máximo drawdown (stake plano): {sim['max_dd']:.2f} U · Banco simulado con Kelly "
                        f"(inicio {sim['bank0']:.0f}): {sim['kelly_curve'][-1]:.1f}")
+            bp = sim["by_pick"]
+            st.markdown("**Por tipo de apuesta** — ¿se concentra en un resultado? Compara aciertos esperados vs reales.")
+            st.dataframe(bp.style.format({"Esperados": "{:.1f}", "Reales": "{:.0f}", "Profit": "{:+.2f}", "% apuestas": "{:.0f}", "Yield %": "{:+.1f}"}),
+                         hide_index=True, use_container_width=True)
+            top = bp.loc[bp["% apuestas"].idxmax()]
+            if top["% apuestas"] > 55 and sim["n_bets"] >= 15:
+                st.warning(f"«{top['Pick']}» concentra el {top['% apuestas']:.0f}% de las apuestas. Suele ser ruido del modelo (el empate es "
+                           "casi impredecible y su cuota amplifica cualquier error), no una ventaja real. Si los aciertos reales no superan "
+                           "a los esperados, excluye ese resultado en la barra lateral o sube la ventaja mínima.")
             cg1, cg2 = st.columns(2)
             cg1.plotly_chart(equity_figure({"Stake plano": sim["equity"]}, "Capital acumulado (unidades)", "Unidades"), use_container_width=True)
             cg2.plotly_chart(equity_figure({"Kelly fraccionado": sim["kelly_curve"]}, "Banco simulado", "Banco"), use_container_width=True)
@@ -1665,7 +1740,7 @@ with t6:
 # --- TAB 7: ML 1X2 ---
 with t7:
     st.markdown("## 🤖 ML 1X2: mercado + Dixon-Coles + contexto")
-    kind_lbl = "Regresión logística" if ml_kind == "logistic" else TREE_LABEL
+    kind_lbl = "Corrección regularizada sobre el mercado" if ml_kind == "offset" else TREE_LABEL
     scope_lbl = "las 7 ligas juntas" if ml_scope == "pooled" else f"solo {LEAGUES[code]}"
     st.caption(f"Modelo: {kind_lbl} · entrenado con {scope_lbl}. Todas las features son pre-partido (sin fugas): "
                "cuotas sin margen, Dixon-Coles ajustado solo con el pasado, Elo, forma, días de descanso y tiros a puerta previos.")
@@ -1696,6 +1771,15 @@ with t7:
             st.success("El ML supera al mercado en esta muestra. Confírmalo con más partidos antes de subir stakes.")
         else:
             st.warning("El ML no supera al mercado en esta muestra: es lo habitual. Úsalo como complemento (peso moderado) y vigila el CLV.")
+        bias_rows = [{"Modelo": nm, "P(Local)": P_[:, 0].mean(), "P(Empate)": P_[:, 1].mean(), "P(Visita)": P_[:, 2].mean(),
+                      "σ P(Empate)": P_[:, 1].std()} for nm, P_ in ev_ml["P"].items()]
+        freq = np.bincount(ev_ml["y"], minlength=3) / len(ev_ml["y"])
+        bias_rows.append({"Modelo": "Frecuencia real", "P(Local)": freq[0], "P(Empate)": freq[1], "P(Visita)": freq[2], "σ P(Empate)": np.nan})
+        st.markdown("**Sesgo por resultado**")
+        st.dataframe(pd.DataFrame(bias_rows).style.format({"P(Local)": "{:.3f}", "P(Empate)": "{:.3f}", "P(Visita)": "{:.3f}", "σ P(Empate)": "{:.3f}"}, na_rep="—"),
+                     hide_index=True, use_container_width=True)
+        st.caption("Si σ P(Empate) del ML es mucho mayor que la del mercado, el modelo está inventando señal en el empate "
+                   "(casi impredecible) y generará 'valor' falso en ese resultado.")
         st.plotly_chart(calibration_figure(ev_ml["P"], ev_ml["y"]), use_container_width=True)
 
     st.divider()
@@ -1712,8 +1796,7 @@ with t7:
             else:
                 x_now = make_features(mk_now, dc, bundle["tracker"].features(home, away, pd.Timestamp.now().normalize()))
                 p_ml = ml.predict_proba(x_now.reshape(1, -1))[0]
-                ss.results["ml_pred"] = {"match_id": match_id, "mk": mk_now, "mk_src": mk_src, "p_ml": p_ml, "x": x_now,
-                                         "imp": ml.importances()}
+                ss.results["ml_pred"] = {"match_id": match_id, "mk": mk_now, "mk_src": mk_src, "p_ml": p_ml, "table": ml.explain(x_now)}
     pred = ss.results.get("ml_pred")
     if pred and pred["match_id"] == match_id:
         pa_, pb_, pc_ = st.columns(3)
@@ -1729,9 +1812,9 @@ with t7:
         })
         st.caption(f"Mercado: {pred['mk_src']}.")
         st.dataframe(comp.style.format({"H": "{:.3f}", "D": "{:.3f}", "A": "{:.3f}"}), hide_index=True, use_container_width=True)
-        imp_df = pd.DataFrame({"Feature": FEATURE_NAMES, "Importancia": pred["imp"], "Valor": pred["x"]}).sort_values("Importancia")
+        imp_df = pred["table"].sort_values("Importancia")
         st.markdown("### 🔍 Importancia de variables")
-        st.caption("Logística: |coeficiente| medio de variables estandarizadas. Árboles: importancia del modelo base.")
+        st.caption("Corrección sobre el mercado: |coeficiente| medio de cada señal (el mercado es el punto de partida). Árboles: importancia del modelo base.")
         fig_imp = go.Figure(go.Bar(x=imp_df["Importancia"], y=imp_df["Feature"], orientation="h", marker_color="#76b900"))
         fig_imp.update_layout(height=420, margin=dict(l=0, r=0, t=30, b=0), template="plotly_dark")
         st.plotly_chart(fig_imp, use_container_width=True)
@@ -1774,15 +1857,15 @@ with t8:
                 with st.expander(f"⚽ {LEAGUES[lc]} (sin partidos válidos)", expanded=False):
                     st.write("No se encontraron partidos pre-partido con nombres y cuotas válidos en la ventana.")
                 continue
-            dec_l = decorate_scan(raw, P, bank).sort_values("Mejor EV", ascending=False).reset_index(drop=True)
+            dec_l = decorate_scan(raw, P, bank).sort_values("Ventaja pp", ascending=False).reset_index(drop=True)
             n_picks = int((dec_l["Pick"] != "No Bet").sum())
             all_dec.append(dec_l)
             with st.expander(f"⚽ {LEAGUES[lc]} ({n_picks} picks de {len(dec_l)} partidos)", expanded=n_picks > 0):
-                st.dataframe(dec_l.style.format({"Mejor EV": "{:.3f}", "Cuota": "{:.2f}", "Kelly %": "{:.2f}", "Stake $": "{:.2f}"}, na_rep="—"),
+                st.dataframe(dec_l.style.format({"Ventaja pp": "{:+.1f}", "Mejor EV": "{:.3f}", "Cuota": "{:.2f}", "Kelly %": "{:.2f}", "Stake $": "{:.2f}"}, na_rep="—"),
                              hide_index=True, use_container_width=True)
         if all_dec:
             st.divider()
             st.markdown("### 📥 Descargar todo")
-            df_master = pd.concat(all_dec, ignore_index=True).sort_values("Mejor EV", ascending=False)
+            df_master = pd.concat(all_dec, ignore_index=True).sort_values("Ventaja pp", ascending=False)
             st.download_button("Descargar CSV combinado (todas las ligas)", data=df_master.to_csv(index=False).encode("utf-8"),
                                file_name="super_jornada_ml.csv", mime="text/csv", key="dl_multi")
