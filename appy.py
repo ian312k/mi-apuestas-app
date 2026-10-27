@@ -1206,8 +1206,9 @@ with st.sidebar:
         edge_min = st.slider("Ventaja mínima (puntos de probabilidad)", 0.0, 6.0, 2.0, 0.5,
                              help="Prob. ajustada − 1/cuota. Se usa en lugar de un EV mínimo porque el EV crece con la cuota y "
                                   "favorecería empates y cuotas largas, donde el ruido del modelo pesa más.") / 100
-        allowed_lbl = st.multiselect("Resultados 1X2 permitidos", ["Local", "Empate", "Visita"], default=["Local", "Empate", "Visita"],
-                                     help="Quita el que quieras excluir de los picks (por ejemplo, el empate).")
+        allowed_lbl = st.multiselect("Resultados 1X2 permitidos", ["Local", "Empate", "Visita"], default=["Local", "Visita"],
+                                     help="El empate empieza desactivado: es casi impredecible y el modelo tiende a inventar ventaja en él. "
+                                          "Actívalo solo si en 🧪 Laboratorio → «Por tipo de apuesta» sus aciertos reales superan a los esperados.")
         allowed = [["Local", "Empate", "Visita"].index(a) for a in allowed_lbl] or [0, 1, 2]
         odd_max = st.slider("Cuota máxima", 2.0, 15.0, 8.0, 0.5, help="Evita cuotas largas, donde el error del modelo pesa más.")
 
