@@ -1,0 +1,12 @@
+# Secretos (nunca subirlos al repo)
+.streamlit/secrets.toml
+.env
+api key
+
+# Datos locales generados por la app
+mis_apuestas_pro.db
+mis_apuestas_pro.csv
+data_cache/
+
+__pycache__/
+*.pyc
