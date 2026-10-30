@@ -1135,6 +1135,28 @@ def decorate_scan(raw, P, bank):
     return pd.DataFrame(out)
 
 
+def safest_picks(raw, P, bank):
+    """Por partido, el resultado 1X2 con MAYOR probabilidad ajustada (el más 'seguro'), con su mejor cuota.
+    Seguro no es rentable: se marca si además tiene ventaja sobre la cuota (valor)."""
+    out = []
+    for r in raw.to_dict("records"):
+        adj = np.array([r["adj_h"], r["adj_d"], r["adj_a"]])
+        mk = np.array([r["mk_h"], r["mk_d"], r["mk_a"]])
+        odds = np.array([r["odd_h"], r["odd_d"], r["odd_a"]])
+        k = int(np.argmax(adj))
+        edge = float(prob_edges(adj, odds)[k])
+        value = edge > 0 and edge >= P["edge_min"]
+        kp = kelly_pct(adj[k], odds[k], P["kelly_frac"], P["cap_pct"], P["edge_min"]) if value else 0.0
+        out.append({
+            "Liga": r["league"], "Hora (UTC)": r["hora"], "Partido": r["partido"],
+            "Pick": [f"Gana {r['home']}", "Empate", f"Gana {r['away']}"][k],
+            "Prob. ajustada %": adj[k] * 100, "Prob. mercado %": mk[k] * 100, "Mejor cuota": odds[k],
+            "Casa": r[f"book_{'hda'[k]}"], "Ventaja pp": edge * 100, "EV": adj[k] * odds[k] - 1.0,
+            "¿Valor?": "✅" if value else "—", "Kelly %": kp, "Stake $": bank * kp / 100.0, "Aviso": r["aviso"],
+        })
+    return pd.DataFrame(out)
+
+
 def render_scan_table(raw, P, bank, key):
     dec = decorate_scan(raw, P, bank)
     only = st.checkbox("Mostrar solo picks (ventaja ≥ mínima y cuota ≤ máxima)", value=False, key=f"only_{key}")
@@ -1843,6 +1865,23 @@ with t8:
     mc1, mc2 = st.columns(2)
     use_ml_multi = mc1.checkbox("Usar modelo ML (si no, solo Dixon-Coles)", value=True, key="multi_use_ml")
     horizon_multi = mc2.slider("Ventana (días)", 1, 14, 7, key="multi_horizon")
+    if st.button(f"⬇️ Descargar odds de las 7 ligas ({len(LEAGUES)} créditos)", key="dl_all_odds", disabled=not api_key,
+                 help="Necesita la API key (💎 Escáner o st.secrets). Usa la caché de 10 min si ya las descargaste."):
+        errs = []
+        with st.spinner("Descargando odds de todas las ligas..."):
+            for lc, ln in LEAGUES.items():
+                try:
+                    resp = call_odds_api(API_LEAGUE_MAP[lc], api_key)
+                    ss.market_storage[lc] = {"timestamp": resp["ts"], "data": resp["data"]}
+                    if resp["remaining"] is not None:
+                        ss.api_usage = {"used": resp["used"], "remaining": resp["remaining"]}
+                except Exception as e:
+                    errs.append(f"{ln}: {_scrub(e, api_key)}")
+        for e in errs:
+            st.error(f"Error API · {e}")
+        if not errs:
+            ss.flash = "✅ Odds de las 7 ligas descargadas. Ahora ejecuta el análisis masivo."
+            st.rerun()
     if st.button("🚀 Ejecutar análisis masivo (7 ligas)", key="run_multi"):
         results, skipped = {}, []
         prog, status = st.progress(0.0), st.empty()
@@ -1882,3 +1921,34 @@ with t8:
             df_master = pd.concat(all_dec, ignore_index=True).sort_values("Ventaja pp", ascending=False)
             st.download_button("Descargar CSV combinado (todas las ligas)", data=df_master.to_csv(index=False).encode("utf-8"),
                                file_name="super_jornada_ml.csv", mime="text/csv", key="dl_multi")
+
+        # --- APUESTAS MÁS SEGURAS (todas las ligas) ---
+        raws = [r for r in multi["results"].values() if not r.empty]
+        if raws:
+            st.divider()
+            st.markdown("### 🛡️ Apuestas más seguras de la jornada")
+            st.caption("Para cada partido, el resultado 1X2 con mayor probabilidad ajustada (modelo + mercado). "
+                       "Ojo: «seguro» no significa rentable. Las cuotas bajas suelen ser justas o incluso peores que justas; "
+                       "solo las marcadas con ✅ tienen además ventaja sobre la cuota (valor). Una combinada de varias "
+                       "«seguras» multiplica el riesgo: 4 picks al 75% aciertan juntos solo el 32% de las veces.")
+            sf1, sf2, sf3 = st.columns(3)
+            min_prob = sf1.slider("Probabilidad mínima (%)", 40, 90, 60, 5, key="safe_min_prob")
+            top_n = sf2.slider("Mostrar los mejores", 5, 50, 15, 5, key="safe_top_n")
+            only_value = sf3.checkbox("Solo con valor (✅)", value=False, key="safe_only_value")
+            safe = safest_picks(pd.concat(raws, ignore_index=True), P, bank)
+            safe = safe[safe["Prob. ajustada %"] >= min_prob]
+            if only_value:
+                safe = safe[safe["¿Valor?"] == "✅"]
+            safe = safe.sort_values("Prob. ajustada %", ascending=False).head(top_n).reset_index(drop=True)
+            if safe.empty:
+                st.info("Ningún partido cumple los filtros. Baja la probabilidad mínima o desmarca «Solo con valor».")
+            else:
+                s1, s2, s3 = st.columns(3)
+                s1.metric("Picks", len(safe))
+                s2.metric("Con valor ✅", int((safe["¿Valor?"] == "✅").sum()))
+                s3.metric("Aciertos esperados", f"{safe['Prob. ajustada %'].sum() / 100:.1f} de {len(safe)}")
+                st.dataframe(safe.style.format({"Prob. ajustada %": "{:.1f}", "Prob. mercado %": "{:.1f}", "Mejor cuota": "{:.2f}",
+                                                "Ventaja pp": "{:+.1f}", "EV": "{:+.3f}", "Kelly %": "{:.2f}", "Stake $": "{:.2f}"}),
+                             hide_index=True, width="stretch")
+                st.download_button("📥 Descargar apuestas seguras (CSV)", data=safe.to_csv(index=False).encode("utf-8"),
+                                   file_name="apuestas_seguras.csv", mime="text/csv", key="dl_safe")
