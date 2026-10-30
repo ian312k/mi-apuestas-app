@@ -42,7 +42,7 @@ try:
 except Exception:
     HAS_XGB = False
 
-# st.fragment (>=1.37) con fallback para versiones anteriores
+# st.fragment con fallback para versiones anteriores
 fragment = getattr(st, "fragment", None) or getattr(st, "experimental_fragment", None) or (lambda f: f)
 
 # ======================================================
@@ -834,7 +834,8 @@ def update_bet_status(bet_id, status):
         row = con.execute("SELECT Stake, Cuota FROM bets WHERE ID=?", (str(bet_id),)).fetchone()
         if row is None:
             return
-        stake, odd = float(row[0]), float(row[1])
+        stake = float(row[0]) if row[0] is not None else 0.0
+        odd = float(row[1]) if row[1] is not None else 1.0
         profit = stake * (odd - 1) if status == "Ganada" else (-stake if status == "Perdida" else 0.0)
         con.execute("UPDATE bets SET Estado=?, Ganancia=? WHERE ID=?", (status, profit, str(bet_id)))
         con.commit()
@@ -1142,7 +1143,7 @@ def render_scan_table(raw, P, bank, key):
     dec = dec.sort_values("Ventaja pp", ascending=False).reset_index(drop=True)
     st.dataframe(
         dec.style.format({"Ventaja pp": "{:+.1f}", "Mejor EV": "{:.3f}", "Cuota": "{:.2f}", "Kelly %": "{:.2f}", "Stake $": "{:.2f}"}, na_rep="—"),
-        use_container_width=True, hide_index=True,
+        width="stretch", hide_index=True,
     )
     return dec
 
@@ -1150,7 +1151,7 @@ def render_scan_table(raw, P, bank, key):
 # 12. ESTADO, ESTILOS Y SIDEBAR
 # ======================================================
 ss.setdefault("ticket", [])
-ss.setdefault("api_key", os.environ.get("ODDS_API_KEY") or _secret("ODDS_API_KEY") or "")
+ss.setdefault("api_key", "")  # solo la key tecleada; la de secrets/entorno nunca se envía al navegador
 ss.setdefault("api_usage", {"used": None, "remaining": None})
 ss.setdefault("market_storage", {})
 ss.setdefault("odds_inputs", {})
@@ -1237,7 +1238,7 @@ with st.sidebar:
         latest = df.sort_values("date", ascending=False).head(5).copy()
         latest["Score"] = latest["home_goals"].astype(int).astype(str) + "-" + latest["away_goals"].astype(int).astype(str)
         latest["date"] = latest["date"].dt.strftime("%d/%m")
-        st.dataframe(latest[["date", "home", "Score", "away"]], hide_index=True, use_container_width=True)
+        st.dataframe(latest[["date", "home", "Score", "away"]], hide_index=True, width="stretch")
 
     st.divider()
     bank = st.number_input("💰 Tu banco ($)", min_value=0.0, value=1000.0, step=50.0, key="bank")
@@ -1320,7 +1321,7 @@ def render_value_tab(code, home, away, bank, P):
         st.dataframe(tbl.style.format({
             "Cuota": "{:.2f}", "P. mercado": "{:.3f}", f"P. {src}": "{:.3f}", "P. ajustada": "{:.3f}", "Ventaja (pp)": "{:+.1f}",
             "EV": "{:+.3f}", "EV (modelo puro)": "{:+.3f}", "Kelly %": "{:.2f}",
-        }), hide_index=True, use_container_width=True)
+        }), hide_index=True, width="stretch")
         st.caption(f"P. ajustada = {P['w_model'] * 100:.0f}% modelo + {(1 - P['w_model']) * 100:.0f}% mercado. "
                    f"Se apuesta solo con ventaja ≥ {P['edge_min'] * 100:.1f} pp (prob. ajustada − 1/cuota) y cuota ≤ {P['odd_max']:.1f}.")
         pk = pick_from_probs(p_adj, odds, P)
@@ -1343,7 +1344,7 @@ def render_value_tab(code, home, away, bank, P):
                          "Kelly %": kelly_pct(p_a, o, P["kelly_frac"], P["cap_pct"], P["edge_min"])})
         st.dataframe(pd.DataFrame(rows).style.format({
             "Cuota": "{:.2f}", "P. modelo": "{:.3f}", "P. ajustada": "{:.3f}", "Ventaja (pp)": "{:+.1f}", "EV": "{:+.3f}",
-            "EV (modelo puro)": "{:+.3f}", "Kelly %": "{:.2f}"}), hide_index=True, use_container_width=True)
+            "EV (modelo puro)": "{:+.3f}", "Kelly %": "{:.2f}"}), hide_index=True, width="stretch")
         st.caption("Sin probabilidad de mercado para estos mercados: se usa 1/cuota como referencia (incluye el margen).")
 
         st.divider()
@@ -1443,21 +1444,21 @@ with t1:
     g1.metric("Over 1.5", f"{dc['po15'] * 100:.1f}%")
     g2.metric("Over 2.5", f"{dc['po25'] * 100:.1f}%")
     g3.metric("BTTS (Ambos anotan)", f"{dc['pbtts'] * 100:.1f}%")
-    st.plotly_chart(plot_score_heatmap(dc["probs"], home, away), use_container_width=True)
+    st.plotly_chart(plot_score_heatmap(dc["probs"], home, away), width="stretch")
 
     st.markdown("### ⭐ Top 3 marcadores más probables")
     top_df = pd.DataFrame([{"Marcador": s, "Prob (%)": p * 100} for s, p in dc["top"]])
-    st.dataframe(top_df.style.format({"Prob (%)": "{:.2f}"}), use_container_width=True, hide_index=True)
+    st.dataframe(top_df.style.format({"Prob (%)": "{:.2f}"}), width="stretch", hide_index=True)
 
     st.divider()
     st.markdown("### 📉 Últimos 5")
     cf1, cf2 = st.columns(2)
     with cf1:
         st.write(f"**{home}**")
-        st.dataframe(get_last_5(df, home), use_container_width=True, hide_index=True)
+        st.dataframe(get_last_5(df, home), width="stretch", hide_index=True)
     with cf2:
         st.write(f"**{away}**")
-        st.dataframe(get_last_5(df, away), use_container_width=True, hide_index=True)
+        st.dataframe(get_last_5(df, away), width="stretch", hide_index=True)
 
 # --- TAB 2: VALOR + TICKET ---
 with t2:
@@ -1470,7 +1471,7 @@ with t3:
     if db.empty:
         st.warning("Aún no hay historial.")
     else:
-        st.dataframe(db, use_container_width=True, hide_index=True)
+        st.dataframe(db, width="stretch", hide_index=True)
         st.divider()
         st.markdown("### 🛠️ Administrar apuestas")
         opts = {f"{r.ID} | {r.Fecha} | {r.Partido} | {r.Pick}": r.ID for r in db.itertuples()}
@@ -1521,12 +1522,15 @@ with t3:
 # --- TAB 4: ESCÁNER ---
 with t4:
     st.markdown("## 💎 Escáner de valor")
-    api_in = st.text_input("🔑 API Key (también se lee de st.secrets['ODDS_API_KEY'] o de la variable ODDS_API_KEY):",
-                           value=ss.api_key, type="password", key="api_key_input")
+    server_key = os.environ.get("ODDS_API_KEY") or _secret("ODDS_API_KEY") or ""
+    api_in = st.text_input("🔑 API Key (opcional si está en st.secrets['ODDS_API_KEY'] o en la variable ODDS_API_KEY):",
+                           value=ss.api_key, type="password", key="api_key_input",
+                           placeholder="Usando la key configurada en el servidor" if server_key else "")
     if api_in != ss.api_key:
         ss.api_key = api_in
+    api_key = ss.api_key or server_key
 
-    if not ss.api_key:
+    if not api_key:
         st.info("Pon tu API key para usar el escáner.")
     else:
         stored = ss.market_storage.get(code)
@@ -1541,14 +1545,14 @@ with t4:
                 if force:
                     call_odds_api.clear()
                 with st.spinner("Conectando..."):
-                    resp = call_odds_api(API_LEAGUE_MAP[code], ss.api_key)
+                    resp = call_odds_api(API_LEAGUE_MAP[code], api_key)
                 ss.market_storage[code] = {"timestamp": resp["ts"], "data": resp["data"]}
                 if resp["remaining"] is not None:
                     ss.api_usage = {"used": resp["used"], "remaining": resp["remaining"]}
                 ss.flash = "✅ Odds descargadas"
                 st.rerun()
             except Exception as e:
-                st.error(f"Error API: {_scrub(e, ss.api_key)}")
+                st.error(f"Error API: {_scrub(e, api_key)}")
 
         st.divider()
         st.markdown("### 🎯 Pronósticos de la jornada")
@@ -1581,7 +1585,7 @@ with t4:
             st.caption("Estos nombres de la API no coinciden con el histórico (o el equipo no tiene historial reciente). "
                        "Agrégalos a TEAM_MAP: nombre de la API → nombre en football-data.")
             st.dataframe(pd.DataFrame(sorted(ss.unmatched), columns=["Liga", "Nombre en la API"]), hide_index=True,
-                         use_container_width=True)
+                         width="stretch")
         else:
             st.write("Ninguno por ahora.")
 
@@ -1622,7 +1626,7 @@ with t5:
                        f"(LogLoss {best_row['LogLoss DC']:.4f} vs mercado {best_row['LogLoss mercado']:.4f}). "
                        "Aplícala en la barra lateral → «Modelo y bankroll».")
             st.dataframe(tune.style.format({"ξ": "{:.3f}", "Regularización": "{:.1f}", "LogLoss DC": "{:.4f}", "LogLoss mercado": "{:.4f}"}),
-                         hide_index=True, use_container_width=True)
+                         hide_index=True, width="stretch")
 
     st.divider()
     st.markdown("### 📈 Backtest de la estrategia (EV con probabilidad ajustada)")
@@ -1633,6 +1637,7 @@ with t5:
     n_bt = bc1.slider("Partidos de prueba", 200, 3000, 800, 100, key="bt_n")
     rt_bt = bc2.slider("Reentrenar ML cada (partidos)", 10, 100, 30, 10, key="bt_rt")
     src_bt = bc3.radio("Modelo a evaluar", ["ML", "Dixon-Coles"], horizontal=True, key="bt_src")
+    lab_cfg = (ml_kind, ml_scope, code if ml_scope == "league" else "pooled", xi, reg, n_bt, rt_bt)
     if st.button("▶️ Ejecutar backtest", key="bt_btn"):
         with st.spinner("Construyendo dataset sin fugas y evaluando (la primera vez puede tardar)..."):
             mlb = get_ml_bundle(ml_kind, ml_scope, code, xi, reg)
@@ -1640,8 +1645,11 @@ with t5:
         if ev_bt is None:
             st.warning("Historial insuficiente para el backtest (prueba con alcance 'Las 7 ligas juntas').")
         else:
-            ss.results["lab_eval"] = ev_bt
+            ss.results["lab_eval"] = {**ev_bt, "cfg": lab_cfg}
     ev_bt = ss.results.get("lab_eval")
+    if ev_bt is not None and ev_bt["cfg"] != lab_cfg:
+        st.info("Los resultados guardados son de otra liga o configuración del modelo: vuelve a ejecutar el backtest.")
+        ev_bt = None
     if ev_bt is not None:
         P_model = ev_bt["P"]["ML"] if src_bt == "ML" else ev_bt["P"]["Dixon-Coles"]
         sim = simulate_strategy(ev_bt["meta"], P_model, ev_bt["P"]["Mercado"], ev_bt["y"], w_model, edge_min, odd_max, kelly_frac, cap_pct, allowed)
@@ -1667,18 +1675,18 @@ with t5:
             bp = sim["by_pick"]
             st.markdown("**Por tipo de apuesta** — ¿se concentra en un resultado? Compara aciertos esperados vs reales.")
             st.dataframe(bp.style.format({"Esperados": "{:.1f}", "Reales": "{:.0f}", "Profit": "{:+.2f}", "% apuestas": "{:.0f}", "Yield %": "{:+.1f}"}),
-                         hide_index=True, use_container_width=True)
+                         hide_index=True, width="stretch")
             top = bp.loc[bp["% apuestas"].idxmax()]
             if top["% apuestas"] > 55 and sim["n_bets"] >= 15:
                 st.warning(f"«{top['Pick']}» concentra el {top['% apuestas']:.0f}% de las apuestas. Suele ser ruido del modelo (el empate es "
                            "casi impredecible y su cuota amplifica cualquier error), no una ventaja real. Si los aciertos reales no superan "
                            "a los esperados, excluye ese resultado en la barra lateral o sube la ventaja mínima.")
             cg1, cg2 = st.columns(2)
-            cg1.plotly_chart(equity_figure({"Stake plano": sim["equity"]}, "Capital acumulado (unidades)", "Unidades"), use_container_width=True)
-            cg2.plotly_chart(equity_figure({"Kelly fraccionado": sim["kelly_curve"]}, "Banco simulado", "Banco"), use_container_width=True)
+            cg1.plotly_chart(equity_figure({"Stake plano": sim["equity"]}, "Capital acumulado (unidades)", "Unidades"), width="stretch")
+            cg2.plotly_chart(equity_figure({"Kelly fraccionado": sim["kelly_curve"]}, "Banco simulado", "Banco"), width="stretch")
             with st.expander("Ver apuestas simuladas"):
                 st.dataframe(sim["bets"].style.format({"Cuota": "{:.2f}", "P ajust.": "{:.3f}", "EV": "{:.3f}", "P/L (U)": "{:+.2f}"}),
-                             hide_index=True, use_container_width=True)
+                             hide_index=True, width="stretch")
 
 # --- TAB 6: RENDIMIENTO ---
 with t6:
@@ -1715,7 +1723,7 @@ with t6:
         else:
             q3.caption("Registra la cuota de cierre en 📜 Historial para medir CLV.")
 
-        st.plotly_chart(equity_figure({"Capital acumulado": fin["Equity"]}, "Curva de capital ($)", "$"), use_container_width=True)
+        st.plotly_chart(equity_figure({"Capital acumulado": fin["Equity"]}, "Curva de capital ($)", "$"), width="stretch")
 
         def breakdown(frame, col, bins=None):
             f = frame.copy()
@@ -1728,15 +1736,15 @@ with t6:
         tabs_fmt = {"Stake": "{:.2f}", "Profit": "{:+.2f}", "ROI %": "{:+.1f}"}
         bk1, bk2, bk3 = st.columns(3)
         bk1.markdown("**Por liga**")
-        bk1.dataframe(breakdown(fin, "Liga").style.format(tabs_fmt), hide_index=True, use_container_width=True)
+        bk1.dataframe(breakdown(fin, "Liga").style.format(tabs_fmt), hide_index=True, width="stretch")
         bk2.markdown("**Por tipo**")
-        bk2.dataframe(breakdown(fin, "Tipo").style.format(tabs_fmt), hide_index=True, use_container_width=True)
+        bk2.dataframe(breakdown(fin, "Tipo").style.format(tabs_fmt), hide_index=True, width="stretch")
         fin["Rango EV"] = ""
         bk3.markdown("**Por rango de EV**")
         bk3.dataframe(breakdown(fin, "Rango EV", bins=([-np.inf, 0.0, 0.05, 0.10, np.inf], ["≤0", "0–5%", "5–10%", ">10%"])).style.format(tabs_fmt),
-                      hide_index=True, use_container_width=True)
+                      hide_index=True, width="stretch")
         with st.expander("Ver apuestas finalizadas"):
-            st.dataframe(fin.drop(columns=["Rango EV"]), use_container_width=True, hide_index=True)
+            st.dataframe(fin.drop(columns=["Rango EV"]), width="stretch", hide_index=True)
 
 # --- TAB 7: ML 1X2 ---
 with t7:
@@ -1750,6 +1758,7 @@ with t7:
     n_test_ml = ec1.slider("Partidos de prueba", 50, 1000, 300, 25, key="ml_n_test")
     min_train_ml = ec2.slider("Mínimo para entrenar", 200, 2000, 500, 50, key="ml_min_train")
     retrain_ml = ec3.slider("Reentrenar cada (partidos)", 10, 100, 30, 10, key="ml_retrain")
+    ml_cfg = (ml_kind, ml_scope, code if ml_scope == "league" else "pooled", xi, reg, n_test_ml, min_train_ml, retrain_ml)
     if st.button("▶️ Evaluar (walk-forward) vs mercado", key="ml_eval_btn"):
         with st.spinner("Construyendo dataset sin fugas y evaluando (la primera vez puede tardar)..."):
             mlb = get_ml_bundle(ml_kind, ml_scope, code, xi, reg)
@@ -1757,8 +1766,11 @@ with t7:
         if ev_ml is None:
             st.warning("No se pudo evaluar (historial insuficiente). Prueba con 'Las 7 ligas juntas' o menos partidos de prueba.")
         else:
-            ss.results["ml_eval"] = ev_ml
+            ss.results["ml_eval"] = {**ev_ml, "cfg": ml_cfg}
     ev_ml = ss.results.get("ml_eval")
+    if ev_ml is not None and ev_ml["cfg"] != ml_cfg:
+        st.info("La evaluación guardada es de otra liga o configuración del modelo: vuelve a evaluar.")
+        ev_ml = None
     if ev_ml is not None:
         ll_mk = ev_ml["ll"]["Mercado"]
         cmp_df = pd.DataFrame({
@@ -1767,7 +1779,7 @@ with t7:
         })
         st.caption(f"Partidos evaluados: {ev_ml['n']} (LogLoss/Brier: menor es mejor).")
         st.dataframe(cmp_df.style.format({"LogLoss": "{:.4f}", "Brier": "{:.4f}", "Δ LogLoss vs mercado": "{:+.4f}"}),
-                     hide_index=True, use_container_width=True)
+                     hide_index=True, width="stretch")
         if ev_ml["ll"]["ML"] < ll_mk:
             st.success("El ML supera al mercado en esta muestra. Confírmalo con más partidos antes de subir stakes.")
         else:
@@ -1778,10 +1790,10 @@ with t7:
         bias_rows.append({"Modelo": "Frecuencia real", "P(Local)": freq[0], "P(Empate)": freq[1], "P(Visita)": freq[2], "σ P(Empate)": np.nan})
         st.markdown("**Sesgo por resultado**")
         st.dataframe(pd.DataFrame(bias_rows).style.format({"P(Local)": "{:.3f}", "P(Empate)": "{:.3f}", "P(Visita)": "{:.3f}", "σ P(Empate)": "{:.3f}"}, na_rep="—"),
-                     hide_index=True, use_container_width=True)
+                     hide_index=True, width="stretch")
         st.caption("Si σ P(Empate) del ML es mucho mayor que la del mercado, el modelo está inventando señal en el empate "
                    "(casi impredecible) y generará 'valor' falso en ese resultado.")
-        st.plotly_chart(calibration_figure(ev_ml["P"], ev_ml["y"]), use_container_width=True)
+        st.plotly_chart(calibration_figure(ev_ml["P"], ev_ml["y"]), width="stretch")
 
     st.divider()
     st.markdown("### 🎯 Predicción ML para el partido seleccionado")
@@ -1812,16 +1824,16 @@ with t7:
             "A": [pred["mk"][2], dc["pa"], pred["p_ml"][2], adj_now[2]],
         })
         st.caption(f"Mercado: {pred['mk_src']}.")
-        st.dataframe(comp.style.format({"H": "{:.3f}", "D": "{:.3f}", "A": "{:.3f}"}), hide_index=True, use_container_width=True)
+        st.dataframe(comp.style.format({"H": "{:.3f}", "D": "{:.3f}", "A": "{:.3f}"}), hide_index=True, width="stretch")
         imp_df = pred["table"].sort_values("Importancia")
         st.markdown("### 🔍 Importancia de variables")
         st.caption("Corrección sobre el mercado: |coeficiente| medio de cada señal (el mercado es el punto de partida). Árboles: importancia del modelo base.")
         fig_imp = go.Figure(go.Bar(x=imp_df["Importancia"], y=imp_df["Feature"], orientation="h", marker_color="#76b900"))
         fig_imp.update_layout(height=420, margin=dict(l=0, r=0, t=30, b=0), template="plotly_dark")
-        st.plotly_chart(fig_imp, use_container_width=True)
+        st.plotly_chart(fig_imp, width="stretch")
         with st.expander("Valores de las features de este partido"):
             st.dataframe(imp_df.sort_values("Importancia", ascending=False).style.format({"Importancia": "{:.3f}", "Valor": "{:.3f}"}),
-                         hide_index=True, use_container_width=True)
+                         hide_index=True, width="stretch")
 
 # --- TAB 8: MULTI-LIGA ---
 with t8:
@@ -1863,7 +1875,7 @@ with t8:
             all_dec.append(dec_l)
             with st.expander(f"⚽ {LEAGUES[lc]} ({n_picks} picks de {len(dec_l)} partidos)", expanded=n_picks > 0):
                 st.dataframe(dec_l.style.format({"Ventaja pp": "{:+.1f}", "Mejor EV": "{:.3f}", "Cuota": "{:.2f}", "Kelly %": "{:.2f}", "Stake $": "{:.2f}"}, na_rep="—"),
-                             hide_index=True, use_container_width=True)
+                             hide_index=True, width="stretch")
         if all_dec:
             st.divider()
             st.markdown("### 📥 Descargar todo")
