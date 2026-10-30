@@ -800,6 +800,7 @@ def init_db():
             "CREATE TABLE IF NOT EXISTS bets (ID TEXT PRIMARY KEY, Fecha TEXT, Tipo TEXT, Liga TEXT, Partido TEXT, "
             "Pick TEXT, Cuota REAL, Stake REAL, Prob REAL, EV REAL, Estado TEXT, Ganancia REAL, Cuota_Cierre REAL)"
         )
+        con.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
         empty = con.execute("SELECT COUNT(*) FROM bets").fetchone()[0] == 0
         if empty and os.path.exists(LEGACY_CSV):
             try:
@@ -850,6 +851,18 @@ def update_bet_closing(bet_id, closing_odd):
 def delete_bet(bet_id):
     with _db() as con:
         con.execute("DELETE FROM bets WHERE ID=?", (str(bet_id),))
+        con.commit()
+
+
+def get_setting(key, default):
+    with _db() as con:
+        row = con.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return row[0] if row else default
+
+
+def set_setting(key, value):
+    with _db() as con:
+        con.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
         con.commit()
 
 
@@ -1263,7 +1276,10 @@ with st.sidebar:
         st.dataframe(latest[["date", "home", "Score", "away"]], hide_index=True, width="stretch")
 
     st.divider()
-    bank = st.number_input("💰 Tu banco ($)", min_value=0.0, value=1000.0, step=50.0, key="bank")
+    if "bank" not in ss:  # el banco se guarda en la BD para que no vuelva a 1000 al recargar la página
+        ss.bank = float(get_setting("bank", 1000.0))
+    bank = st.number_input("💰 Tu banco ($)", min_value=0.0, step=50.0, key="bank",
+                           on_change=lambda: set_setting("bank", ss.bank))
     if ss.api_usage.get("remaining") is not None:
         st.metric("Créditos API restantes", ss.api_usage["remaining"])
     if ss.ticket:
